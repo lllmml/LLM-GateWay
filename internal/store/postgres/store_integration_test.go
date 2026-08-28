@@ -3,6 +3,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane"
+	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/apikey"
 	projectdomain "github.com/lllmml/production-go-llm-gateway/internal/controlplane/project"
 )
 
@@ -64,6 +66,28 @@ func TestControlPlaneFoundationMigrationUpAndDown(t *testing.T) {
 			t.Fatalf("table %s still exists after down migration", table)
 		}
 	}
+}
+
+func TestVirtualAPIKeyMigrationUpAndDown(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pool, _, cleanup := newIsolatedPool(t, ctx)
+	defer cleanup()
+
+	applyMigration(t, ctx, pool, "000001_control_plane_foundation.up.sql")
+	applyMigration(t, ctx, pool, "000002_virtual_api_keys.up.sql")
+
+	if !tableExists(t, ctx, pool, "virtual_api_keys") {
+		t.Fatal("virtual_api_keys table does not exist after up migration")
+	}
+
+	applyMigration(t, ctx, pool, "000002_virtual_api_keys.down.sql")
+	if tableExists(t, ctx, pool, "virtual_api_keys") {
+		t.Fatal("virtual_api_keys table still exists after down migration")
+	}
+
+	applyMigration(t, ctx, pool, "000001_control_plane_foundation.down.sql")
 }
 
 func TestControlPlaneFoundationConstraints(t *testing.T) {
@@ -129,6 +153,218 @@ func TestControlPlaneFoundationConstraints(t *testing.T) {
 		Status:      pgtype.Text{String: "archived", Valid: true},
 	})
 	assertPgCode(t, err, "23514")
+}
+
+func TestVirtualAPIKeyStoreAdapterAndConstraints(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	store, cleanup := newMigratedStore(t, ctx)
+	defer cleanup()
+
+	owner, err := store.UpsertGitHubUser(ctx, controlplane.GitHubUser{
+		GitHubID:    4001,
+		GitHubLogin: "key-owner",
+	})
+	if err != nil {
+		t.Fatalf("upsert owner: %v", err)
+	}
+	other, err := store.UpsertGitHubUser(ctx, controlplane.GitHubUser{
+		GitHubID:    4002,
+		GitHubLogin: "other-owner",
+	})
+	if err != nil {
+		t.Fatalf("upsert other: %v", err)
+	}
+
+	project, err := store.CreateProject(ctx, projectdomain.CreateParams{
+		OwnerUserID: owner.ID,
+		Name:        "Gateway",
+		Slug:        "gateway-keys",
+	})
+	if err != nil {
+		t.Fatalf("create owner project: %v", err)
+	}
+	otherProject, err := store.CreateProject(ctx, projectdomain.CreateParams{
+		OwnerUserID: other.ID,
+		Name:        "Other Gateway",
+		Slug:        "other-gateway-keys",
+	})
+	if err != nil {
+		t.Fatalf("create other project: %v", err)
+	}
+
+	keyHash := bytes.Repeat([]byte{1}, 32)
+	created, err := store.CreateKey(ctx, apikey.CreateParams{
+		OwnerUserID: owner.ID,
+		ProjectID:   project.ID,
+		Name:        "local-dev",
+		Prefix:      "abcdefgh",
+		KeyHash:     keyHash,
+	})
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	if created.ProjectID != project.ID || created.Name != "local-dev" || created.Prefix != "abcdefgh" || created.Status != apikey.StatusActive {
+		t.Fatalf("created key metadata = %+v", created)
+	}
+
+	keyID, err := parseUUID(created.ID)
+	if err != nil {
+		t.Fatalf("parse created key ID: %v", err)
+	}
+	projectID, err := parseUUID(project.ID)
+	if err != nil {
+		t.Fatalf("parse project ID: %v", err)
+	}
+	var persistedHash []byte
+	var persistedPrefix string
+	if err := store.pool.QueryRow(ctx, "SELECT key_hash, key_prefix FROM virtual_api_keys WHERE id = $1", keyID).Scan(&persistedHash, &persistedPrefix); err != nil {
+		t.Fatalf("read persisted key material: %v", err)
+	}
+	if !bytes.Equal(persistedHash, keyHash) || len(persistedHash) != 32 {
+		t.Fatalf("persisted digest length/equality mismatch: len=%d", len(persistedHash))
+	}
+	if persistedPrefix != "abcdefgh" {
+		t.Fatalf("persisted prefix = %q, want abcdefgh", persistedPrefix)
+	}
+
+	_, err = store.CreateKey(ctx, apikey.CreateParams{
+		OwnerUserID: owner.ID,
+		ProjectID:   project.ID,
+		Name:        "short-hash",
+		Prefix:      "shortbad",
+		KeyHash:     bytes.Repeat([]byte{2}, 31),
+	})
+	assertPgCode(t, err, "23514")
+
+	_, err = store.CreateKey(ctx, apikey.CreateParams{
+		OwnerUserID: other.ID,
+		ProjectID:   otherProject.ID,
+		Name:        "duplicate-hash",
+		Prefix:      "duphash1",
+		KeyHash:     keyHash,
+	})
+	assertPgCode(t, err, "23505")
+
+	otherKey, err := store.CreateKey(ctx, apikey.CreateParams{
+		OwnerUserID: other.ID,
+		ProjectID:   otherProject.ID,
+		Name:        "other-dev",
+		Prefix:      "ijklmnop",
+		KeyHash:     bytes.Repeat([]byte{3}, 32),
+	})
+	if err != nil {
+		t.Fatalf("create other key: %v", err)
+	}
+
+	keys, err := store.ListKeys(ctx, owner.ID, project.ID)
+	if err != nil {
+		t.Fatalf("list owner keys: %v", err)
+	}
+	if len(keys) != 1 || keys[0].ID != created.ID {
+		t.Fatalf("owner list = %+v, want only created key", keys)
+	}
+	keys, err = store.ListKeys(ctx, other.ID, project.ID)
+	if !errors.Is(err, apikey.ErrNotFound) {
+		t.Fatalf("cross-owner list error = %v, want ErrNotFound", err)
+	}
+	if keys != nil {
+		t.Fatalf("cross-owner list returned keys: %+v", keys)
+	}
+
+	pepper := bytes.Repeat([]byte{9}, 32)
+	keyService, err := apikey.NewService(store, pepper)
+	if err != nil {
+		t.Fatalf("create key service: %v", err)
+	}
+	shownOnce, err := keyService.Create(ctx, owner.ID, project.ID, "shown-once")
+	if err != nil {
+		t.Fatalf("create shown-once key: %v", err)
+	}
+	shownOnceID, err := parseUUID(shownOnce.Key.ID)
+	if err != nil {
+		t.Fatalf("parse shown-once key ID: %v", err)
+	}
+	expectedDigest, err := apikey.HashKey(shownOnce.RawKey, pepper)
+	if err != nil {
+		t.Fatalf("hash shown-once key: %v", err)
+	}
+	var storedDigest []byte
+	var storedRow string
+	if err := store.pool.QueryRow(ctx, "SELECT key_hash, row_to_json(keys)::text FROM virtual_api_keys AS keys WHERE id = $1", shownOnceID).Scan(&storedDigest, &storedRow); err != nil {
+		t.Fatalf("read shown-once key row: %v", err)
+	}
+	if !bytes.Equal(storedDigest, expectedDigest) || len(storedDigest) != 32 {
+		t.Fatalf("shown-once key persisted an invalid digest length: %d", len(storedDigest))
+	}
+	if strings.Contains(storedRow, shownOnce.RawKey) {
+		t.Fatal("database row contains the raw virtual API key")
+	}
+
+	if _, err := store.DisableKey(ctx, other.ID, project.ID, created.ID); !errors.Is(err, apikey.ErrNotFound) {
+		t.Fatalf("cross-owner disable error = %v, want ErrNotFound", err)
+	}
+	current := readVirtualAPIKey(t, ctx, store, keyID)
+	if current.Status != string(apikey.StatusActive) {
+		t.Fatalf("cross-owner disable changed status to %q", current.Status)
+	}
+
+	disabled, err := store.DisableKey(ctx, owner.ID, project.ID, created.ID)
+	if err != nil {
+		t.Fatalf("disable key: %v", err)
+	}
+	if disabled.Status != apikey.StatusDisabled {
+		t.Fatalf("disabled status = %q, want disabled", disabled.Status)
+	}
+	disabledAgain, err := store.DisableKey(ctx, owner.ID, project.ID, created.ID)
+	if err != nil {
+		t.Fatalf("disable key again: %v", err)
+	}
+	if disabledAgain.Status != apikey.StatusDisabled {
+		t.Fatalf("second disable status = %q, want disabled", disabledAgain.Status)
+	}
+
+	if _, err := store.RevokeKey(ctx, owner.ID, otherProject.ID, otherKey.ID); !errors.Is(err, apikey.ErrNotFound) {
+		t.Fatalf("wrong-project revoke error = %v, want ErrNotFound", err)
+	}
+	if _, err := store.RevokeKey(ctx, other.ID, project.ID, created.ID); !errors.Is(err, apikey.ErrNotFound) {
+		t.Fatalf("cross-owner revoke error = %v, want ErrNotFound", err)
+	}
+
+	revoked, err := store.RevokeKey(ctx, owner.ID, project.ID, created.ID)
+	if err != nil {
+		t.Fatalf("revoke key: %v", err)
+	}
+	if revoked.Status != apikey.StatusRevoked || revoked.RevokedAt == nil {
+		t.Fatalf("revoked key = %+v, want revoked status and timestamp", revoked)
+	}
+	firstRevokedAt := *revoked.RevokedAt
+	revokedAgain, err := store.RevokeKey(ctx, owner.ID, project.ID, created.ID)
+	if err != nil {
+		t.Fatalf("revoke key again: %v", err)
+	}
+	if revokedAgain.Status != apikey.StatusRevoked || revokedAgain.RevokedAt == nil || !revokedAgain.RevokedAt.Equal(firstRevokedAt) {
+		t.Fatalf("second revoke key = %+v, want same revoked timestamp", revokedAgain)
+	}
+	stillRevoked, err := store.DisableKey(ctx, owner.ID, project.ID, created.ID)
+	if err != nil {
+		t.Fatalf("disable revoked key: %v", err)
+	}
+	if stillRevoked.Status != apikey.StatusRevoked {
+		t.Fatalf("disable changed revoked status to %q", stillRevoked.Status)
+	}
+
+	if _, err := store.pool.Exec(ctx, "DELETE FROM projects WHERE id = $1", projectID); err != nil {
+		t.Fatalf("delete project: %v", err)
+	}
+	var remaining int
+	if err := store.pool.QueryRow(ctx, "SELECT count(*) FROM virtual_api_keys WHERE project_id = $1", projectID).Scan(&remaining); err != nil {
+		t.Fatalf("count project keys after project delete: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("remaining keys after project delete = %d, want 0", remaining)
+	}
 }
 
 func TestProjectOwnershipAndSessionLookupQueries(t *testing.T) {
@@ -316,6 +552,7 @@ func newMigratedStore(t *testing.T, ctx context.Context) (*Store, func()) {
 
 	pool, _, cleanupPool := newIsolatedPool(t, ctx)
 	applyMigration(t, ctx, pool, "000001_control_plane_foundation.up.sql")
+	applyMigration(t, ctx, pool, "000002_virtual_api_keys.up.sql")
 
 	store := &Store{
 		pool:    pool,
@@ -326,6 +563,27 @@ func newMigratedStore(t *testing.T, ctx context.Context) (*Store, func()) {
 		store.Close()
 		cleanupPool()
 	}
+}
+
+func readVirtualAPIKey(t *testing.T, ctx context.Context, store *Store, id pgtype.UUID) VirtualApiKey {
+	t.Helper()
+
+	row, err := store.pool.Query(ctx, "SELECT id, project_id, name, key_prefix, key_hash, status, created_at, last_used_at, revoked_at FROM virtual_api_keys WHERE id = $1", id)
+	if err != nil {
+		t.Fatalf("query virtual key: %v", err)
+	}
+	defer row.Close()
+	if !row.Next() {
+		t.Fatal("virtual key was not found")
+	}
+	var key VirtualApiKey
+	if err := row.Scan(&key.ID, &key.ProjectID, &key.Name, &key.KeyPrefix, &key.KeyHash, &key.Status, &key.CreatedAt, &key.LastUsedAt, &key.RevokedAt); err != nil {
+		t.Fatalf("scan virtual key: %v", err)
+	}
+	if err := row.Err(); err != nil {
+		t.Fatalf("read virtual key rows: %v", err)
+	}
+	return key
 }
 
 func newIsolatedPool(t *testing.T, ctx context.Context) (*pgxpool.Pool, string, func()) {

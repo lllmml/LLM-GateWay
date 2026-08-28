@@ -27,6 +27,18 @@ type User struct {
 	UpdatedAt   pgtype.Timestamptz
 }
 
+type VirtualApiKey struct {
+	ID         pgtype.UUID
+	ProjectID  pgtype.UUID
+	Name       string
+	KeyPrefix  string
+	KeyHash    []byte
+	Status     string
+	CreatedAt  pgtype.Timestamptz
+	LastUsedAt pgtype.Timestamptz
+	RevokedAt  pgtype.Timestamptz
+}
+
 type WebSession struct {
 	ID         pgtype.UUID
 	UserID     pgtype.UUID

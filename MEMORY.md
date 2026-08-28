@@ -4,9 +4,9 @@ Update this after major decisions, completed phases, or bugs that future agents 
 
 ## Current State
 
-- Current task: Week 2 users/sessions/projects foundation is implemented and fully verified.
+- Current task: Week 2 virtual API key lifecycle is implemented and fully verified.
 - Current phase: Week 2 Control Plane Core is in progress.
-- Next step: Propose the bounded virtual API key creation/list/disable/revoke slice, including key format, HMAC digest, shown-once response, ownership queries, and focused tests before implementation.
+- Next step: Propose the bounded provider credential encrypted CRUD slice before implementation.
 - Blocked by: None. Default port `:8080` was occupied during local verification; use address overrides or identify the owner before using defaults.
 
 ## Decisions
@@ -23,6 +23,7 @@ Update this after major decisions, completed phases, or bugs that future agents 
 - 2026-08-28: GitHub login uses no requested scopes, validates one-time random state, and uses S256 PKCE; each login re-fetches `/user`, and the provider access token is not persisted.
 - 2026-08-28: Web sessions use random tokens stored only as HMAC-SHA256 digests with a 32-byte pepper; production cookies require HTTPS while loopback HTTP remains available for local development.
 - 2026-08-28: The MVP tenant boundary is enforced by ownership-scoped PostgreSQL queries using authenticated `owner_user_id`; cross-owner project lookup/update is indistinguishable from not found.
+- 2026-08-28: Virtual API keys use independent random 8-character display prefixes and 256-bit secrets, are shown once, and persist only HMAC-SHA256 digests under a dedicated 32-byte `VIRTUAL_KEY_PEPPER`; disable/revoke mutations remain ownership-scoped and atomic.
 
 ## AI / Tooling Decisions
 
@@ -40,6 +41,7 @@ Update this after major decisions, completed phases, or bugs that future agents 
 
 - [x] Initial scaffold
 - [x] Control Plane users/sessions/projects foundation
+- [x] Virtual API key creation/list/disable/revoke lifecycle
 - [ ] Core data model
 - [ ] Auth
 - [ ] Core MVP flow

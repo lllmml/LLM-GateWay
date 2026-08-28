@@ -52,7 +52,11 @@ func run() error {
 		database.Close()
 		return fmt.Errorf("configure control-plane authentication: %w", err)
 	}
-	controlPlaneHandler := controlplane.NewHandler(authHandler, database)
+	controlPlaneHandler, err := controlplane.NewHandler(authHandler, database, database, cfg.VirtualKeyPepper)
+	if err != nil {
+		database.Close()
+		return fmt.Errorf("configure control plane: %w", err)
+	}
 
 	application := app.New(app.Options{
 		DataPlaneAddr:       cfg.DataPlaneAddr,

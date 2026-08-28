@@ -59,6 +59,11 @@ func TestLoadRejectsMissingRequiredValues(t *testing.T) {
 			values: withoutKey(requiredTestValues(), "SESSION_TOKEN_PEPPER"),
 			want:   "SESSION_TOKEN_PEPPER is required",
 		},
+		{
+			name:   "virtual key pepper",
+			values: withoutKey(requiredTestValues(), "VIRTUAL_KEY_PEPPER"),
+			want:   "VIRTUAL_KEY_PEPPER is required",
+		},
 	}
 
 	for _, tt := range tests {
@@ -156,6 +161,30 @@ func TestLoadRejectsInvalidSessionTokenPepper(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsInvalidVirtualKeyPepper(t *testing.T) {
+	values := requiredTestValues()
+	values["VIRTUAL_KEY_PEPPER"] = base64.StdEncoding.EncodeToString(make([]byte, 31))
+
+	_, err := load(mapLookup(values))
+	if err == nil || !strings.Contains(err.Error(), "exactly 32 bytes") {
+		t.Fatalf("load error = %v, want 32-byte validation error", err)
+	}
+}
+
+func TestLoadKeepsSessionAndVirtualKeyPeppersSeparate(t *testing.T) {
+	values := requiredTestValues()
+	values["SESSION_TOKEN_PEPPER"] = base64.StdEncoding.EncodeToString(bytesOf(1, 32))
+	values["VIRTUAL_KEY_PEPPER"] = base64.StdEncoding.EncodeToString(bytesOf(2, 32))
+
+	cfg, err := load(mapLookup(values))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if string(cfg.SessionTokenPepper) == string(cfg.VirtualKeyPepper) {
+		t.Fatal("session and virtual key peppers unexpectedly share key material")
+	}
+}
+
 func mapLookup(values map[string]string) func(string) (string, bool) {
 	return func(key string) (string, bool) {
 		value, ok := values[key]
@@ -175,7 +204,16 @@ func requiredTestValues() map[string]string {
 		"GITHUB_CLIENT_ID":      "test-client-id",
 		"GITHUB_CLIENT_SECRET":  "test-client-secret",
 		"SESSION_TOKEN_PEPPER":  base64.StdEncoding.EncodeToString(make([]byte, 32)),
+		"VIRTUAL_KEY_PEPPER":    base64.StdEncoding.EncodeToString(make([]byte, 32)),
 	}
+}
+
+func bytesOf(value byte, size int) []byte {
+	result := make([]byte, size)
+	for index := range result {
+		result[index] = value
+	}
+	return result
 }
 
 func withoutKey(values map[string]string, key string) map[string]string {

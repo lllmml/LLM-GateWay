@@ -31,6 +31,7 @@ type Config struct {
 	GitHubClientID      string
 	GitHubClientSecret  string
 	SessionTokenPepper  []byte
+	VirtualKeyPepper    []byte
 	SecureCookies       bool
 	LogLevel            slog.Level
 	DatabaseConnectTime time.Duration
@@ -80,6 +81,10 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	virtualKeyPepper, err := base64Key(lookup, "VIRTUAL_KEY_PEPPER", 32)
+	if err != nil {
+		return Config{}, err
+	}
 
 	logLevel, err := parseLogLevel(valueOrDefault(lookup, "LOG_LEVEL", "info"))
 	if err != nil {
@@ -111,6 +116,7 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		GitHubClientID:      githubClientID,
 		GitHubClientSecret:  githubClientSecret,
 		SessionTokenPepper:  sessionTokenPepper,
+		VirtualKeyPepper:    virtualKeyPepper,
 		SecureCookies:       secureCookies,
 		LogLevel:            logLevel,
 		DatabaseConnectTime: databaseConnectTime,
