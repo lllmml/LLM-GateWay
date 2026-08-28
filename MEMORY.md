@@ -4,9 +4,9 @@ Update this after major decisions, completed phases, or bugs that future agents 
 
 ## Current State
 
-- Current task: Week 1 HTTP foundation is implemented and fully verified.
-- Current phase: Prepare Week 2 Control Plane Core.
-- Next step: Propose a bounded Week 2 plan covering the initial schema/migrations, GitHub auth/session boundary, project ownership, and their tests before implementation.
+- Current task: Week 2 users/sessions/projects foundation is implemented and fully verified.
+- Current phase: Week 2 Control Plane Core is in progress.
+- Next step: Propose the bounded virtual API key creation/list/disable/revoke slice, including key format, HMAC digest, shown-once response, ownership queries, and focused tests before implementation.
 - Blocked by: None. Default port `:8080` was occupied during local verification; use address overrides or identify the owner before using defaults.
 
 ## Decisions
@@ -19,6 +19,10 @@ Update this after major decisions, completed phases, or bugs that future agents 
 - 2026-08-28: Use Go 1.26 and module path `github.com/lllmml/production-go-llm-gateway` as explicitly approved by the project owner.
 - 2026-08-28: Pin local PostgreSQL to `postgres:18.6-alpine3.24`, `pgx/v5` to v5.10.0, and the PostgreSQL-only `golang-migrate` CLI to v4.19.1.
 - 2026-08-28: Require Go 1.26.7 and `golang.org/x/text` v0.39.0 to clear reachable standard-library and text-processing vulnerabilities; `x/sync` v0.21.0 is the required transitive update.
+- 2026-08-28: Pin `sqlc` to v1.31.1 for explicit PostgreSQL query generation and `golang.org/x/oauth2` to v0.36.0 for GitHub Authorization Code exchange.
+- 2026-08-28: GitHub login uses no requested scopes, validates one-time random state, and uses S256 PKCE; each login re-fetches `/user`, and the provider access token is not persisted.
+- 2026-08-28: Web sessions use random tokens stored only as HMAC-SHA256 digests with a 32-byte pepper; production cookies require HTTPS while loopback HTTP remains available for local development.
+- 2026-08-28: The MVP tenant boundary is enforced by ownership-scoped PostgreSQL queries using authenticated `owner_user_id`; cross-owner project lookup/update is indistinguishable from not found.
 
 ## AI / Tooling Decisions
 
@@ -35,6 +39,7 @@ Update this after major decisions, completed phases, or bugs that future agents 
 ## Completed
 
 - [x] Initial scaffold
+- [x] Control Plane users/sessions/projects foundation
 - [ ] Core data model
 - [ ] Auth
 - [ ] Core MVP flow

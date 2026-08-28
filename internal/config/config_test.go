@@ -9,10 +9,7 @@ import (
 )
 
 func TestLoadUsesDefaults(t *testing.T) {
-	values := map[string]string{
-		"DATABASE_URL":          "postgres://example",
-		"CREDENTIAL_MASTER_KEY": testCredentialMasterKey(),
-	}
+	values := requiredTestValues()
 
 	cfg, err := load(mapLookup(values))
 	if err != nil {
@@ -44,13 +41,23 @@ func TestLoadRejectsMissingRequiredValues(t *testing.T) {
 	}{
 		{
 			name:   "database URL",
-			values: map[string]string{"CREDENTIAL_MASTER_KEY": testCredentialMasterKey()},
+			values: withoutKey(requiredTestValues(), "DATABASE_URL"),
 			want:   "DATABASE_URL is required",
 		},
 		{
 			name:   "credential master key",
-			values: map[string]string{"DATABASE_URL": "postgres://example"},
+			values: withoutKey(requiredTestValues(), "CREDENTIAL_MASTER_KEY"),
 			want:   "CREDENTIAL_MASTER_KEY is required",
+		},
+		{
+			name:   "GitHub client secret",
+			values: withoutKey(requiredTestValues(), "GITHUB_CLIENT_SECRET"),
+			want:   "GITHUB_CLIENT_SECRET is required",
+		},
+		{
+			name:   "session token pepper",
+			values: withoutKey(requiredTestValues(), "SESSION_TOKEN_PEPPER"),
+			want:   "SESSION_TOKEN_PEPPER is required",
 		},
 	}
 
@@ -65,12 +72,9 @@ func TestLoadRejectsMissingRequiredValues(t *testing.T) {
 }
 
 func TestLoadRejectsDuplicateAddresses(t *testing.T) {
-	values := map[string]string{
-		"DATABASE_URL":          "postgres://example",
-		"CREDENTIAL_MASTER_KEY": testCredentialMasterKey(),
-		"DATA_PLANE_ADDR":       ":8080",
-		"CONTROL_PLANE_ADDR":    ":8080",
-	}
+	values := requiredTestValues()
+	values["DATA_PLANE_ADDR"] = ":8080"
+	values["CONTROL_PLANE_ADDR"] = ":8080"
 
 	_, err := load(mapLookup(values))
 	if err == nil || !strings.Contains(err.Error(), "must be distinct") {
@@ -79,14 +83,11 @@ func TestLoadRejectsDuplicateAddresses(t *testing.T) {
 }
 
 func TestLoadParsesOverrides(t *testing.T) {
-	values := map[string]string{
-		"DATABASE_URL":             "postgres://example",
-		"CREDENTIAL_MASTER_KEY":    testCredentialMasterKey(),
-		"LOG_LEVEL":                "debug",
-		"DATABASE_CONNECT_TIMEOUT": "7s",
-		"READINESS_TIMEOUT":        "3s",
-		"SHUTDOWN_TIMEOUT":         "11s",
-	}
+	values := requiredTestValues()
+	values["LOG_LEVEL"] = "debug"
+	values["DATABASE_CONNECT_TIMEOUT"] = "7s"
+	values["READINESS_TIMEOUT"] = "3s"
+	values["SHUTDOWN_TIMEOUT"] = "11s"
 
 	cfg, err := load(mapLookup(values))
 	if err != nil {
@@ -107,6 +108,54 @@ func TestLoadParsesOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadValidatesPublicConsoleURL(t *testing.T) {
+	tests := []struct {
+		name       string
+		consoleURL string
+		wantSecure bool
+		wantError  bool
+	}{
+		{name: "production HTTPS", consoleURL: "https://console.example.com/", wantSecure: true},
+		{name: "IPv4 loopback development", consoleURL: "http://127.0.0.1:8081", wantSecure: false},
+		{name: "localhost development", consoleURL: "http://localhost:8081", wantSecure: false},
+		{name: "public HTTP rejected", consoleURL: "http://console.example.com", wantError: true},
+		{name: "credentials rejected", consoleURL: "https://user:pass@console.example.com", wantError: true},
+		{name: "path rejected", consoleURL: "https://console.example.com/app", wantError: true},
+		{name: "query rejected", consoleURL: "https://console.example.com?next=elsewhere", wantError: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := requiredTestValues()
+			values["PUBLIC_CONSOLE_URL"] = tt.consoleURL
+
+			cfg, err := load(mapLookup(values))
+			if tt.wantError {
+				if err == nil {
+					t.Fatal("load returned nil error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("load config: %v", err)
+			}
+			if cfg.SecureCookies != tt.wantSecure {
+				t.Fatalf("SecureCookies = %t, want %t", cfg.SecureCookies, tt.wantSecure)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidSessionTokenPepper(t *testing.T) {
+	values := requiredTestValues()
+	values["SESSION_TOKEN_PEPPER"] = base64.StdEncoding.EncodeToString(make([]byte, 31))
+
+	_, err := load(mapLookup(values))
+	if err == nil || !strings.Contains(err.Error(), "exactly 32 bytes") {
+		t.Fatalf("load error = %v, want 32-byte validation error", err)
+	}
+}
+
 func mapLookup(values map[string]string) func(string) (string, bool) {
 	return func(key string) (string, bool) {
 		value, ok := values[key]
@@ -116,4 +165,20 @@ func mapLookup(values map[string]string) func(string) (string, bool) {
 
 func testCredentialMasterKey() string {
 	return base64.StdEncoding.EncodeToString(make([]byte, 32))
+}
+
+func requiredTestValues() map[string]string {
+	return map[string]string{
+		"DATABASE_URL":          "postgres://example",
+		"CREDENTIAL_MASTER_KEY": testCredentialMasterKey(),
+		"PUBLIC_CONSOLE_URL":    "http://127.0.0.1:8081",
+		"GITHUB_CLIENT_ID":      "test-client-id",
+		"GITHUB_CLIENT_SECRET":  "test-client-secret",
+		"SESSION_TOKEN_PEPPER":  base64.StdEncoding.EncodeToString(make([]byte, 32)),
+	}
+}
+
+func withoutKey(values map[string]string, key string) map[string]string {
+	delete(values, key)
+	return values
 }
