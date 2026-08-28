@@ -1,9 +1,0 @@
-{
-  "mcpServers": {},
-  "tools": {
-    "approvalMode": "prompt"
-  },
-  "checkpointing": {
-    "enabled": true
-  }
-}

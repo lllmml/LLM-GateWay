@@ -7,9 +7,9 @@ Last verified: 2026-08
 | Area | Choice | Notes |
 |------|--------|-------|
 | Frontend | React + Vite + TypeScript | Static infrastructure-console SPA; React Router and TanStack Query for routing/server state |
-| Backend | Go 1.27 + `net/http` | One modular monolith with Data, Control, and private Operations listeners; direct provider HTTP adapters |
-| Database | PostgreSQL + `pgx/v5` + `sqlc` | Durable source of truth; explicit SQL with generated strongly typed access |
-| Migrations | `golang-migrate` SQL migrations | Version-controlled up/down migrations; existing migrations are protected |
+| Backend | Go 1.26.7 + `net/http` | Go 1.26 remains the selected release line; 1.26.7 is the minimum security patch. One modular monolith with Data, Control, and private Operations listeners; direct provider HTTP adapters |
+| Database | PostgreSQL 18.6 + `pgx/v5` v5.10.0 + `sqlc` | Durable source of truth; local image is `postgres:18.6-alpine3.24`; `sqlc` begins with the first domain schema |
+| Migrations | `golang-migrate` v4.19.1 SQL migrations | PostgreSQL-only CLI installed to `.tools/`; version-controlled up/down migrations begin with real Week 2 schema changes |
 | Auth | GitHub OAuth + server-side sessions; hashed virtual keys | Same-origin Web control plane; project ownership enforced by backend services/queries |
 | Security | AES-256-GCM provider-secret encryption | Versioned master keys; virtual keys remain non-recoverable and are shown once |
 | Rate limiting | In-process token bucket first; optional Redis + `go-redis` later | Redis is added only after a demonstrated multi-instance need; local emergency limiter on Redis failure |
@@ -26,7 +26,7 @@ Last verified: 2026-08
 
 ## Commands
 
-- Setup: `make bootstrap`
+- Setup: Copy `.env.example` to ignored `.env`, set `CREDENTIAL_MASTER_KEY`, then run `make bootstrap`
 - Dev: `make dev`
 - Test: `make test`
 - Typecheck: `make typecheck`
@@ -35,6 +35,7 @@ Last verified: 2026-08
 - Integration: `make integration`
 - Race: `make race`
 - Benchmark/profile: `make bench`
+- Database lifecycle: `make postgres-up` / `make postgres-down`
 - Browser/device check: Run `make dev`, complete the primary journey in a current Chrome/Edge/Firefox/Safari desktop browser, then confirm the layout remains usable at a mobile viewport.
 
 ## LLM provider runtime

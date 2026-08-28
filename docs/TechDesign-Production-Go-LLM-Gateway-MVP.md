@@ -116,7 +116,7 @@ The code is conceptually separated from day one, but deployment is not split int
 
 | Decision | Recommended | Alternatives | Why |
 |---|---|---|---|
-| Go HTTP stack | Go 1.27 + `net/http` | Gin; Kratos | Best for learning real HTTP, streaming, cancellation, Transport, and server behavior. Gin/Kratos remain useful references but should not hide the gateway path. |
+| Go HTTP stack | Go 1.26.7 + `net/http` | Gin; Kratos | Go 1.26 remains the selected release line; 1.26.7 is the minimum security patch. Best for learning real HTTP, streaming, cancellation, Transport, and server behavior. Gin/Kratos remain useful references but should not hide the gateway path. |
 | Runtime shape | 1 Go process, 3 listeners | 2 Go binaries; microservices | Preserves conceptual separation without deployment overhead. |
 | Common LLM API | OpenAI-compatible Chat Completions subset | Responses-first; native-provider-only | Broad cross-provider shape for MVP; provider-specific capability gaps are explicitly rejected/documented instead of silently erased. |
 | Provider integration | Direct HTTP adapters | Official SDK per provider; generic SDK | Direct HTTP gives precise control over streaming, headers, errors, retries, and connection lifecycle. |
@@ -1333,7 +1333,7 @@ React + Vite:
 
 ### 27.1 Required Tools
 
-- Go 1.27 toolchain;
+- Go 1.26 toolchain;
 - Docker + Docker Compose;
 - Node.js LTS + npm;
 - PostgreSQL client optional;
@@ -1773,7 +1773,7 @@ Those changes require an ADR or explicit human approval.
 
 Build:
 
-- Go 1.27 project baseline;
+- Go 1.26.7 project baseline;
 - three `http.Server`s;
 - graceful shutdown;
 - config loading;
@@ -2126,7 +2126,7 @@ Unknown numeric performance targets remain TBD until baseline measurement; they 
 
 As of 2026-08-28:
 
-- Go 1.27 is the current Go release selected for this project.
+- Go 1.26 is the project release line selected by the owner, with Go 1.26.7 as the minimum supported security patch. Go 1.27 is the current release as of 2026-08-28; upgrading release lines is an explicit future toolchain decision rather than an automatic change.
 - Go HTTP Transports are designed to be reused and are safe for concurrent use.
 - OpenAI supports streaming through SSE and recommends its Responses API for new OpenAI-native projects, while Chat Completions remains available.
 - Anthropic's Messages API streams named SSE events and has different event semantics from OpenAI-style data-only streams.
@@ -2216,7 +2216,7 @@ This is part of the product's Definition of Done.
 - Target platform: Web management console + Go backend LLM Gateway
 - Budget: Flexible; local/self-host first, pay only for clear engineering value
 - Timeline: Approximately 12 weeks / 3 months; quality over deadline; 20+ hours/week
-- Chosen stack: React + Vite + TypeScript frontend; Go 1.27 net/http modular monolith; PostgreSQL + pgx/v5 + sqlc + golang-migrate; optional Redis; Prometheus + OpenTelemetry + Tempo + Grafana; Docker Compose + Caddy
+- Chosen stack: React + Vite + TypeScript frontend; Go 1.26 net/http modular monolith; PostgreSQL + pgx/v5 + sqlc + golang-migrate; optional Redis; Prometheus + OpenTelemetry + Tempo + Grafana; Docker Compose + Caddy
 - AI coding tool: Tool-agnostic Coding Agent workflow governed by AGENTS.md/spec/ADR; AI leads implementation, human leads understanding and approval
 - Source files: research-Production-Go-LLM-Gateway.md → PRD-Production-Go-LLM-Gateway-MVP.md → TechDesign-Production-Go-LLM-Gateway-MVP.md
 
@@ -2227,7 +2227,7 @@ This is part of the product's Definition of Done.
   "appName": "Production Go LLM Gateway",
   "stack": {
     "frontend": "React + Vite + TypeScript",
-    "backend": "Go 1.27 net/http modular monolith with separate Data, Control, and Ops listeners",
+    "backend": "Go 1.26 net/http modular monolith with separate Data, Control, and Ops listeners",
     "database": "PostgreSQL + pgx/v5 + sqlc + golang-migrate",
     "auth": "GitHub OAuth 2.0 + server-side Web sessions; hashed virtual API keys for Data Plane",
     "styling": "Tailwind CSS + shadcn/ui",
