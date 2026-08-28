@@ -1,0 +1,11 @@
+# Repository-scoped Codex defaults. Loaded only after the project is trusted.
+# AGENTS.md and agent_docs/ are the source of truth for project behavior.
+# Model/provider/auth/telemetry preferences remain in the user-level config.
+
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+allow_login_shell = false
+project_doc_max_bytes = 32768
+
+[sandbox_workspace_write]
+network_access = false

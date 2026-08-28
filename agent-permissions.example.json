@@ -1,0 +1,25 @@
+{
+  "lastVerified": "2026-08",
+  "defaultPolicy": "ask-first",
+  "protectedPaths": [
+    ".env*",
+    ".git/**",
+    ".github/workflows/**",
+    "db/migrations/**",
+    "deploy/**"
+  ],
+  "toolClasses": {
+    "readOnly": "allowed with authorized repository and development data",
+    "write": "requires scoped task intent",
+    "destructive": "requires explicit human approval",
+    "externalNetwork": "requires an approved destination and purpose",
+    "credentialBearing": "requires server-side authorization and secret redaction",
+    "costBearing": "requires explicit human approval and a bounded budget",
+    "production": "requires explicit human approval, verification evidence, rollback notes, and audit notes"
+  },
+  "mcpServers": {
+    "trustedOnly": true,
+    "remoteTransport": "streamable-http",
+    "requireAuthReview": true
+  }
+}
