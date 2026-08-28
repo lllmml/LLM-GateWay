@@ -313,6 +313,72 @@ func TestLogoutRequiresOriginCSRFAndDeletesSession(t *testing.T) {
 	}
 }
 
+func TestCanonicalOriginNormalizesCaseDefaultPortsAndLoopback(t *testing.T) {
+	tests := []struct {
+		name  string
+		left  string
+		right string
+	}{
+		{name: "HTTPS host and scheme case", left: "HTTPS://Console.Example.test:443", right: "https://console.example.test"},
+		{name: "HTTP default port", left: "HTTP://127.0.0.1:80", right: "http://127.0.0.1"},
+		{name: "IPv6 loopback", left: "http://[0:0:0:0:0:0:0:1]:80", right: "http://[::1]"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			left, err := canonicalOrigin(tt.left, false)
+			if err != nil {
+				t.Fatalf("canonicalize left origin: %v", err)
+			}
+			right, err := canonicalOrigin(tt.right, false)
+			if err != nil {
+				t.Fatalf("canonicalize right origin: %v", err)
+			}
+			if left != right {
+				t.Fatalf("origins differ: left=%+v right=%+v", left, right)
+			}
+		})
+	}
+}
+
+func TestNewAuthHandlerAllowsIPv6LoopbackDevelopmentOrigin(t *testing.T) {
+	_ = newTestAuthHandler(t, testAuthDeps{publicURL: "http://[::1]:8081"})
+}
+
+func TestRequireSameOriginUsesCanonicalOriginAndRejectsDifferentHost(t *testing.T) {
+	handler := newTestAuthHandler(t, testAuthDeps{
+		publicURL:     "https://Console.Example.test:443",
+		secureCookies: true,
+	})
+
+	tests := []struct {
+		name       string
+		origin     string
+		wantStatus int
+	}{
+		{name: "equivalent canonical origin", origin: "https://console.example.test", wantStatus: http.StatusNoContent},
+		{name: "different origin", origin: "https://console.example.test.evil", wantStatus: http.StatusForbidden},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/mutation", nil)
+			request.Header.Set("Origin", tt.origin)
+			request.Header.Set("X-CSRF-Token", "csrf-token")
+			request.AddCookie(&http.Cookie{Name: defaultCSRFCookie, Value: "csrf-token"})
+			response := httptest.NewRecorder()
+
+			handler.RequireSameOrigin(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				response.WriteHeader(http.StatusNoContent)
+			})).ServeHTTP(response, request)
+
+			if response.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, tt.wantStatus)
+			}
+		})
+	}
+}
+
 func TestLogoutKeepsCookiesWhenSessionDeletionFails(t *testing.T) {
 	user := User{ID: "user-1", GitHubLogin: "octo"}
 	store := newFakeSessionStore(user)

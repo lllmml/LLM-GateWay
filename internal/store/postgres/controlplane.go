@@ -16,6 +16,8 @@ import (
 	projectdomain "github.com/lllmml/production-go-llm-gateway/internal/controlplane/project"
 )
 
+const projectOwnerSlugConstraint = "projects_owner_user_id_slug_idx"
+
 func (s *Store) UpsertGitHubUser(ctx context.Context, githubUser controlplane.GitHubUser) (controlplane.User, error) {
 	id, err := newUUID()
 	if err != nil {
@@ -93,7 +95,7 @@ func (s *Store) CreateProject(ctx context.Context, params projectdomain.CreatePa
 		Name:        params.Name,
 		Slug:        params.Slug,
 	})
-	if isUniqueViolation(err) {
+	if isProjectSlugConflict(err) {
 		return projectdomain.Project{}, projectdomain.ErrConflict
 	}
 	if err != nil {
@@ -148,7 +150,7 @@ func (s *Store) UpdateProject(ctx context.Context, ownerUserID, projectID string
 	if errors.Is(err, pgx.ErrNoRows) {
 		return projectdomain.Project{}, projectdomain.ErrNotFound
 	}
-	if isUniqueViolation(err) {
+	if isProjectSlugConflict(err) {
 		return projectdomain.Project{}, projectdomain.ErrConflict
 	}
 	if err != nil {
@@ -245,7 +247,7 @@ func timestamptz(value time.Time) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: value, Valid: true}
 }
 
-func isUniqueViolation(err error) bool {
+func isProjectSlugConflict(err error) bool {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == projectOwnerSlugConstraint
 }

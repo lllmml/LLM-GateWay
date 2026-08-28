@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -96,7 +97,7 @@ type AuthConfig struct {
 type AuthHandler struct {
 	oauth             oauth2.Config
 	githubUserURL     string
-	publicOrigin      string
+	publicOrigin      origin
 	loginRedirectPath string
 	sessionCookieName string
 	stateCookieName   string
@@ -114,6 +115,12 @@ type AuthHandler struct {
 }
 
 type contextUserKey struct{}
+
+type origin struct {
+	scheme string
+	host   string
+	port   string
+}
 
 func NewAuthHandler(config AuthConfig, users UserStore, sessions SessionStore) (*AuthHandler, error) {
 	if users == nil {
@@ -138,17 +145,18 @@ func NewAuthHandler(config AuthConfig, users UserStore, sessions SessionStore) (
 		return nil, err
 	}
 
-	parsedPublicURL, err := url.Parse(config.PublicConsoleURL)
-	if err != nil || parsedPublicURL.Host == "" || parsedPublicURL.User != nil || (parsedPublicURL.Path != "" && parsedPublicURL.Path != "/") || parsedPublicURL.RawQuery != "" || parsedPublicURL.Fragment != "" {
+	publicOrigin, err := canonicalOrigin(config.PublicConsoleURL, true)
+	if err != nil {
 		return nil, errors.New("public console URL must be an origin URL")
 	}
-	if parsedPublicURL.Scheme == "https" {
+	if publicOrigin.scheme == "https" {
 		if !config.SecureCookies {
 			return nil, errors.New("https public console requires secure cookies")
 		}
-	} else if parsedPublicURL.Scheme != "http" || !isLoopback(parsedPublicURL.Hostname()) {
+	} else if !isLoopback(publicOrigin.host) {
 		return nil, errors.New("public console URL must use https except for loopback development")
 	}
+	parsedPublicURL, _ := url.Parse(config.PublicConsoleURL)
 	loginRedirectPath := valueOrDefault(config.LoginRedirectPath, defaultLoginRedirect)
 	if !strings.HasPrefix(loginRedirectPath, "/") || strings.HasPrefix(loginRedirectPath, "//") {
 		return nil, errors.New("login redirect path must be a same-origin absolute path")
@@ -169,7 +177,7 @@ func NewAuthHandler(config AuthConfig, users UserStore, sessions SessionStore) (
 	handler := &AuthHandler{
 		oauth:             oauthConfig,
 		githubUserURL:     valueOrDefault(config.GitHubUserURL, githubUserURL),
-		publicOrigin:      parsedPublicURL.Scheme + "://" + parsedPublicURL.Host,
+		publicOrigin:      publicOrigin,
 		loginRedirectPath: loginRedirectPath,
 		sessionCookieName: valueOrDefault(config.SessionCookieName, defaultSessionCookie),
 		stateCookieName:   valueOrDefault(config.StateCookieName, defaultStateCookie),
@@ -464,11 +472,11 @@ func expiredCookie(name, path string, secure, httpOnly bool) *http.Cookie {
 }
 
 func (h *AuthHandler) hasValidOrigin(request *http.Request) bool {
-	origin := request.Header.Get("Origin")
-	if origin == "" {
+	requestOrigin, err := canonicalOrigin(request.Header.Get("Origin"), false)
+	if err != nil {
 		return false
 	}
-	return constantTimeEqual(origin, h.publicOrigin)
+	return requestOrigin == h.publicOrigin
 }
 
 func (h *AuthHandler) hasValidCSRF(request *http.Request) bool {
@@ -495,6 +503,47 @@ func isLoopback(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+func canonicalOrigin(raw string, allowRootPath bool) (origin, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Opaque != "" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return origin{}, errors.New("invalid origin")
+	}
+	if parsed.Path != "" && (!allowRootPath || parsed.Path != "/") {
+		return origin{}, errors.New("origin must not contain a path")
+	}
+
+	scheme := strings.ToLower(parsed.Scheme)
+	defaultPort := ""
+	switch scheme {
+	case "https":
+		defaultPort = "443"
+	case "http":
+		defaultPort = "80"
+	default:
+		return origin{}, errors.New("origin scheme must be http or https")
+	}
+
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" {
+		return origin{}, errors.New("origin host is required")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
+
+	port := parsed.Port()
+	if port == "" {
+		port = defaultPort
+	} else {
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return origin{}, errors.New("invalid origin port")
+		}
+		port = strconv.Itoa(portNumber)
+	}
+	return origin{scheme: scheme, host: host, port: port}, nil
 }
 
 func randomToken(reader io.Reader, byteCount int) (string, error) {

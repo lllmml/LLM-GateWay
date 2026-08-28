@@ -73,7 +73,7 @@ func TestControlPlaneFoundationConstraints(t *testing.T) {
 	store, cleanup := newMigratedStore(t, ctx)
 	defer cleanup()
 
-	queries := store.Queries()
+	queries := store.queries
 	userID := newTestUUID(t)
 	_, err := queries.UpsertUserFromGitHub(ctx, UpsertUserFromGitHubParams{
 		ID:          userID,
@@ -138,7 +138,7 @@ func TestProjectOwnershipAndSessionLookupQueries(t *testing.T) {
 	store, cleanup := newMigratedStore(t, ctx)
 	defer cleanup()
 
-	queries := store.Queries()
+	queries := store.queries
 	ownerID := newTestUUID(t)
 	otherID := newTestUUID(t)
 
@@ -294,6 +294,20 @@ func TestControlPlaneStoreAdapters(t *testing.T) {
 		Slug:        "gateway",
 	}); !errors.Is(err, projectdomain.ErrConflict) {
 		t.Fatalf("duplicate slug error = %v, want ErrConflict", err)
+	}
+	second, err := store.CreateProject(ctx, projectdomain.CreateParams{
+		OwnerUserID: owner.ID,
+		Name:        "Second Project",
+		Slug:        "second-project",
+	})
+	if err != nil {
+		t.Fatalf("create second project: %v", err)
+	}
+	duplicateSlug := created.Slug
+	if _, err := store.UpdateProject(ctx, owner.ID, second.ID, projectdomain.UpdateParams{
+		Slug: &duplicateSlug,
+	}); !errors.Is(err, projectdomain.ErrConflict) {
+		t.Fatalf("update duplicate slug error = %v, want ErrConflict", err)
 	}
 }
 

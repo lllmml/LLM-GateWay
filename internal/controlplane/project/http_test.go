@@ -63,6 +63,40 @@ func TestHandlerMapsCrossOwnerLookupToNotFound(t *testing.T) {
 	}
 }
 
+func TestProjectJSONResponsesAreNotCacheable(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		body       string
+		wantStatus int
+	}{
+		{name: "list success", method: http.MethodGet, path: "/api/v1/projects", wantStatus: http.StatusOK},
+		{name: "create success", method: http.MethodPost, path: "/api/v1/projects", body: `{"name":"Gateway","slug":"gateway"}`, wantStatus: http.StatusCreated},
+		{name: "validation error", method: http.MethodPost, path: "/api/v1/projects", body: `{"name":"Gateway","slug":"invalid--slug"}`, wantStatus: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeStore{}
+			handler := NewHandler(NewService(store), func(*http.Request) (string, bool) { return "owner-from-session", true })
+			mux := http.NewServeMux()
+			handler.Register(mux)
+
+			request := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, request)
+
+			if response.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", response.Code, tt.wantStatus, response.Body.String())
+			}
+			if got := response.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("Cache-Control = %q, want no-store", got)
+			}
+		})
+	}
+}
+
 type errorStore struct {
 	err error
 }

@@ -52,10 +52,6 @@ func (s *Store) Ping(ctx context.Context) error {
 	return s.pool.Ping(ctx)
 }
 
-func (s *Store) Queries() *Queries {
-	return s.queries
-}
-
 func (s *Store) Close() {
 	s.pool.Close()
 }
