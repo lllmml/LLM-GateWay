@@ -341,6 +341,20 @@ func TestCanonicalOriginNormalizesCaseDefaultPortsAndLoopback(t *testing.T) {
 	}
 }
 
+func TestCanonicalOriginPreservesIPv4MappedIPv6Identity(t *testing.T) {
+	ipv4, err := canonicalOrigin("http://127.0.0.1", false)
+	if err != nil {
+		t.Fatalf("canonicalize IPv4 origin: %v", err)
+	}
+	mappedIPv6, err := canonicalOrigin("http://[::ffff:127.0.0.1]", false)
+	if err != nil {
+		t.Fatalf("canonicalize IPv4-mapped IPv6 origin: %v", err)
+	}
+	if ipv4 == mappedIPv6 {
+		t.Fatalf("IPv4 and IPv4-mapped IPv6 origins compare equal: IPv4=%+v mappedIPv6=%+v", ipv4, mappedIPv6)
+	}
+}
+
 func TestNewAuthHandlerAllowsIPv6LoopbackDevelopmentOrigin(t *testing.T) {
 	_ = newTestAuthHandler(t, testAuthDeps{publicURL: "http://[::1]:8081"})
 }

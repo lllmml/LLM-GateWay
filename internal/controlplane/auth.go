@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -529,8 +530,8 @@ func canonicalOrigin(raw string, allowRootPath bool) (origin, error) {
 	if host == "" {
 		return origin{}, errors.New("origin host is required")
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		host = ip.String()
+	if addr, err := netip.ParseAddr(host); err == nil {
+		host = addr.String()
 	}
 
 	port := parsed.Port()
