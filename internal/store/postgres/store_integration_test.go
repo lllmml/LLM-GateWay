@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	sharedapikey "github.com/lllmml/production-go-llm-gateway/internal/apikey"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/apikey"
 	projectdomain "github.com/lllmml/production-go-llm-gateway/internal/controlplane/project"
@@ -311,7 +312,7 @@ func TestVirtualAPIKeyStoreAdapterAndConstraints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse shown-once key ID: %v", err)
 	}
-	expectedDigest, err := apikey.HashKey(shownOnce.RawKey, pepper)
+	expectedDigest, err := sharedapikey.HashKey(shownOnce.RawKey, pepper)
 	if err != nil {
 		t.Fatalf("hash shown-once key: %v", err)
 	}
