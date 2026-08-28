@@ -27,9 +27,9 @@ Use one Go 1.26 modular-monolith process with three independently configured `ht
 - Control Plane on `:8081` by default.
 - Operations Plane on `:9090` by default and kept private in production.
 
-Each server owns a separate `ServeMux` and timeout policy. The Data Plane intentionally has no server-wide `WriteTimeout`, because that timeout would cover the lifetime of valid long-running streams. All listeners are bound before serving so a port conflict fails startup without leaving a partially running application.
+Each server owns a separate `ServeMux` and timeout policy. `ReadHeaderTimeout` bounds the time spent reading only request headers. The Data Plane also has a bounded `ReadTimeout` for the full request read, which prevents clients from sending headers and then trickling a request body forever during the Week 1 foundation. The Data Plane intentionally has no server-wide `WriteTimeout`, because that timeout would cover the lifetime of valid long-running SSE streams. `IdleTimeout` applies only between requests on an idle keep-alive connection. All listeners are bound before serving so a port conflict fails startup without leaving a partially running application.
 
-On shutdown, the process stops accepting new traffic, drains Control and Data Plane work within a bounded timeout, stops Operations, and closes PostgreSQL. Package boundaries remain conceptual seams that can support a later binary split without introducing service boundaries now.
+On shutdown, the process stops accepting new traffic, starts graceful shutdown for Control, Data, and Operations concurrently under one application-level deadline, force-closes any server that does not drain by the deadline, and closes PostgreSQL. Package boundaries remain conceptual seams that can support a later binary split without introducing service boundaries now.
 
 ## Consequences
 
@@ -41,8 +41,8 @@ On shutdown, the process stops accepting new traffic, drains Control and Data Pl
 
 ## Verification
 
-- Unit tests assert that the Data Plane has no global `WriteTimeout` while other planes use bounded timeouts.
-- Lifecycle tests cover all three listeners, basic routing, port conflicts, active-request draining, and database closure.
+- Unit tests assert that the Data Plane has no global `WriteTimeout`, does have bounded request-read protection, and other planes use bounded timeouts.
+- Lifecycle tests cover all three listeners, basic routing, port conflicts, active-request draining, concurrent graceful shutdown, forced close after timeout, and database closure.
 - Manual verification checks readiness with PostgreSQL available, unavailable, and restored, followed by an actual `SIGTERM`.
 
 ## Revisit when

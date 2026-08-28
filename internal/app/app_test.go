@@ -68,6 +68,9 @@ func TestDataPlaneHasNoWriteTimeout(t *testing.T) {
 	if application.dataPlaneServer.WriteTimeout != 0 {
 		t.Fatalf("data plane WriteTimeout = %v, want 0 for streaming", application.dataPlaneServer.WriteTimeout)
 	}
+	if application.dataPlaneServer.ReadTimeout != dataPlaneReadTimeout {
+		t.Fatalf("data plane ReadTimeout = %v, want %v", application.dataPlaneServer.ReadTimeout, dataPlaneReadTimeout)
+	}
 	if application.controlPlaneServer.WriteTimeout != controlWriteTimeout {
 		t.Fatalf("control plane WriteTimeout = %v, want %v", application.controlPlaneServer.WriteTimeout, controlWriteTimeout)
 	}
@@ -153,6 +156,155 @@ func TestRunDrainsActiveDataPlaneRequest(t *testing.T) {
 	}
 	if err := <-runResult; err != nil {
 		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestRunStartsDataPlaneShutdownWhileControlPlaneRequestIsBlocked(t *testing.T) {
+	database := &fakeDatabase{}
+	options := testOptions(t)
+	options.ShutdownTimeout = 750 * time.Millisecond
+
+	controlStarted := make(chan struct{})
+	releaseControl := make(chan struct{})
+	var controlStartedOnce sync.Once
+	options.ControlPlaneHandler = http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		controlStartedOnce.Do(func() { close(controlStarted) })
+		<-releaseControl
+		response.WriteHeader(http.StatusNoContent)
+	})
+
+	dataStarted := make(chan struct{})
+	dataShutdownStarted := make(chan struct{})
+	var dataStartedOnce sync.Once
+	options.DataPlaneHandler = http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		dataStartedOnce.Do(func() { close(dataStarted) })
+		select {
+		case <-dataShutdownStarted:
+			response.WriteHeader(http.StatusNoContent)
+		case <-request.Context().Done():
+		}
+	})
+
+	application := newTestApp(t, database, options)
+	application.dataPlaneServer.RegisterOnShutdown(func() {
+		close(dataShutdownStarted)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- application.Run(ctx)
+	}()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	waitForStatus(t, client, "http://"+options.OpsAddr+"/health/live", http.StatusOK)
+
+	controlResult := make(chan error, 1)
+	go func() {
+		response, err := client.Get("http://" + options.ControlPlaneAddr + "/blocked")
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		controlResult <- err
+	}()
+
+	dataResult := make(chan error, 1)
+	go func() {
+		response, err := client.Get("http://" + options.DataPlaneAddr + "/active")
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		dataResult <- err
+	}()
+
+	select {
+	case <-controlStarted:
+	case <-time.After(time.Second):
+		t.Fatal("control plane request did not start")
+	}
+	select {
+	case <-dataStarted:
+	case <-time.After(time.Second):
+		t.Fatal("data plane request did not start")
+	}
+
+	cancel()
+
+	select {
+	case err := <-dataResult:
+		if err != nil {
+			t.Fatalf("data plane request failed before graceful drain: %v", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		close(releaseControl)
+		t.Fatal("data plane did not begin graceful shutdown while control plane was blocked")
+	}
+
+	close(releaseControl)
+	if err := <-controlResult; err != nil {
+		t.Fatalf("control plane request failed after release: %v", err)
+	}
+	if err := <-runResult; err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestRunForceClosesStuckRequestAfterShutdownTimeout(t *testing.T) {
+	database := &fakeDatabase{}
+	options := testOptions(t)
+	options.ShutdownTimeout = 200 * time.Millisecond
+
+	requestStarted := make(chan struct{})
+	var requestStartedOnce sync.Once
+	options.DataPlaneHandler = http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		requestStartedOnce.Do(func() { close(requestStarted) })
+		<-request.Context().Done()
+	})
+
+	application := newTestApp(t, database, options)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- application.Run(ctx)
+	}()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	waitForStatus(t, client, "http://"+options.OpsAddr+"/health/live", http.StatusOK)
+
+	requestResult := make(chan error, 1)
+	go func() {
+		response, err := client.Get("http://" + options.DataPlaneAddr + "/stuck")
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		requestResult <- err
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("data plane request did not start")
+	}
+
+	cancel()
+
+	select {
+	case err := <-runResult:
+		if err == nil {
+			t.Fatal("Run returned nil error, want shutdown timeout error")
+		}
+		if !strings.Contains(err.Error(), "shutdown data plane") {
+			t.Fatalf("Run error = %v, want data-plane shutdown error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after shutdown timeout")
+	}
+
+	select {
+	case <-requestResult:
+	case <-time.After(time.Second):
+		t.Fatal("stuck request was not force closed")
 	}
 }
 

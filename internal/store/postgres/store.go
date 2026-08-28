@@ -2,7 +2,13 @@ package postgres
 
 import (
 	"context"
+	"errors"
+	"net"
+	"os"
+	"strings"
+	"syscall"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -12,11 +18,15 @@ type ConnectionError struct {
 }
 
 func (e *ConnectionError) Error() string {
-	return "postgres " + e.Operation + " failed"
+	return "postgres " + e.Operation + " failed: " + e.SafeCause()
 }
 
 func (e *ConnectionError) Unwrap() error {
 	return e.Err
+}
+
+func (e *ConnectionError) SafeCause() string {
+	return classifyConnectionError(e.Err)
 }
 
 type Store struct {
@@ -43,4 +53,45 @@ func (s *Store) Ping(ctx context.Context) error {
 
 func (s *Store) Close() {
 	s.pool.Close()
+}
+
+func classifyConnectionError(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "dns"
+	}
+
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return "connection_refused"
+	}
+
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) && errors.Is(pathErr.Err, syscall.ECONNREFUSED) {
+		return "connection_refused"
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		if strings.HasPrefix(pgErr.Code, "28") {
+			return "authentication_or_configuration"
+		}
+		return "server_error"
+	}
+
+	return "unclassified"
 }

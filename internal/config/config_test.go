@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"log/slog"
 	"strings"
 	"testing"
@@ -10,7 +11,7 @@ import (
 func TestLoadUsesDefaults(t *testing.T) {
 	values := map[string]string{
 		"DATABASE_URL":          "postgres://example",
-		"CREDENTIAL_MASTER_KEY": "development-key",
+		"CREDENTIAL_MASTER_KEY": testCredentialMasterKey(),
 	}
 
 	cfg, err := load(mapLookup(values))
@@ -43,7 +44,7 @@ func TestLoadRejectsMissingRequiredValues(t *testing.T) {
 	}{
 		{
 			name:   "database URL",
-			values: map[string]string{"CREDENTIAL_MASTER_KEY": "development-key"},
+			values: map[string]string{"CREDENTIAL_MASTER_KEY": testCredentialMasterKey()},
 			want:   "DATABASE_URL is required",
 		},
 		{
@@ -66,7 +67,7 @@ func TestLoadRejectsMissingRequiredValues(t *testing.T) {
 func TestLoadRejectsDuplicateAddresses(t *testing.T) {
 	values := map[string]string{
 		"DATABASE_URL":          "postgres://example",
-		"CREDENTIAL_MASTER_KEY": "development-key",
+		"CREDENTIAL_MASTER_KEY": testCredentialMasterKey(),
 		"DATA_PLANE_ADDR":       ":8080",
 		"CONTROL_PLANE_ADDR":    ":8080",
 	}
@@ -80,7 +81,7 @@ func TestLoadRejectsDuplicateAddresses(t *testing.T) {
 func TestLoadParsesOverrides(t *testing.T) {
 	values := map[string]string{
 		"DATABASE_URL":             "postgres://example",
-		"CREDENTIAL_MASTER_KEY":    "development-key",
+		"CREDENTIAL_MASTER_KEY":    testCredentialMasterKey(),
 		"LOG_LEVEL":                "debug",
 		"DATABASE_CONNECT_TIMEOUT": "7s",
 		"READINESS_TIMEOUT":        "3s",
@@ -111,4 +112,8 @@ func mapLookup(values map[string]string) func(string) (string, bool) {
 		value, ok := values[key]
 		return value, ok
 	}
+}
+
+func testCredentialMasterKey() string {
+	return base64.StdEncoding.EncodeToString(make([]byte, 32))
 }

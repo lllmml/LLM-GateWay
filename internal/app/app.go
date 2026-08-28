@@ -12,6 +12,7 @@ import (
 
 const (
 	defaultReadHeaderTimeout = 5 * time.Second
+	dataPlaneReadTimeout     = 30 * time.Second
 	defaultIdleTimeout       = 60 * time.Second
 	controlReadTimeout       = 15 * time.Second
 	controlWriteTimeout      = 30 * time.Second
@@ -153,11 +154,25 @@ func (a *App) shutdown() error {
 		{name: "operations", server: a.opsServer},
 	}
 
-	var shutdownErr error
+	errs := make(chan error, len(servers))
 	for _, current := range servers {
-		if err := current.server.Shutdown(ctx); err != nil {
-			_ = current.server.Close()
-			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("shutdown %s plane: %w", current.name, err))
+		current := current
+		go func() {
+			if err := current.server.Shutdown(ctx); err != nil {
+				if closeErr := current.server.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) && !errors.Is(closeErr, net.ErrClosed) {
+					err = errors.Join(err, fmt.Errorf("force close %s plane: %w", current.name, closeErr))
+				}
+				errs <- fmt.Errorf("shutdown %s plane: %w", current.name, err)
+				return
+			}
+			errs <- nil
+		}()
+	}
+
+	var shutdownErr error
+	for range servers {
+		if err := <-errs; err != nil {
+			shutdownErr = errors.Join(shutdownErr, err)
 		}
 	}
 	return shutdownErr
@@ -168,8 +183,12 @@ func newDataPlaneServer(address string, handler http.Handler) *http.Server {
 		Addr:              address,
 		Handler:           handler,
 		ReadHeaderTimeout: defaultReadHeaderTimeout,
-		IdleTimeout:       defaultIdleTimeout,
-		MaxHeaderBytes:    maxHeaderBytes,
+		// ReadTimeout bounds header-plus-body reads so a client cannot send
+		// headers and then trickle a request body forever. WriteTimeout stays
+		// zero because future SSE responses may be valid long-running streams.
+		ReadTimeout:    dataPlaneReadTimeout,
+		IdleTimeout:    defaultIdleTimeout,
+		MaxHeaderBytes: maxHeaderBytes,
 	}
 }
 
