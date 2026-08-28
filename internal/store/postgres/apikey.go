@@ -34,7 +34,10 @@ func (s *Store) CreateKey(ctx context.Context, params apikey.CreateParams) (apik
 	if err != nil {
 		return apikey.Key{}, err
 	}
-	return domainAPIKey(stored), nil
+	return domainAPIKey(
+		stored.ID, stored.ProjectID, stored.Name, stored.KeyPrefix, stored.Status,
+		stored.CreatedAt, stored.LastUsedAt, stored.RevokedAt,
+	), nil
 }
 
 func (s *Store) ListKeys(ctx context.Context, ownerUserID, projectID string) ([]apikey.Key, error) {
@@ -59,7 +62,10 @@ func (s *Store) ListKeys(ctx context.Context, ownerUserID, projectID string) ([]
 	}
 	keys := make([]apikey.Key, 0, len(stored))
 	for _, current := range stored {
-		keys = append(keys, domainAPIKey(current))
+		keys = append(keys, domainAPIKey(
+			current.ID, current.ProjectID, current.Name, current.KeyPrefix, current.Status,
+			current.CreatedAt, current.LastUsedAt, current.RevokedAt,
+		))
 	}
 	return keys, nil
 }
@@ -70,7 +76,16 @@ func (s *Store) DisableKey(ctx context.Context, ownerUserID, projectID, keyID st
 		return apikey.Key{}, err
 	}
 	stored, err := s.queries.DisableVirtualAPIKeyForOwner(ctx, DisableVirtualAPIKeyForOwnerParams(ids))
-	return apiKeyMutationResult(stored, err)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return apikey.Key{}, apikey.ErrNotFound
+	}
+	if err != nil {
+		return apikey.Key{}, err
+	}
+	return domainAPIKey(
+		stored.ID, stored.ProjectID, stored.Name, stored.KeyPrefix, stored.Status,
+		stored.CreatedAt, stored.LastUsedAt, stored.RevokedAt,
+	), nil
 }
 
 func (s *Store) RevokeKey(ctx context.Context, ownerUserID, projectID, keyID string) (apikey.Key, error) {
@@ -79,7 +94,16 @@ func (s *Store) RevokeKey(ctx context.Context, ownerUserID, projectID, keyID str
 		return apikey.Key{}, err
 	}
 	stored, err := s.queries.RevokeVirtualAPIKeyForOwner(ctx, RevokeVirtualAPIKeyForOwnerParams(ids))
-	return apiKeyMutationResult(stored, err)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return apikey.Key{}, apikey.ErrNotFound
+	}
+	if err != nil {
+		return apikey.Key{}, err
+	}
+	return domainAPIKey(
+		stored.ID, stored.ProjectID, stored.Name, stored.KeyPrefix, stored.Status,
+		stored.CreatedAt, stored.LastUsedAt, stored.RevokedAt,
+	), nil
 }
 
 type virtualKeyIDParams struct {
@@ -112,26 +136,20 @@ func ownerAndProjectIDs(ownerUserID, projectID string) (pgtype.UUID, pgtype.UUID
 	return ownerID, selectedProjectID, nil
 }
 
-func apiKeyMutationResult(stored VirtualApiKey, err error) (apikey.Key, error) {
-	if errors.Is(err, pgx.ErrNoRows) {
-		return apikey.Key{}, apikey.ErrNotFound
-	}
-	if err != nil {
-		return apikey.Key{}, err
-	}
-	return domainAPIKey(stored), nil
-}
-
-func domainAPIKey(key VirtualApiKey) apikey.Key {
+func domainAPIKey(
+	id, projectID pgtype.UUID,
+	name, keyPrefix, status string,
+	createdAt, lastUsedAt, revokedAt pgtype.Timestamptz,
+) apikey.Key {
 	return apikey.Key{
-		ID:         formatUUID(key.ID),
-		ProjectID:  formatUUID(key.ProjectID),
-		Name:       key.Name,
-		Prefix:     key.KeyPrefix,
-		Status:     apikey.Status(key.Status),
-		CreatedAt:  key.CreatedAt.Time,
-		LastUsedAt: timePointer(key.LastUsedAt),
-		RevokedAt:  timePointer(key.RevokedAt),
+		ID:         formatUUID(id),
+		ProjectID:  formatUUID(projectID),
+		Name:       name,
+		Prefix:     keyPrefix,
+		Status:     apikey.Status(status),
+		CreatedAt:  createdAt.Time,
+		LastUsedAt: timePointer(lastUsedAt),
+		RevokedAt:  timePointer(revokedAt),
 	}
 }
 

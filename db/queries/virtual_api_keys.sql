@@ -15,7 +15,7 @@ SELECT
 FROM projects
 WHERE projects.id = sqlc.arg('project_id')
   AND projects.owner_user_id = sqlc.arg('owner_user_id')
-RETURNING id, project_id, name, key_prefix, key_hash, status, created_at, last_used_at, revoked_at;
+RETURNING id, project_id, name, key_prefix, status, created_at, last_used_at, revoked_at;
 
 -- name: ListVirtualAPIKeysForOwner :many
 SELECT
@@ -23,7 +23,6 @@ SELECT
     keys.project_id,
     keys.name,
     keys.key_prefix,
-    keys.key_hash,
     keys.status,
     keys.created_at,
     keys.last_used_at,
@@ -45,7 +44,7 @@ WHERE keys.id = $1
   AND keys.project_id = $2
   AND projects.id = keys.project_id
   AND projects.owner_user_id = $3
-RETURNING keys.id, keys.project_id, keys.name, keys.key_prefix, keys.key_hash, keys.status, keys.created_at, keys.last_used_at, keys.revoked_at;
+RETURNING keys.id, keys.project_id, keys.name, keys.key_prefix, keys.status, keys.created_at, keys.last_used_at, keys.revoked_at;
 
 -- name: RevokeVirtualAPIKeyForOwner :one
 UPDATE virtual_api_keys AS keys
@@ -57,4 +56,4 @@ WHERE keys.id = $1
   AND keys.project_id = $2
   AND projects.id = keys.project_id
   AND projects.owner_user_id = $3
-RETURNING keys.id, keys.project_id, keys.name, keys.key_prefix, keys.key_hash, keys.status, keys.created_at, keys.last_used_at, keys.revoked_at;
+RETURNING keys.id, keys.project_id, keys.name, keys.key_prefix, keys.status, keys.created_at, keys.last_used_at, keys.revoked_at;

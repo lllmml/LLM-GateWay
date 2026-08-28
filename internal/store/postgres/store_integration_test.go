@@ -193,6 +193,31 @@ func TestVirtualAPIKeyStoreAdapterAndConstraints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create other project: %v", err)
 	}
+	missingProjectID := formatUUID(newTestUUID(t))
+	for _, test := range []struct {
+		name        string
+		ownerUserID string
+		projectID   string
+	}{
+		{name: "missing project", ownerUserID: owner.ID, projectID: missingProjectID},
+		{name: "cross-owner project", ownerUserID: other.ID, projectID: project.ID},
+	} {
+		t.Run("create key under "+test.name, func(t *testing.T) {
+			_, err := store.CreateKey(ctx, apikey.CreateParams{
+				OwnerUserID: test.ownerUserID,
+				ProjectID:   test.projectID,
+				Name:        "not-created",
+				Prefix:      "notfound",
+				KeyHash:     bytes.Repeat([]byte{8}, 32),
+			})
+			if !errors.Is(err, apikey.ErrNotFound) {
+				t.Fatalf("create key error = %v, want ErrNotFound", err)
+			}
+		})
+	}
+	if keys, err := store.ListKeys(ctx, owner.ID, missingProjectID); !errors.Is(err, apikey.ErrNotFound) || keys != nil {
+		t.Fatalf("missing-project list = (%+v, %v), want nil, ErrNotFound", keys, err)
+	}
 
 	keyHash := bytes.Repeat([]byte{1}, 32)
 	created, err := store.CreateKey(ctx, apikey.CreateParams{

@@ -99,7 +99,7 @@ func TestControlPlaneProjectAndKeyRoutesUseSessionOwnerAndCSRF(t *testing.T) {
 	keyCreateResponse := httptest.NewRecorder()
 	handler.ServeHTTP(keyCreateResponse, keyCreateRequest)
 	if keyCreateResponse.Code != http.StatusCreated {
-		t.Fatalf("key create status = %d, want %d; body=%s", keyCreateResponse.Code, http.StatusCreated, keyCreateResponse.Body.String())
+		t.Fatalf("key create status = %d, want %d", keyCreateResponse.Code, http.StatusCreated)
 	}
 	if keys.createCalls != 1 || keys.lastOwner != user.ID || keys.lastProject != "project-1" {
 		t.Fatal("key create did not use session owner and path project")

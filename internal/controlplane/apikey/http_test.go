@@ -20,7 +20,7 @@ func TestCreateReturnsRawKeyOnceAndNoStoreCaching(t *testing.T) {
 	handler.ServeHTTP(response, request)
 
 	if response.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusCreated, response.Body.String())
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusCreated)
 	}
 	if got := response.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control = %q, want no-store", got)
@@ -106,22 +106,49 @@ func TestMutationMapsCrossOwnerToNotFoundWithoutLeak(t *testing.T) {
 	handler := newHTTPTestHandler(t, store, func(*http.Request) (string, bool) { return "owner-2", true })
 
 	for _, test := range []struct {
+		name   string
 		method string
 		path   string
 	}{
-		{method: http.MethodPost, path: "/api/v1/projects/project-1/keys/key-1/disable"},
-		{method: http.MethodDelete, path: "/api/v1/projects/project-1/keys/key-1"},
+		{name: "disable wrong or cross-owner key", method: http.MethodPost, path: "/api/v1/projects/project-1/keys/key-1/disable"},
+		{name: "revoke wrong or cross-owner key", method: http.MethodDelete, path: "/api/v1/projects/project-1/keys/key-1"},
 	} {
-		request := httptest.NewRequest(test.method, test.path, nil)
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, request)
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.path, nil)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
 
-		if response.Code != http.StatusNotFound {
-			t.Fatalf("%s status = %d, want %d", test.method, response.Code, http.StatusNotFound)
-		}
-		if strings.Contains(strings.ToLower(response.Body.String()), "owner") {
-			t.Fatalf("response leaked ownership detail: %s", response.Body.String())
-		}
+			assertHTTPError(t, response, http.StatusNotFound, "api_key_not_found")
+			if strings.Contains(strings.ToLower(response.Body.String()), "owner") {
+				t.Fatalf("response leaked ownership detail: %s", response.Body.String())
+			}
+		})
+	}
+}
+
+func TestCollectionMapsMissingOrCrossOwnerProjectToProjectNotFound(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		method string
+		body   string
+	}{
+		{name: "create under missing project", method: http.MethodPost, body: `{"name":"local"}`},
+		{name: "create under another owner's project", method: http.MethodPost, body: `{"name":"local"}`},
+		{name: "list missing project", method: http.MethodGet},
+		{name: "list another owner's project", method: http.MethodGet},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &httpStore{err: ErrNotFound}
+			handler := newHTTPTestHandler(t, store, func(*http.Request) (string, bool) { return "owner-2", true })
+			request := httptest.NewRequest(test.method, "/api/v1/projects/project-1/keys", strings.NewReader(test.body))
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			assertHTTPError(t, response, http.StatusNotFound, "project_not_found")
+			if strings.Contains(strings.ToLower(response.Body.String()), "owner") {
+				t.Fatalf("response leaked ownership detail: %s", response.Body.String())
+			}
+		})
 	}
 }
 
@@ -184,6 +211,24 @@ func newHTTPTestHandler(t *testing.T, store Store, currentUserID CurrentUserID) 
 	mux := http.NewServeMux()
 	NewHandler(service, currentUserID).Register(mux)
 	return mux
+}
+
+func assertHTTPError(t *testing.T, response *httptest.ResponseRecorder, wantStatus int, wantCode string) {
+	t.Helper()
+	if response.Code != wantStatus {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, wantStatus, response.Body.String())
+	}
+	var body struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if body.Error.Code != wantCode {
+		t.Fatalf("error code = %q, want %q", body.Error.Code, wantCode)
+	}
 }
 
 type httpStore struct {

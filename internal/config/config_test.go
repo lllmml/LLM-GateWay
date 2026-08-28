@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
 	"log/slog"
 	"strings"
@@ -180,8 +181,20 @@ func TestLoadKeepsSessionAndVirtualKeyPeppersSeparate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if string(cfg.SessionTokenPepper) == string(cfg.VirtualKeyPepper) {
+	if bytes.Equal(cfg.SessionTokenPepper, cfg.VirtualKeyPepper) {
 		t.Fatal("session and virtual key peppers unexpectedly share key material")
+	}
+}
+
+func TestLoadRejectsIdenticalSessionAndVirtualKeyPeppers(t *testing.T) {
+	values := requiredTestValues()
+	sharedPepper := base64.StdEncoding.EncodeToString(bytesOf(3, 32))
+	values["SESSION_TOKEN_PEPPER"] = sharedPepper
+	values["VIRTUAL_KEY_PEPPER"] = sharedPepper
+
+	_, err := load(mapLookup(values))
+	if err == nil || !strings.Contains(err.Error(), "must use different key material") {
+		t.Fatalf("load error = %v, want pepper domain-separation error", err)
 	}
 }
 
@@ -203,8 +216,8 @@ func requiredTestValues() map[string]string {
 		"PUBLIC_CONSOLE_URL":    "http://127.0.0.1:8081",
 		"GITHUB_CLIENT_ID":      "test-client-id",
 		"GITHUB_CLIENT_SECRET":  "test-client-secret",
-		"SESSION_TOKEN_PEPPER":  base64.StdEncoding.EncodeToString(make([]byte, 32)),
-		"VIRTUAL_KEY_PEPPER":    base64.StdEncoding.EncodeToString(make([]byte, 32)),
+		"SESSION_TOKEN_PEPPER":  base64.StdEncoding.EncodeToString(bytesOf(1, 32)),
+		"VIRTUAL_KEY_PEPPER":    base64.StdEncoding.EncodeToString(bytesOf(2, 32)),
 	}
 }
 

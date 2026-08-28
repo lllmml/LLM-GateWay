@@ -13,14 +13,20 @@ import (
 )
 
 const (
-	rawKeyPrefix     = "pgw_"
-	prefixRandomSize = 6
-	secretRandomSize = 32
+	rawKeyMarker      = "pgw_"
+	prefixRandomSize  = 6
+	secretRandomSize  = 32
+	prefixEncodedSize = 8
+	secretEncodedSize = 43
+	rawKeySize        = len(rawKeyMarker) + prefixEncodedSize + 1 + secretEncodedSize
 )
 
 var (
-	ErrNotFound = errors.New("api key not found")
+	ErrNotFound      = errors.New("api key not found")
+	ErrInvalidRawKey = errors.New("invalid virtual API key format")
 )
+
+var rawURLEncoding = base64.RawURLEncoding.Strict()
 
 type Status string
 
@@ -52,6 +58,10 @@ type CreateParams struct {
 type CreateResult struct {
 	Key    Key
 	RawKey string
+}
+
+type ParsedKey struct {
+	Prefix string
 }
 
 type Store interface {
@@ -134,6 +144,32 @@ func HashKey(rawKey string, pepper []byte) ([]byte, error) {
 	return mac.Sum(nil), nil
 }
 
+func ParseRawKey(rawKey string) (ParsedKey, error) {
+	if len(rawKey) != rawKeySize || !strings.HasPrefix(rawKey, rawKeyMarker) {
+		return ParsedKey{}, ErrInvalidRawKey
+	}
+
+	prefixStart := len(rawKeyMarker)
+	separator := prefixStart + prefixEncodedSize
+	if rawKey[separator] != '_' {
+		return ParsedKey{}, ErrInvalidRawKey
+	}
+	prefix := rawKey[prefixStart:separator]
+	secret := rawKey[separator+1:]
+	if !isCanonicalComponent(prefix, prefixRandomSize) || !isCanonicalComponent(secret, secretRandomSize) {
+		return ParsedKey{}, ErrInvalidRawKey
+	}
+	return ParsedKey{Prefix: prefix}, nil
+}
+
+func isCanonicalComponent(encoded string, decodedSize int) bool {
+	decoded, err := rawURLEncoding.DecodeString(encoded)
+	if err != nil || len(decoded) != decodedSize {
+		return false
+	}
+	return rawURLEncoding.EncodeToString(decoded) == encoded
+}
+
 func DisabledStatus(current Status) Status {
 	if current == StatusActive {
 		return StatusDisabled
@@ -181,7 +217,7 @@ func generateRawKey(random io.Reader) (string, string, error) {
 	if _, err := io.ReadFull(random, secretBytes); err != nil {
 		return "", "", err
 	}
-	prefix := base64.RawURLEncoding.EncodeToString(prefixBytes)
-	secret := base64.RawURLEncoding.EncodeToString(secretBytes)
-	return rawKeyPrefix + prefix + "_" + secret, prefix, nil
+	prefix := rawURLEncoding.EncodeToString(prefixBytes)
+	secret := rawURLEncoding.EncodeToString(secretBytes)
+	return rawKeyMarker + prefix + "_" + secret, prefix, nil
 }

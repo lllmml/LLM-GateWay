@@ -17,21 +17,69 @@ func TestGenerateRawKeyFormat(t *testing.T) {
 		t.Fatalf("generateRawKey: %v", err)
 	}
 
-	parts := strings.Split(rawKey, "_")
-	if len(parts) != 3 {
-		t.Fatalf("raw key parts = %d, want 3", len(parts))
+	parsed, err := ParseRawKey(rawKey)
+	if err != nil {
+		t.Fatalf("ParseRawKey rejected generated key: %v", err)
 	}
-	if parts[0] != "pgw" {
-		t.Fatalf("raw key prefix marker = %q, want pgw", parts[0])
+	if len(rawKey) != rawKeySize {
+		t.Fatalf("raw key length = %d, want %d", len(rawKey), rawKeySize)
 	}
-	if len(parts[1]) != 8 {
-		t.Fatalf("public prefix length = %d, want 8", len(parts[1]))
+	if parsed.Prefix != prefix {
+		t.Fatalf("parsed prefix = %q, want generated prefix %q", parsed.Prefix, prefix)
 	}
-	if len(parts[2]) != 43 {
-		t.Fatalf("secret length = %d, want 43", len(parts[2]))
+}
+
+func TestParseRawKeyAcceptsURLSafeDashAndUnderscore(t *testing.T) {
+	prefixBytes := []byte{0xfb, 0xff, 0xff, 0xfb, 0xff, 0xff}
+	secretBytes := append(bytes.Repeat([]byte{0xfb, 0xff, 0xff}, 10), 0xfb, 0xff)
+	randomBytes := append(append([]byte(nil), prefixBytes...), secretBytes...)
+
+	rawKey, prefix, err := generateRawKey(bytes.NewReader(randomBytes))
+	if err != nil {
+		t.Fatalf("generateRawKey: %v", err)
 	}
-	if prefix != parts[1] {
-		t.Fatalf("returned prefix = %q, want %q", prefix, parts[1])
+	secret := rawKey[len(rawKeyMarker)+prefixEncodedSize+1:]
+	if !strings.Contains(prefix, "_") || !strings.Contains(prefix, "-") {
+		t.Fatal("deterministic prefix did not exercise both URL-safe symbols")
+	}
+	if !strings.Contains(secret, "_") || !strings.Contains(secret, "-") {
+		t.Fatal("deterministic secret did not exercise both URL-safe symbols")
+	}
+
+	parsed, err := ParseRawKey(rawKey)
+	if err != nil {
+		t.Fatalf("ParseRawKey rejected valid URL-safe key: %v", err)
+	}
+	if parsed.Prefix != prefix {
+		t.Fatalf("parsed prefix = %q, want %q", parsed.Prefix, prefix)
+	}
+}
+
+func TestParseRawKeyRejectsMalformedValues(t *testing.T) {
+	valid := rawKeyMarker + strings.Repeat("A", prefixEncodedSize) + "_" + strings.Repeat("A", secretEncodedSize)
+	separator := len(rawKeyMarker) + prefixEncodedSize
+	secretStart := separator + 1
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "empty", value: ""},
+		{name: "wrong marker", value: "bad_" + valid[len(rawKeyMarker):]},
+		{name: "too short", value: valid[:len(valid)-1]},
+		{name: "too long", value: valid + "A"},
+		{name: "wrong separator", value: valid[:separator] + "-" + valid[separator+1:]},
+		{name: "invalid prefix base64url", value: valid[:len(rawKeyMarker)] + "*" + valid[len(rawKeyMarker)+1:]},
+		{name: "invalid secret base64url", value: valid[:secretStart] + "*" + valid[secretStart+1:]},
+		{name: "padding rejected", value: valid[:len(valid)-1] + "="},
+		{name: "non-canonical trailing bits", value: valid[:len(valid)-1] + "B"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := ParseRawKey(test.value); !errors.Is(err, ErrInvalidRawKey) {
+				t.Fatalf("ParseRawKey error = %v, want ErrInvalidRawKey", err)
+			}
+		})
 	}
 }
 

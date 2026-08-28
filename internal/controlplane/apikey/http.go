@@ -43,7 +43,7 @@ func (h *Handler) create(response http.ResponseWriter, request *http.Request) {
 	}
 	created, err := h.service.Create(request.Context(), ownerUserID, request.PathValue("projectID"), body.Name)
 	if err != nil {
-		writeServiceError(response, err)
+		writeCollectionServiceError(response, err)
 		return
 	}
 	metadata := responseKey(created.Key)
@@ -60,7 +60,7 @@ func (h *Handler) list(response http.ResponseWriter, request *http.Request) {
 	}
 	keys, err := h.service.List(request.Context(), ownerUserID, request.PathValue("projectID"))
 	if err != nil {
-		writeServiceError(response, err)
+		writeCollectionServiceError(response, err)
 		return
 	}
 	items := make([]keyResponse, 0, len(keys))
@@ -87,7 +87,7 @@ func (h *Handler) mutate(response http.ResponseWriter, request *http.Request, op
 	}
 	key, err := operation(request.Context(), ownerUserID, request.PathValue("projectID"), request.PathValue("keyID"))
 	if err != nil {
-		writeServiceError(response, err)
+		writeKeyServiceError(response, err)
 		return
 	}
 	writeJSON(response, http.StatusOK, responseKey(key))
@@ -137,13 +137,21 @@ func decodeJSON(response http.ResponseWriter, request *http.Request, destination
 	return nil
 }
 
-func writeServiceError(response http.ResponseWriter, err error) {
+func writeCollectionServiceError(response http.ResponseWriter, err error) {
+	writeServiceError(response, err, "project_not_found", "project was not found")
+}
+
+func writeKeyServiceError(response http.ResponseWriter, err error) {
+	writeServiceError(response, err, "api_key_not_found", "API key was not found")
+}
+
+func writeServiceError(response http.ResponseWriter, err error, notFoundCode, notFoundMessage string) {
 	var validationErr *ValidationError
 	switch {
 	case errors.As(err, &validationErr):
 		writeError(response, http.StatusBadRequest, "invalid_request", validationErr.Error())
 	case errors.Is(err, ErrNotFound):
-		writeError(response, http.StatusNotFound, "api_key_not_found", "API key was not found")
+		writeError(response, http.StatusNotFound, notFoundCode, notFoundMessage)
 	default:
 		writeError(response, http.StatusInternalServerError, "internal_error", "request could not be completed")
 	}

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -84,6 +85,9 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 	virtualKeyPepper, err := base64Key(lookup, "VIRTUAL_KEY_PEPPER", 32)
 	if err != nil {
 		return Config{}, err
+	}
+	if bytes.Equal(sessionTokenPepper, virtualKeyPepper) {
+		return Config{}, errors.New("SESSION_TOKEN_PEPPER and VIRTUAL_KEY_PEPPER must use different key material")
 	}
 
 	logLevel, err := parseLogLevel(valueOrDefault(lookup, "LOG_LEVEL", "info"))

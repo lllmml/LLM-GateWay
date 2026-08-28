@@ -28,7 +28,7 @@ SELECT
 FROM projects
 WHERE projects.id = $5
   AND projects.owner_user_id = $6
-RETURNING id, project_id, name, key_prefix, key_hash, status, created_at, last_used_at, revoked_at
+RETURNING id, project_id, name, key_prefix, status, created_at, last_used_at, revoked_at
 `
 
 type CreateVirtualAPIKeyForOwnerParams struct {
@@ -40,7 +40,18 @@ type CreateVirtualAPIKeyForOwnerParams struct {
 	OwnerUserID pgtype.UUID
 }
 
-func (q *Queries) CreateVirtualAPIKeyForOwner(ctx context.Context, arg CreateVirtualAPIKeyForOwnerParams) (VirtualApiKey, error) {
+type CreateVirtualAPIKeyForOwnerRow struct {
+	ID         pgtype.UUID
+	ProjectID  pgtype.UUID
+	Name       string
+	KeyPrefix  string
+	Status     string
+	CreatedAt  pgtype.Timestamptz
+	LastUsedAt pgtype.Timestamptz
+	RevokedAt  pgtype.Timestamptz
+}
+
+func (q *Queries) CreateVirtualAPIKeyForOwner(ctx context.Context, arg CreateVirtualAPIKeyForOwnerParams) (CreateVirtualAPIKeyForOwnerRow, error) {
 	row := q.db.QueryRow(ctx, createVirtualAPIKeyForOwner,
 		arg.ID,
 		arg.Name,
@@ -49,13 +60,12 @@ func (q *Queries) CreateVirtualAPIKeyForOwner(ctx context.Context, arg CreateVir
 		arg.ProjectID,
 		arg.OwnerUserID,
 	)
-	var i VirtualApiKey
+	var i CreateVirtualAPIKeyForOwnerRow
 	err := row.Scan(
 		&i.ID,
 		&i.ProjectID,
 		&i.Name,
 		&i.KeyPrefix,
-		&i.KeyHash,
 		&i.Status,
 		&i.CreatedAt,
 		&i.LastUsedAt,
@@ -75,7 +85,7 @@ WHERE keys.id = $1
   AND keys.project_id = $2
   AND projects.id = keys.project_id
   AND projects.owner_user_id = $3
-RETURNING keys.id, keys.project_id, keys.name, keys.key_prefix, keys.key_hash, keys.status, keys.created_at, keys.last_used_at, keys.revoked_at
+RETURNING keys.id, keys.project_id, keys.name, keys.key_prefix, keys.status, keys.created_at, keys.last_used_at, keys.revoked_at
 `
 
 type DisableVirtualAPIKeyForOwnerParams struct {
@@ -84,15 +94,25 @@ type DisableVirtualAPIKeyForOwnerParams struct {
 	OwnerUserID pgtype.UUID
 }
 
-func (q *Queries) DisableVirtualAPIKeyForOwner(ctx context.Context, arg DisableVirtualAPIKeyForOwnerParams) (VirtualApiKey, error) {
+type DisableVirtualAPIKeyForOwnerRow struct {
+	ID         pgtype.UUID
+	ProjectID  pgtype.UUID
+	Name       string
+	KeyPrefix  string
+	Status     string
+	CreatedAt  pgtype.Timestamptz
+	LastUsedAt pgtype.Timestamptz
+	RevokedAt  pgtype.Timestamptz
+}
+
+func (q *Queries) DisableVirtualAPIKeyForOwner(ctx context.Context, arg DisableVirtualAPIKeyForOwnerParams) (DisableVirtualAPIKeyForOwnerRow, error) {
 	row := q.db.QueryRow(ctx, disableVirtualAPIKeyForOwner, arg.ID, arg.ProjectID, arg.OwnerUserID)
-	var i VirtualApiKey
+	var i DisableVirtualAPIKeyForOwnerRow
 	err := row.Scan(
 		&i.ID,
 		&i.ProjectID,
 		&i.Name,
 		&i.KeyPrefix,
-		&i.KeyHash,
 		&i.Status,
 		&i.CreatedAt,
 		&i.LastUsedAt,
@@ -107,7 +127,6 @@ SELECT
     keys.project_id,
     keys.name,
     keys.key_prefix,
-    keys.key_hash,
     keys.status,
     keys.created_at,
     keys.last_used_at,
@@ -124,21 +143,31 @@ type ListVirtualAPIKeysForOwnerParams struct {
 	OwnerUserID pgtype.UUID
 }
 
-func (q *Queries) ListVirtualAPIKeysForOwner(ctx context.Context, arg ListVirtualAPIKeysForOwnerParams) ([]VirtualApiKey, error) {
+type ListVirtualAPIKeysForOwnerRow struct {
+	ID         pgtype.UUID
+	ProjectID  pgtype.UUID
+	Name       string
+	KeyPrefix  string
+	Status     string
+	CreatedAt  pgtype.Timestamptz
+	LastUsedAt pgtype.Timestamptz
+	RevokedAt  pgtype.Timestamptz
+}
+
+func (q *Queries) ListVirtualAPIKeysForOwner(ctx context.Context, arg ListVirtualAPIKeysForOwnerParams) ([]ListVirtualAPIKeysForOwnerRow, error) {
 	rows, err := q.db.Query(ctx, listVirtualAPIKeysForOwner, arg.ProjectID, arg.OwnerUserID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []VirtualApiKey{}
+	items := []ListVirtualAPIKeysForOwnerRow{}
 	for rows.Next() {
-		var i VirtualApiKey
+		var i ListVirtualAPIKeysForOwnerRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.ProjectID,
 			&i.Name,
 			&i.KeyPrefix,
-			&i.KeyHash,
 			&i.Status,
 			&i.CreatedAt,
 			&i.LastUsedAt,
@@ -164,7 +193,7 @@ WHERE keys.id = $1
   AND keys.project_id = $2
   AND projects.id = keys.project_id
   AND projects.owner_user_id = $3
-RETURNING keys.id, keys.project_id, keys.name, keys.key_prefix, keys.key_hash, keys.status, keys.created_at, keys.last_used_at, keys.revoked_at
+RETURNING keys.id, keys.project_id, keys.name, keys.key_prefix, keys.status, keys.created_at, keys.last_used_at, keys.revoked_at
 `
 
 type RevokeVirtualAPIKeyForOwnerParams struct {
@@ -173,15 +202,25 @@ type RevokeVirtualAPIKeyForOwnerParams struct {
 	OwnerUserID pgtype.UUID
 }
 
-func (q *Queries) RevokeVirtualAPIKeyForOwner(ctx context.Context, arg RevokeVirtualAPIKeyForOwnerParams) (VirtualApiKey, error) {
+type RevokeVirtualAPIKeyForOwnerRow struct {
+	ID         pgtype.UUID
+	ProjectID  pgtype.UUID
+	Name       string
+	KeyPrefix  string
+	Status     string
+	CreatedAt  pgtype.Timestamptz
+	LastUsedAt pgtype.Timestamptz
+	RevokedAt  pgtype.Timestamptz
+}
+
+func (q *Queries) RevokeVirtualAPIKeyForOwner(ctx context.Context, arg RevokeVirtualAPIKeyForOwnerParams) (RevokeVirtualAPIKeyForOwnerRow, error) {
 	row := q.db.QueryRow(ctx, revokeVirtualAPIKeyForOwner, arg.ID, arg.ProjectID, arg.OwnerUserID)
-	var i VirtualApiKey
+	var i RevokeVirtualAPIKeyForOwnerRow
 	err := row.Scan(
 		&i.ID,
 		&i.ProjectID,
 		&i.Name,
 		&i.KeyPrefix,
-		&i.KeyHash,
 		&i.Status,
 		&i.CreatedAt,
 		&i.LastUsedAt,
