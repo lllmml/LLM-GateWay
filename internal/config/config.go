@@ -27,7 +27,7 @@ type Config struct {
 	ControlPlaneAddr    string
 	OpsAddr             string
 	DatabaseURL         string
-	CredentialMasterKey string
+	CredentialMasterKey []byte
 	PublicConsoleURL    string
 	GitHubClientID      string
 	GitHubClientSecret  string
@@ -58,7 +58,7 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		return Config{}, err
 	}
 
-	credentialMasterKey, err := required(lookup, "CREDENTIAL_MASTER_KEY")
+	credentialMasterKey, err := base64Key(lookup, "CREDENTIAL_MASTER_KEY", 32)
 	if err != nil {
 		return Config{}, err
 	}

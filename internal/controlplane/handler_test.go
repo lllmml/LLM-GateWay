@@ -9,17 +9,24 @@ import (
 	"time"
 
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/apikey"
+	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/credential"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/project"
+	"github.com/lllmml/production-go-llm-gateway/internal/security"
 )
 
-func TestControlPlaneProjectAndKeyRoutesUseSessionOwnerAndCSRF(t *testing.T) {
+func TestControlPlaneProjectKeyAndCredentialRoutesUseSessionOwnerAndCSRF(t *testing.T) {
 	user := User{ID: "owner-from-session", GitHubLogin: "octo"}
 	sessions := newFakeSessionStore(user)
 	auth := newTestAuthHandler(t, testAuthDeps{sessionStore: sessions})
 	sessionCookie, csrfCookie := seedSession(t, auth, sessions, user)
 	projects := &handlerProjectStore{}
 	keys := &handlerKeyStore{}
-	handler, err := NewHandler(auth, projects, keys, bytes.Repeat([]byte{9}, 32))
+	credentials := &handlerCredentialStore{}
+	cipher, err := security.NewCredentialCipher(bytes.Repeat([]byte{8}, 32))
+	if err != nil {
+		t.Fatalf("new credential cipher: %v", err)
+	}
+	handler, err := NewHandler(auth, projects, keys, bytes.Repeat([]byte{9}, 32), credentials, cipher)
 	if err != nil {
 		t.Fatalf("new handler: %v", err)
 	}
@@ -115,6 +122,42 @@ func TestControlPlaneProjectAndKeyRoutesUseSessionOwnerAndCSRF(t *testing.T) {
 	if keys.revokeCalls != 0 {
 		t.Fatal("key revoke without CSRF reached store")
 	}
+
+	credentialListRequest := httptest.NewRequest(http.MethodGet, "/api/v1/projects/project-1/provider-credentials", nil)
+	credentialListRequest.AddCookie(sessionCookie)
+	credentialListResponse := httptest.NewRecorder()
+	handler.ServeHTTP(credentialListResponse, credentialListRequest)
+	if credentialListResponse.Code != http.StatusOK {
+		t.Fatalf("credential list status = %d, want %d", credentialListResponse.Code, http.StatusOK)
+	}
+	if credentials.lastOwner != user.ID || credentials.lastProject != "project-1" {
+		t.Fatal("credential list did not use session owner and path project")
+	}
+
+	missingCredentialCSRF := httptest.NewRequest(http.MethodPost, "/api/v1/projects/project-1/provider-credentials", bytes.NewBufferString(`{"provider":"openai","label":"prod","secret":"sk-test"}`))
+	missingCredentialCSRF.AddCookie(sessionCookie)
+	missingCredentialCSRFResponse := httptest.NewRecorder()
+	handler.ServeHTTP(missingCredentialCSRFResponse, missingCredentialCSRF)
+	if missingCredentialCSRFResponse.Code != http.StatusForbidden {
+		t.Fatalf("credential create without CSRF status = %d, want %d", missingCredentialCSRFResponse.Code, http.StatusForbidden)
+	}
+	if credentials.createCalls != 0 {
+		t.Fatal("credential create without CSRF reached store")
+	}
+
+	credentialCreateRequest := httptest.NewRequest(http.MethodPost, "/api/v1/projects/project-1/provider-credentials", bytes.NewBufferString(`{"provider":"openai","label":"prod","secret":"sk-test"}`))
+	credentialCreateRequest.Header.Set("Origin", "http://127.0.0.1:8081")
+	credentialCreateRequest.Header.Set("X-CSRF-Token", csrfCookie.Value)
+	credentialCreateRequest.AddCookie(sessionCookie)
+	credentialCreateRequest.AddCookie(csrfCookie)
+	credentialCreateResponse := httptest.NewRecorder()
+	handler.ServeHTTP(credentialCreateResponse, credentialCreateRequest)
+	if credentialCreateResponse.Code != http.StatusCreated {
+		t.Fatalf("credential create status = %d, want %d; body=%s", credentialCreateResponse.Code, http.StatusCreated, credentialCreateResponse.Body.String())
+	}
+	if credentials.createCalls != 1 || credentials.lastOwner != user.ID || credentials.lastProject != "project-1" {
+		t.Fatal("credential create did not use session owner and path project")
+	}
 }
 
 type handlerProjectStore struct {
@@ -177,4 +220,38 @@ func (s *handlerKeyStore) DisableKey(context.Context, string, string, string) (a
 func (s *handlerKeyStore) RevokeKey(context.Context, string, string, string) (apikey.Key, error) {
 	s.revokeCalls++
 	return apikey.Key{}, apikey.ErrNotFound
+}
+
+type handlerCredentialStore struct {
+	createCalls int
+	lastOwner   string
+	lastProject string
+}
+
+func (s *handlerCredentialStore) CreateCredential(_ context.Context, params credential.CreateParams) (credential.Credential, error) {
+	s.createCalls++
+	s.lastOwner = params.OwnerUserID
+	s.lastProject = params.ProjectID
+	return credential.Credential{
+		ID:        "credential-1",
+		ProjectID: params.ProjectID,
+		Provider:  params.Provider,
+		Label:     params.Label,
+		Status:    credential.StatusActive,
+		CreatedAt: time.Now().UTC(),
+	}, nil
+}
+
+func (s *handlerCredentialStore) ListCredentials(_ context.Context, ownerUserID, projectID string) ([]credential.Credential, error) {
+	s.lastOwner = ownerUserID
+	s.lastProject = projectID
+	return nil, nil
+}
+
+func (s *handlerCredentialStore) RotateCredential(context.Context, credential.RotateParams) (credential.Credential, error) {
+	return credential.Credential{}, credential.ErrNotFound
+}
+
+func (s *handlerCredentialStore) DisableCredential(context.Context, string, string, string) (credential.Credential, error) {
+	return credential.Credential{}, credential.ErrNotFound
 }

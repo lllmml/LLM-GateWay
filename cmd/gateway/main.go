@@ -12,6 +12,7 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/app"
 	"github.com/lllmml/production-go-llm-gateway/internal/config"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane"
+	"github.com/lllmml/production-go-llm-gateway/internal/security"
 	"github.com/lllmml/production-go-llm-gateway/internal/store/postgres"
 	"github.com/lllmml/production-go-llm-gateway/internal/telemetry"
 )
@@ -52,7 +53,20 @@ func run() error {
 		database.Close()
 		return fmt.Errorf("configure control-plane authentication: %w", err)
 	}
-	controlPlaneHandler, err := controlplane.NewHandler(authHandler, database, database, cfg.VirtualKeyPepper)
+	credentialCipher, err := security.NewCredentialCipher(cfg.CredentialMasterKey)
+	clear(cfg.CredentialMasterKey)
+	if err != nil {
+		database.Close()
+		return fmt.Errorf("configure provider credential encryption: %w", err)
+	}
+	controlPlaneHandler, err := controlplane.NewHandler(
+		authHandler,
+		database,
+		database,
+		cfg.VirtualKeyPepper,
+		database,
+		credentialCipher,
+	)
 	if err != nil {
 		database.Close()
 		return fmt.Errorf("configure control plane: %w", err)

@@ -18,6 +18,19 @@ type Project struct {
 	UpdatedAt   pgtype.Timestamptz
 }
 
+type ProviderCredential struct {
+	ID               pgtype.UUID
+	ProjectID        pgtype.UUID
+	Provider         string
+	Label            string
+	SecretCiphertext []byte
+	SecretNonce      []byte
+	KeyVersion       int16
+	Status           string
+	CreatedAt        pgtype.Timestamptz
+	RotatedAt        pgtype.Timestamptz
+}
+
 type User struct {
 	ID          pgtype.UUID
 	GithubID    int64

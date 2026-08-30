@@ -4,10 +4,10 @@ Update this after major decisions, completed phases, or bugs that future agents 
 
 ## Current State
 
-- Current task: Week 2 virtual API key lifecycle is implemented and fully verified.
-- Current phase: Week 2 Control Plane Core is in progress.
-- Next step: Propose the bounded provider credential encrypted CRUD slice before implementation.
-- Blocked by: None. Default port `:8080` was occupied during local verification; use address overrides or identify the owner before using defaults.
+- Current task: Week 2 provider credential encrypted CRUD and the minimal React console shell are implemented; automated and local HTTP runtime checks pass.
+- Current phase: Week 2 Control Plane Core implementation is complete; its manual visual acceptance check remains.
+- Next step: Review the console at desktop and mobile widths, then propose the bounded Week 3 first-provider/non-streaming foundation plan.
+- Blocked by: This agent environment has no browser runtime, so the required visual desktop/mobile check could not be executed. Default port `:8080` remains occupied; use address overrides or identify its owner before using defaults.
 
 ## Decisions
 
@@ -25,6 +25,9 @@ Update this after major decisions, completed phases, or bugs that future agents 
 - 2026-08-28: The MVP tenant boundary is enforced by ownership-scoped PostgreSQL queries using authenticated `owner_user_id`; cross-owner project lookup/update is indistinguishable from not found.
 - 2026-08-28: Virtual API keys use independent random 8-character display prefixes and 256-bit secrets, are shown once, and persist only HMAC-SHA256 digests under a dedicated 32-byte `VIRTUAL_KEY_PEPPER`; disable/revoke mutations remain ownership-scoped and atomic.
 - 2026-08-28: Shared virtual-key format, generation, parsing, and hashing primitives live in `internal/apikey`; Control Plane lifecycle code depends on that package, and future Data Plane authentication must do the same rather than importing Control Plane code.
+- 2026-08-30: Provider credentials use AES-256-GCM with a fresh nonce per encryption and persisted key version `1`; `CREDENTIAL_MASTER_KEY` must decode from standard Base64 to exactly 32 bytes, and metadata APIs never return the secret envelope.
+- 2026-08-30: Provider credential create/list/rotate/disable operations are ownership-scoped; rotation atomically replaces ciphertext/nonce/key-version metadata, while credential deletion, re-enable, live provider validation, and master-key re-encryption remain outside the Week 2 slice.
+- 2026-08-30: The minimal React/Vite console uses same-origin `/api` and `/auth` development proxies, server-side session discovery through `/api/v1/me`, CSRF-protected logout, and placeholder operational routes; full management screens remain later milestones.
 
 ## AI / Tooling Decisions
 
@@ -43,6 +46,8 @@ Update this after major decisions, completed phases, or bugs that future agents 
 - [x] Initial scaffold
 - [x] Control Plane users/sessions/projects foundation
 - [x] Virtual API key creation/list/disable/revoke lifecycle
+- [x] Provider credential encrypted create/list/rotate/disable lifecycle
+- [x] Minimal React/Vite control-plane shell
 - [ ] Core data model
 - [ ] Auth
 - [ ] Core MVP flow

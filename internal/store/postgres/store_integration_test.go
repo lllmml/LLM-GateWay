@@ -22,7 +22,9 @@ import (
 	sharedapikey "github.com/lllmml/production-go-llm-gateway/internal/apikey"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/apikey"
+	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/credential"
 	projectdomain "github.com/lllmml/production-go-llm-gateway/internal/controlplane/project"
+	"github.com/lllmml/production-go-llm-gateway/internal/security"
 )
 
 func TestOpenAndPing(t *testing.T) {
@@ -91,6 +93,107 @@ func TestVirtualAPIKeyMigrationUpAndDown(t *testing.T) {
 	applyMigration(t, ctx, pool, "000001_control_plane_foundation.down.sql")
 }
 
+func TestProviderCredentialMigrationUpAndDown(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pool, _, cleanup := newIsolatedPool(t, ctx)
+	defer cleanup()
+
+	applyMigration(t, ctx, pool, "000001_control_plane_foundation.up.sql")
+	applyMigration(t, ctx, pool, "000002_virtual_api_keys.up.sql")
+	applyMigration(t, ctx, pool, "000003_provider_credentials.up.sql")
+
+	if !tableExists(t, ctx, pool, "provider_credentials") {
+		t.Fatal("provider_credentials table does not exist after up migration")
+	}
+
+	applyMigration(t, ctx, pool, "000003_provider_credentials.down.sql")
+	if tableExists(t, ctx, pool, "provider_credentials") {
+		t.Fatal("provider_credentials table still exists after down migration")
+	}
+
+	applyMigration(t, ctx, pool, "000002_virtual_api_keys.down.sql")
+	applyMigration(t, ctx, pool, "000001_control_plane_foundation.down.sql")
+}
+
+func TestProviderCredentialServicePersistsOnlyRecoverableCiphertext(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	store, cleanup := newMigratedStore(t, ctx)
+	defer cleanup()
+
+	owner, err := store.UpsertGitHubUser(ctx, controlplane.GitHubUser{
+		GitHubID:    5003,
+		GitHubLogin: "encrypted-credential-owner",
+	})
+	if err != nil {
+		t.Fatalf("upsert owner: %v", err)
+	}
+	project, err := store.CreateProject(ctx, projectdomain.CreateParams{
+		OwnerUserID: owner.ID,
+		Name:        "Encrypted Credential Gateway",
+		Slug:        "encrypted-credential-gateway",
+	})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	cipher, err := security.NewCredentialCipher(bytes.Repeat([]byte{9}, 32))
+	if err != nil {
+		t.Fatalf("create credential cipher: %v", err)
+	}
+	service, err := credential.NewService(store, func(secret []byte) (credential.SealedSecret, error) {
+		encrypted, err := cipher.Encrypt(secret)
+		if err != nil {
+			return credential.SealedSecret{}, err
+		}
+		return credential.SealedSecret{
+			Ciphertext: encrypted.Ciphertext,
+			Nonce:      encrypted.Nonce,
+			KeyVersion: encrypted.KeyVersion,
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("create credential service: %v", err)
+	}
+
+	rawSecret := []byte("provider-secret-not-stored-in-plaintext")
+	created, err := service.Create(ctx, owner.ID, project.ID, "openai", "prod", string(rawSecret))
+	if err != nil {
+		t.Fatalf("create encrypted credential: %v", err)
+	}
+	credentialID, err := parseUUID(created.ID)
+	if err != nil {
+		t.Fatalf("parse credential ID: %v", err)
+	}
+
+	var ciphertext, nonce []byte
+	var keyVersion int16
+	if err := store.pool.QueryRow(ctx, `
+		SELECT secret_ciphertext, secret_nonce, key_version
+		FROM provider_credentials
+		WHERE id = $1
+	`, credentialID).Scan(&ciphertext, &nonce, &keyVersion); err != nil {
+		t.Fatalf("read encrypted credential envelope: %v", err)
+	}
+	if bytes.Contains(ciphertext, rawSecret) || bytes.Equal(ciphertext, rawSecret) {
+		t.Fatal("database credential ciphertext contains plaintext material")
+	}
+	decrypted, err := cipher.Decrypt(security.EncryptedCredential{
+		Ciphertext: ciphertext,
+		Nonce:      nonce,
+		KeyVersion: keyVersion,
+	})
+	if err != nil {
+		t.Fatalf("decrypt persisted credential: %v", err)
+	}
+	if !bytes.Equal(decrypted, rawSecret) {
+		t.Fatal("decrypted credential does not match the submitted secret")
+	}
+}
+
 func TestControlPlaneFoundationConstraints(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -154,6 +257,219 @@ func TestControlPlaneFoundationConstraints(t *testing.T) {
 		Status:      pgtype.Text{String: "archived", Valid: true},
 	})
 	assertPgCode(t, err, "23514")
+}
+
+func TestProviderCredentialStoreAdapterAndConstraints(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	store, cleanup := newMigratedStore(t, ctx)
+	defer cleanup()
+
+	owner, err := store.UpsertGitHubUser(ctx, controlplane.GitHubUser{
+		GitHubID:    5001,
+		GitHubLogin: "credential-owner",
+	})
+	if err != nil {
+		t.Fatalf("upsert owner: %v", err)
+	}
+	other, err := store.UpsertGitHubUser(ctx, controlplane.GitHubUser{
+		GitHubID:    5002,
+		GitHubLogin: "credential-other",
+	})
+	if err != nil {
+		t.Fatalf("upsert other: %v", err)
+	}
+	project, err := store.CreateProject(ctx, projectdomain.CreateParams{
+		OwnerUserID: owner.ID,
+		Name:        "Credential Gateway",
+		Slug:        "credential-gateway",
+	})
+	if err != nil {
+		t.Fatalf("create owner project: %v", err)
+	}
+	otherProject, err := store.CreateProject(ctx, projectdomain.CreateParams{
+		OwnerUserID: other.ID,
+		Name:        "Other Credential Gateway",
+		Slug:        "other-credential-gateway",
+	})
+	if err != nil {
+		t.Fatalf("create other project: %v", err)
+	}
+
+	missingProjectID := formatUUID(newTestUUID(t))
+	for _, test := range []struct {
+		name        string
+		ownerUserID string
+		projectID   string
+	}{
+		{name: "missing project", ownerUserID: owner.ID, projectID: missingProjectID},
+		{name: "cross-owner project", ownerUserID: other.ID, projectID: project.ID},
+	} {
+		t.Run("create credential under "+test.name, func(t *testing.T) {
+			_, err := store.CreateCredential(ctx, credential.CreateParams{
+				OwnerUserID:      test.ownerUserID,
+				ProjectID:        test.projectID,
+				Provider:         credential.ProviderOpenAI,
+				Label:            "not-created",
+				SecretCiphertext: []byte("ciphertext"),
+				SecretNonce:      bytes.Repeat([]byte{1}, 12),
+				KeyVersion:       1,
+			})
+			if !errors.Is(err, credential.ErrNotFound) {
+				t.Fatalf("create credential error = %v, want ErrNotFound", err)
+			}
+		})
+	}
+	if credentials, err := store.ListCredentials(ctx, owner.ID, missingProjectID); !errors.Is(err, credential.ErrNotFound) || credentials != nil {
+		t.Fatalf("missing-project list = (%+v, %v), want nil, ErrNotFound", credentials, err)
+	}
+
+	created, err := store.CreateCredential(ctx, credential.CreateParams{
+		OwnerUserID:      owner.ID,
+		ProjectID:        project.ID,
+		Provider:         credential.ProviderOpenAI,
+		Label:            "prod",
+		SecretCiphertext: []byte("ciphertext-v1"),
+		SecretNonce:      bytes.Repeat([]byte{2}, 12),
+		KeyVersion:       1,
+	})
+	if err != nil {
+		t.Fatalf("create credential: %v", err)
+	}
+	if created.ProjectID != project.ID || created.Provider != credential.ProviderOpenAI || created.Label != "prod" || created.Status != credential.StatusActive {
+		t.Fatalf("created credential metadata = %+v", created)
+	}
+
+	credentialID, err := parseUUID(created.ID)
+	if err != nil {
+		t.Fatalf("parse created credential ID: %v", err)
+	}
+	var persistedCiphertext []byte
+	var persistedNonce []byte
+	var persistedKeyVersion int16
+	if err := store.pool.QueryRow(ctx, "SELECT secret_ciphertext, secret_nonce, key_version FROM provider_credentials WHERE id = $1", credentialID).Scan(&persistedCiphertext, &persistedNonce, &persistedKeyVersion); err != nil {
+		t.Fatalf("read persisted credential secret envelope: %v", err)
+	}
+	if !bytes.Equal(persistedCiphertext, []byte("ciphertext-v1")) || !bytes.Equal(persistedNonce, bytes.Repeat([]byte{2}, 12)) || persistedKeyVersion != 1 {
+		t.Fatalf("persisted envelope mismatch: ciphertext=%q nonce_len=%d version=%d", persistedCiphertext, len(persistedNonce), persistedKeyVersion)
+	}
+
+	_, err = store.CreateCredential(ctx, credential.CreateParams{
+		OwnerUserID:      owner.ID,
+		ProjectID:        project.ID,
+		Provider:         "invalid",
+		Label:            "bad-provider",
+		SecretCiphertext: []byte("ciphertext"),
+		SecretNonce:      bytes.Repeat([]byte{3}, 12),
+		KeyVersion:       1,
+	})
+	assertPgCode(t, err, "23514")
+
+	_, err = store.CreateCredential(ctx, credential.CreateParams{
+		OwnerUserID:      owner.ID,
+		ProjectID:        project.ID,
+		Provider:         credential.ProviderAnthropic,
+		Label:            "bad-nonce",
+		SecretCiphertext: []byte("ciphertext"),
+		SecretNonce:      bytes.Repeat([]byte{4}, 11),
+		KeyVersion:       1,
+	})
+	assertPgCode(t, err, "23514")
+
+	otherCredential, err := store.CreateCredential(ctx, credential.CreateParams{
+		OwnerUserID:      other.ID,
+		ProjectID:        otherProject.ID,
+		Provider:         credential.ProviderDeepSeek,
+		Label:            "other-prod",
+		SecretCiphertext: []byte("other-ciphertext"),
+		SecretNonce:      bytes.Repeat([]byte{5}, 12),
+		KeyVersion:       1,
+	})
+	if err != nil {
+		t.Fatalf("create other credential: %v", err)
+	}
+
+	credentials, err := store.ListCredentials(ctx, owner.ID, project.ID)
+	if err != nil {
+		t.Fatalf("list owner credentials: %v", err)
+	}
+	if len(credentials) != 1 || credentials[0].ID != created.ID {
+		t.Fatalf("owner list = %+v, want only created credential", credentials)
+	}
+	rows, err := store.queries.ListProviderCredentialsForOwner(ctx, ListProviderCredentialsForOwnerParams{
+		ProjectID:   credentialIDParamsProject(t, project.ID),
+		OwnerUserID: credentialIDParamsOwner(t, owner.ID),
+	})
+	if err != nil {
+		t.Fatalf("list metadata rows: %v", err)
+	}
+	rowJSON := fmt.Sprintf("%+v", rows[0])
+	if strings.Contains(rowJSON, "ciphertext-v1") || strings.Contains(rowJSON, "SecretNonce") {
+		t.Fatalf("metadata list row exposed secret envelope: %s", rowJSON)
+	}
+
+	if credentials, err := store.ListCredentials(ctx, other.ID, project.ID); !errors.Is(err, credential.ErrNotFound) || credentials != nil {
+		t.Fatalf("cross-owner list = (%+v, %v), want nil, ErrNotFound", credentials, err)
+	}
+	if _, err := store.RotateCredential(ctx, credential.RotateParams{
+		OwnerUserID:      other.ID,
+		ProjectID:        project.ID,
+		CredentialID:     created.ID,
+		SecretCiphertext: []byte("attacker-ciphertext"),
+		SecretNonce:      bytes.Repeat([]byte{6}, 12),
+		KeyVersion:       1,
+	}); !errors.Is(err, credential.ErrNotFound) {
+		t.Fatalf("cross-owner rotate error = %v, want ErrNotFound", err)
+	}
+	if err := store.pool.QueryRow(ctx, "SELECT secret_ciphertext FROM provider_credentials WHERE id = $1", credentialID).Scan(&persistedCiphertext); err != nil {
+		t.Fatalf("read credential after cross-owner rotate: %v", err)
+	}
+	if !bytes.Equal(persistedCiphertext, []byte("ciphertext-v1")) {
+		t.Fatalf("cross-owner rotate changed ciphertext to %q", persistedCiphertext)
+	}
+
+	rotated, err := store.RotateCredential(ctx, credential.RotateParams{
+		OwnerUserID:      owner.ID,
+		ProjectID:        project.ID,
+		CredentialID:     created.ID,
+		SecretCiphertext: []byte("ciphertext-v2"),
+		SecretNonce:      bytes.Repeat([]byte{7}, 12),
+		KeyVersion:       1,
+	})
+	if err != nil {
+		t.Fatalf("rotate credential: %v", err)
+	}
+	if rotated.RotatedAt == nil || rotated.Status != credential.StatusActive {
+		t.Fatalf("rotated credential = %+v, want active with rotated_at", rotated)
+	}
+	if err := store.pool.QueryRow(ctx, "SELECT secret_ciphertext, secret_nonce FROM provider_credentials WHERE id = $1", credentialID).Scan(&persistedCiphertext, &persistedNonce); err != nil {
+		t.Fatalf("read rotated credential envelope: %v", err)
+	}
+	if !bytes.Equal(persistedCiphertext, []byte("ciphertext-v2")) || !bytes.Equal(persistedNonce, bytes.Repeat([]byte{7}, 12)) {
+		t.Fatalf("rotated envelope mismatch: ciphertext=%q nonce=%v", persistedCiphertext, persistedNonce)
+	}
+
+	if _, err := store.DisableCredential(ctx, owner.ID, otherProject.ID, otherCredential.ID); !errors.Is(err, credential.ErrNotFound) {
+		t.Fatalf("wrong-project disable error = %v, want ErrNotFound", err)
+	}
+	if _, err := store.DisableCredential(ctx, other.ID, project.ID, created.ID); !errors.Is(err, credential.ErrNotFound) {
+		t.Fatalf("cross-owner disable error = %v, want ErrNotFound", err)
+	}
+	disabled, err := store.DisableCredential(ctx, owner.ID, project.ID, created.ID)
+	if err != nil {
+		t.Fatalf("disable credential: %v", err)
+	}
+	if disabled.Status != credential.StatusDisabled {
+		t.Fatalf("disabled status = %q, want disabled", disabled.Status)
+	}
+	disabledAgain, err := store.DisableCredential(ctx, owner.ID, project.ID, created.ID)
+	if err != nil {
+		t.Fatalf("disable credential again: %v", err)
+	}
+	if disabledAgain.Status != credential.StatusDisabled {
+		t.Fatalf("second disable status = %q, want disabled", disabledAgain.Status)
+	}
 }
 
 func TestVirtualAPIKeyStoreAdapterAndConstraints(t *testing.T) {
@@ -579,6 +895,7 @@ func newMigratedStore(t *testing.T, ctx context.Context) (*Store, func()) {
 	pool, _, cleanupPool := newIsolatedPool(t, ctx)
 	applyMigration(t, ctx, pool, "000001_control_plane_foundation.up.sql")
 	applyMigration(t, ctx, pool, "000002_virtual_api_keys.up.sql")
+	applyMigration(t, ctx, pool, "000003_provider_credentials.up.sql")
 
 	store := &Store{
 		pool:    pool,
@@ -589,6 +906,24 @@ func newMigratedStore(t *testing.T, ctx context.Context) (*Store, func()) {
 		store.Close()
 		cleanupPool()
 	}
+}
+
+func credentialIDParamsProject(t *testing.T, projectID string) pgtype.UUID {
+	t.Helper()
+	id, err := parseUUID(projectID)
+	if err != nil {
+		t.Fatalf("parse project ID: %v", err)
+	}
+	return id
+}
+
+func credentialIDParamsOwner(t *testing.T, ownerID string) pgtype.UUID {
+	t.Helper()
+	id, err := parseUUID(ownerID)
+	if err != nil {
+		t.Fatalf("parse owner ID: %v", err)
+	}
+	return id
 }
 
 func readVirtualAPIKey(t *testing.T, ctx context.Context, store *Store, id pgtype.UUID) VirtualApiKey {

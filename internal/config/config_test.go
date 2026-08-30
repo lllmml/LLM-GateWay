@@ -32,6 +32,9 @@ func TestLoadUsesDefaults(t *testing.T) {
 	if cfg.DatabaseConnectTime != defaultDatabaseConnectTime {
 		t.Fatalf("DatabaseConnectTime = %v, want %v", cfg.DatabaseConnectTime, defaultDatabaseConnectTime)
 	}
+	if len(cfg.CredentialMasterKey) != 32 {
+		t.Fatalf("CredentialMasterKey length = %d, want 32", len(cfg.CredentialMasterKey))
+	}
 }
 
 func TestLoadRejectsMissingRequiredValues(t *testing.T) {
@@ -155,6 +158,16 @@ func TestLoadValidatesPublicConsoleURL(t *testing.T) {
 func TestLoadRejectsInvalidSessionTokenPepper(t *testing.T) {
 	values := requiredTestValues()
 	values["SESSION_TOKEN_PEPPER"] = base64.StdEncoding.EncodeToString(make([]byte, 31))
+
+	_, err := load(mapLookup(values))
+	if err == nil || !strings.Contains(err.Error(), "exactly 32 bytes") {
+		t.Fatalf("load error = %v, want 32-byte validation error", err)
+	}
+}
+
+func TestLoadRejectsInvalidCredentialMasterKey(t *testing.T) {
+	values := requiredTestValues()
+	values["CREDENTIAL_MASTER_KEY"] = base64.StdEncoding.EncodeToString(make([]byte, 31))
 
 	_, err := load(mapLookup(values))
 	if err == nil || !strings.Contains(err.Error(), "exactly 32 bytes") {

@@ -1,6 +1,7 @@
 SHELL := /bin/sh
 
 GO ?= go
+NPM ?= npm
 COMPOSE ?= docker compose
 DATABASE_URL ?= postgres://gateway:gateway@localhost:5432/gateway?sslmode=disable
 GOCACHE ?= $(CURDIR)/.cache/go-build
@@ -10,6 +11,7 @@ MIGRATE := $(TOOLS_BIN)/migrate
 MIGRATE_VERSION := v4.19.1
 SQLC := $(TOOLS_BIN)/sqlc
 SQLC_VERSION := v1.31.1
+WEB_DIR := web
 
 export DATABASE_URL
 export GOCACHE
@@ -20,10 +22,12 @@ include .env
 export
 endif
 
-.PHONY: bootstrap dev test typecheck format lint build integration race bench generate \
+.PHONY: bootstrap web-install dev dev-backend dev-web test test-backend test-web \
+	typecheck typecheck-backend typecheck-web format lint lint-backend lint-web \
+	build build-backend build-web integration race bench generate \
 	postgres-up postgres-down migrate-version migrate-up migrate-down-one
 
-bootstrap: $(MIGRATE) $(SQLC)
+bootstrap: $(MIGRATE) $(SQLC) web-install
 	@command -v $(GO) >/dev/null
 	@$(GO) version | grep -q 'go1\.26' || (echo 'Go 1.26.7 or a newer Go 1.26 patch is required' >&2; exit 1)
 	@command -v docker >/dev/null
@@ -35,6 +39,10 @@ bootstrap: $(MIGRATE) $(SQLC)
 	@echo 'sqlc $(SQLC_VERSION) installed at $(SQLC)'
 	@if [ ! -f .env ]; then echo 'Create .env from .env.example and set its required values before make dev.'; fi
 
+web-install:
+	@command -v $(NPM) >/dev/null
+	cd $(WEB_DIR) && $(NPM) ci
+
 $(MIGRATE):
 	@mkdir -p $(TOOLS_BIN)
 	GOBIN=$(TOOLS_BIN) $(GO) install -tags postgres github.com/golang-migrate/migrate/v4/cmd/migrate@$(MIGRATE_VERSION)
@@ -44,27 +52,56 @@ $(SQLC):
 	GOBIN=$(TOOLS_BIN) $(GO) install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION)
 
 dev: postgres-up
+	@$(MAKE) dev-backend & backend_pid=$$!; \
+	$(MAKE) dev-web & web_pid=$$!; \
+	trap 'kill $$backend_pid $$web_pid 2>/dev/null' INT TERM EXIT; \
+	wait $$backend_pid $$web_pid
+
+dev-backend:
 	$(GO) run ./cmd/gateway
 
-test:
+dev-web:
+	cd $(WEB_DIR) && $(NPM) run dev
+
+test: test-backend test-web
+
+test-backend:
 	$(GO) test ./...
 
-typecheck: $(SQLC)
+test-web:
+	cd $(WEB_DIR) && $(NPM) test
+
+typecheck: typecheck-backend typecheck-web
+
+typecheck-backend: $(SQLC)
 	$(GO) vet ./...
 	cd db && $(SQLC) vet
+
+typecheck-web:
+	cd $(WEB_DIR) && $(NPM) run typecheck
 
 format:
 	gofmt -w $$(find cmd internal -type f -name '*.go')
 
-lint:
+lint: lint-backend lint-web
+
+lint-backend:
 	@test -z "$$(gofmt -l $$(find cmd internal -type f -name '*.go'))" || (echo 'Go files are not formatted; run make format' >&2; exit 1)
 	$(GO) vet ./...
+
+lint-web:
+	cd $(WEB_DIR) && $(NPM) run lint
 
 generate: $(SQLC)
 	cd db && $(SQLC) generate
 
-build:
+build: build-backend build-web
+
+build-backend:
 	$(GO) build ./...
+
+build-web:
+	cd $(WEB_DIR) && $(NPM) run build
 
 integration: postgres-up
 	$(GO) test -tags=integration ./...
