@@ -260,7 +260,16 @@ func (s *httpStore) CreateCredential(_ context.Context, params CreateParams) (Cr
 	if s.err != nil {
 		return Credential{}, s.err
 	}
-	return Credential{ID: "credential-1", ProjectID: params.ProjectID, Provider: params.Provider, Label: params.Label, Status: StatusActive, KeyVersion: params.KeyVersion, CreatedAt: time.Now().UTC()}, nil
+	return Credential{ID: params.ID, ProjectID: params.ProjectID, Provider: params.Provider, Label: params.Label, Status: StatusActive, KeyVersion: params.KeyVersion, CreatedAt: time.Now().UTC()}, nil
+}
+
+func (s *httpStore) GetCredential(_ context.Context, ownerUserID, projectID, credentialID string) (Credential, error) {
+	s.lastOwner = ownerUserID
+	s.lastProject = projectID
+	if s.err != nil {
+		return Credential{}, s.err
+	}
+	return Credential{ID: credentialID, ProjectID: projectID, Provider: ProviderOpenAI}, nil
 }
 
 func (s *httpStore) ListCredentials(_ context.Context, ownerUserID, projectID string) ([]Credential, error) {

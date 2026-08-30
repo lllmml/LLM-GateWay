@@ -86,8 +86,8 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	if bytes.Equal(sessionTokenPepper, virtualKeyPepper) {
-		return Config{}, errors.New("SESSION_TOKEN_PEPPER and VIRTUAL_KEY_PEPPER must use different key material")
+	if err := validateDistinctSecurityKeys(credentialMasterKey, sessionTokenPepper, virtualKeyPepper); err != nil {
+		return Config{}, err
 	}
 
 	logLevel, err := parseLogLevel(valueOrDefault(lookup, "LOG_LEVEL", "info"))
@@ -127,6 +127,19 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		ReadinessTimeout:    readinessTimeout,
 		ShutdownTimeout:     shutdownTimeout,
 	}, nil
+}
+
+func validateDistinctSecurityKeys(credentialMasterKey, sessionTokenPepper, virtualKeyPepper []byte) error {
+	if bytes.Equal(credentialMasterKey, sessionTokenPepper) {
+		return errors.New("CREDENTIAL_MASTER_KEY and SESSION_TOKEN_PEPPER must use different key material")
+	}
+	if bytes.Equal(credentialMasterKey, virtualKeyPepper) {
+		return errors.New("CREDENTIAL_MASTER_KEY and VIRTUAL_KEY_PEPPER must use different key material")
+	}
+	if bytes.Equal(sessionTokenPepper, virtualKeyPepper) {
+		return errors.New("SESSION_TOKEN_PEPPER and VIRTUAL_KEY_PEPPER must use different key material")
+	}
+	return nil
 }
 
 func parsePublicConsoleURL(lookup func(string) (string, bool)) (string, bool, error) {

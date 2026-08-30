@@ -15,6 +15,7 @@ import (
 )
 
 func TestControlPlaneProjectKeyAndCredentialRoutesUseSessionOwnerAndCSRF(t *testing.T) {
+	const credentialProjectID = "22222222-2222-4222-8222-222222222222"
 	user := User{ID: "owner-from-session", GitHubLogin: "octo"}
 	sessions := newFakeSessionStore(user)
 	auth := newTestAuthHandler(t, testAuthDeps{sessionStore: sessions})
@@ -123,18 +124,18 @@ func TestControlPlaneProjectKeyAndCredentialRoutesUseSessionOwnerAndCSRF(t *test
 		t.Fatal("key revoke without CSRF reached store")
 	}
 
-	credentialListRequest := httptest.NewRequest(http.MethodGet, "/api/v1/projects/project-1/provider-credentials", nil)
+	credentialListRequest := httptest.NewRequest(http.MethodGet, "/api/v1/projects/"+credentialProjectID+"/provider-credentials", nil)
 	credentialListRequest.AddCookie(sessionCookie)
 	credentialListResponse := httptest.NewRecorder()
 	handler.ServeHTTP(credentialListResponse, credentialListRequest)
 	if credentialListResponse.Code != http.StatusOK {
 		t.Fatalf("credential list status = %d, want %d", credentialListResponse.Code, http.StatusOK)
 	}
-	if credentials.lastOwner != user.ID || credentials.lastProject != "project-1" {
+	if credentials.lastOwner != user.ID || credentials.lastProject != credentialProjectID {
 		t.Fatal("credential list did not use session owner and path project")
 	}
 
-	missingCredentialCSRF := httptest.NewRequest(http.MethodPost, "/api/v1/projects/project-1/provider-credentials", bytes.NewBufferString(`{"provider":"openai","label":"prod","secret":"sk-test"}`))
+	missingCredentialCSRF := httptest.NewRequest(http.MethodPost, "/api/v1/projects/"+credentialProjectID+"/provider-credentials", bytes.NewBufferString(`{"provider":"openai","label":"prod","secret":"sk-test"}`))
 	missingCredentialCSRF.AddCookie(sessionCookie)
 	missingCredentialCSRFResponse := httptest.NewRecorder()
 	handler.ServeHTTP(missingCredentialCSRFResponse, missingCredentialCSRF)
@@ -145,7 +146,7 @@ func TestControlPlaneProjectKeyAndCredentialRoutesUseSessionOwnerAndCSRF(t *test
 		t.Fatal("credential create without CSRF reached store")
 	}
 
-	credentialCreateRequest := httptest.NewRequest(http.MethodPost, "/api/v1/projects/project-1/provider-credentials", bytes.NewBufferString(`{"provider":"openai","label":"prod","secret":"sk-test"}`))
+	credentialCreateRequest := httptest.NewRequest(http.MethodPost, "/api/v1/projects/"+credentialProjectID+"/provider-credentials", bytes.NewBufferString(`{"provider":"openai","label":"prod","secret":"sk-test"}`))
 	credentialCreateRequest.Header.Set("Origin", "http://127.0.0.1:8081")
 	credentialCreateRequest.Header.Set("X-CSRF-Token", csrfCookie.Value)
 	credentialCreateRequest.AddCookie(sessionCookie)
@@ -155,7 +156,7 @@ func TestControlPlaneProjectKeyAndCredentialRoutesUseSessionOwnerAndCSRF(t *test
 	if credentialCreateResponse.Code != http.StatusCreated {
 		t.Fatalf("credential create status = %d, want %d; body=%s", credentialCreateResponse.Code, http.StatusCreated, credentialCreateResponse.Body.String())
 	}
-	if credentials.createCalls != 1 || credentials.lastOwner != user.ID || credentials.lastProject != "project-1" {
+	if credentials.createCalls != 1 || credentials.lastOwner != user.ID || credentials.lastProject != credentialProjectID {
 		t.Fatal("credential create did not use session owner and path project")
 	}
 }
@@ -233,13 +234,19 @@ func (s *handlerCredentialStore) CreateCredential(_ context.Context, params cred
 	s.lastOwner = params.OwnerUserID
 	s.lastProject = params.ProjectID
 	return credential.Credential{
-		ID:        "credential-1",
+		ID:        params.ID,
 		ProjectID: params.ProjectID,
 		Provider:  params.Provider,
 		Label:     params.Label,
 		Status:    credential.StatusActive,
 		CreatedAt: time.Now().UTC(),
 	}, nil
+}
+
+func (s *handlerCredentialStore) GetCredential(_ context.Context, ownerUserID, projectID, credentialID string) (credential.Credential, error) {
+	s.lastOwner = ownerUserID
+	s.lastProject = projectID
+	return credential.Credential{ID: credentialID, ProjectID: projectID, Provider: credential.ProviderOpenAI}, nil
 }
 
 func (s *handlerCredentialStore) ListCredentials(_ context.Context, ownerUserID, projectID string) ([]credential.Credential, error) {

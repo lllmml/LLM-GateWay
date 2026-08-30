@@ -144,8 +144,12 @@ func TestProviderCredentialServicePersistsOnlyRecoverableCiphertext(t *testing.T
 	if err != nil {
 		t.Fatalf("create credential cipher: %v", err)
 	}
-	service, err := credential.NewService(store, func(secret []byte) (credential.SealedSecret, error) {
-		encrypted, err := cipher.Encrypt(secret)
+	service, err := credential.NewService(store, func(secret []byte, context credential.SealContext) (credential.SealedSecret, error) {
+		encrypted, err := cipher.Encrypt(secret, security.CredentialIdentity{
+			CredentialID: context.CredentialID,
+			ProjectID:    context.ProjectID,
+			Provider:     string(context.Provider),
+		})
 		if err != nil {
 			return credential.SealedSecret{}, err
 		}
@@ -185,12 +189,47 @@ func TestProviderCredentialServicePersistsOnlyRecoverableCiphertext(t *testing.T
 		Ciphertext: ciphertext,
 		Nonce:      nonce,
 		KeyVersion: keyVersion,
+	}, security.CredentialIdentity{
+		CredentialID: created.ID,
+		ProjectID:    created.ProjectID,
+		Provider:     string(created.Provider),
 	})
 	if err != nil {
 		t.Fatalf("decrypt persisted credential: %v", err)
 	}
 	if !bytes.Equal(decrypted, rawSecret) {
 		t.Fatal("decrypted credential does not match the submitted secret")
+	}
+
+	rotatedSecret := []byte("rotated-provider-secret-not-stored-in-plaintext")
+	rotated, err := service.Rotate(ctx, owner.ID, project.ID, created.ID, string(rotatedSecret))
+	if err != nil {
+		t.Fatalf("rotate encrypted credential: %v", err)
+	}
+	if rotated.RotatedAt == nil || rotated.Provider != created.Provider {
+		t.Fatalf("rotated credential metadata = %+v", rotated)
+	}
+	if err := store.pool.QueryRow(ctx, `
+		SELECT secret_ciphertext, secret_nonce, key_version
+		FROM provider_credentials
+		WHERE id = $1
+	`, credentialID).Scan(&ciphertext, &nonce, &keyVersion); err != nil {
+		t.Fatalf("read rotated credential envelope: %v", err)
+	}
+	decrypted, err = cipher.Decrypt(security.EncryptedCredential{
+		Ciphertext: ciphertext,
+		Nonce:      nonce,
+		KeyVersion: keyVersion,
+	}, security.CredentialIdentity{
+		CredentialID: rotated.ID,
+		ProjectID:    rotated.ProjectID,
+		Provider:     string(rotated.Provider),
+	})
+	if err != nil {
+		t.Fatalf("decrypt rotated credential: %v", err)
+	}
+	if !bytes.Equal(decrypted, rotatedSecret) {
+		t.Fatal("decrypted rotated credential does not match the submitted secret")
 	}
 }
 
@@ -308,6 +347,7 @@ func TestProviderCredentialStoreAdapterAndConstraints(t *testing.T) {
 	} {
 		t.Run("create credential under "+test.name, func(t *testing.T) {
 			_, err := store.CreateCredential(ctx, credential.CreateParams{
+				ID:               formatUUID(newTestUUID(t)),
 				OwnerUserID:      test.ownerUserID,
 				ProjectID:        test.projectID,
 				Provider:         credential.ProviderOpenAI,
@@ -326,6 +366,7 @@ func TestProviderCredentialStoreAdapterAndConstraints(t *testing.T) {
 	}
 
 	created, err := store.CreateCredential(ctx, credential.CreateParams{
+		ID:               formatUUID(newTestUUID(t)),
 		OwnerUserID:      owner.ID,
 		ProjectID:        project.ID,
 		Provider:         credential.ProviderOpenAI,
@@ -356,6 +397,7 @@ func TestProviderCredentialStoreAdapterAndConstraints(t *testing.T) {
 	}
 
 	_, err = store.CreateCredential(ctx, credential.CreateParams{
+		ID:               formatUUID(newTestUUID(t)),
 		OwnerUserID:      owner.ID,
 		ProjectID:        project.ID,
 		Provider:         "invalid",
@@ -367,6 +409,7 @@ func TestProviderCredentialStoreAdapterAndConstraints(t *testing.T) {
 	assertPgCode(t, err, "23514")
 
 	_, err = store.CreateCredential(ctx, credential.CreateParams{
+		ID:               formatUUID(newTestUUID(t)),
 		OwnerUserID:      owner.ID,
 		ProjectID:        project.ID,
 		Provider:         credential.ProviderAnthropic,
@@ -378,6 +421,7 @@ func TestProviderCredentialStoreAdapterAndConstraints(t *testing.T) {
 	assertPgCode(t, err, "23514")
 
 	otherCredential, err := store.CreateCredential(ctx, credential.CreateParams{
+		ID:               formatUUID(newTestUUID(t)),
 		OwnerUserID:      other.ID,
 		ProjectID:        otherProject.ID,
 		Provider:         credential.ProviderDeepSeek,

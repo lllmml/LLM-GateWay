@@ -15,9 +15,9 @@ func (s *Store) CreateCredential(ctx context.Context, params credential.CreatePa
 	if err != nil {
 		return credential.Credential{}, err
 	}
-	id, err := newUUID()
+	id, err := parseUUID(params.ID)
 	if err != nil {
-		return credential.Credential{}, err
+		return credential.Credential{}, fmt.Errorf("parse provider credential ID: %w", err)
 	}
 	stored, err := s.queries.CreateProviderCredentialForOwner(ctx, CreateProviderCredentialForOwnerParams{
 		ID:               id,
@@ -29,6 +29,24 @@ func (s *Store) CreateCredential(ctx context.Context, params credential.CreatePa
 		ProjectID:        projectID,
 		OwnerUserID:      ownerID,
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return credential.Credential{}, credential.ErrNotFound
+	}
+	if err != nil {
+		return credential.Credential{}, err
+	}
+	return domainProviderCredential(
+		stored.ID, stored.ProjectID, stored.Provider, stored.Label, stored.KeyVersion, stored.Status,
+		stored.CreatedAt, stored.RotatedAt,
+	), nil
+}
+
+func (s *Store) GetCredential(ctx context.Context, ownerUserID, projectID, credentialID string) (credential.Credential, error) {
+	ids, err := providerCredentialIDs(ownerUserID, projectID, credentialID)
+	if err != nil {
+		return credential.Credential{}, err
+	}
+	stored, err := s.queries.GetProviderCredentialForOwner(ctx, GetProviderCredentialForOwnerParams(ids))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return credential.Credential{}, credential.ErrNotFound
 	}

@@ -21,6 +21,22 @@ WHERE projects.id = sqlc.arg('project_id')
   AND projects.owner_user_id = sqlc.arg('owner_user_id')
 RETURNING id, project_id, provider, label, key_version, status, created_at, rotated_at;
 
+-- name: GetProviderCredentialForOwner :one
+SELECT
+    credentials.id,
+    credentials.project_id,
+    credentials.provider,
+    credentials.label,
+    credentials.key_version,
+    credentials.status,
+    credentials.created_at,
+    credentials.rotated_at
+FROM provider_credentials AS credentials
+JOIN projects ON projects.id = credentials.project_id
+WHERE credentials.id = $1
+  AND credentials.project_id = $2
+  AND projects.owner_user_id = $3;
+
 -- name: ListProviderCredentialsForOwner :many
 SELECT
     credentials.id,

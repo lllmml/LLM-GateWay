@@ -199,15 +199,32 @@ func TestLoadKeepsSessionAndVirtualKeyPeppersSeparate(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsIdenticalSessionAndVirtualKeyPeppers(t *testing.T) {
-	values := requiredTestValues()
-	sharedPepper := base64.StdEncoding.EncodeToString(bytesOf(3, 32))
-	values["SESSION_TOKEN_PEPPER"] = sharedPepper
-	values["VIRTUAL_KEY_PEPPER"] = sharedPepper
+func TestLoadRejectsReusedSecurityKeyMaterial(t *testing.T) {
+	tests := []struct {
+		name   string
+		first  string
+		second string
+	}{
+		{name: "credential and session", first: "CREDENTIAL_MASTER_KEY", second: "SESSION_TOKEN_PEPPER"},
+		{name: "credential and virtual", first: "CREDENTIAL_MASTER_KEY", second: "VIRTUAL_KEY_PEPPER"},
+		{name: "session and virtual", first: "SESSION_TOKEN_PEPPER", second: "VIRTUAL_KEY_PEPPER"},
+	}
 
-	_, err := load(mapLookup(values))
-	if err == nil || !strings.Contains(err.Error(), "must use different key material") {
-		t.Fatalf("load error = %v, want pepper domain-separation error", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			values := requiredTestValues()
+			sharedKey := base64.StdEncoding.EncodeToString(bytesOf(3, 32))
+			values[test.first] = sharedKey
+			values[test.second] = sharedKey
+
+			_, err := load(mapLookup(values))
+			if err == nil || !strings.Contains(err.Error(), test.first) || !strings.Contains(err.Error(), test.second) {
+				t.Fatalf("load error = %v, want key-reuse error naming %s and %s", err, test.first, test.second)
+			}
+			if strings.Contains(err.Error(), sharedKey) {
+				t.Fatalf("load error leaked key material: %v", err)
+			}
+		})
 	}
 }
 

@@ -129,6 +129,56 @@ func (q *Queries) DisableProviderCredentialForOwner(ctx context.Context, arg Dis
 	return i, err
 }
 
+const getProviderCredentialForOwner = `-- name: GetProviderCredentialForOwner :one
+SELECT
+    credentials.id,
+    credentials.project_id,
+    credentials.provider,
+    credentials.label,
+    credentials.key_version,
+    credentials.status,
+    credentials.created_at,
+    credentials.rotated_at
+FROM provider_credentials AS credentials
+JOIN projects ON projects.id = credentials.project_id
+WHERE credentials.id = $1
+  AND credentials.project_id = $2
+  AND projects.owner_user_id = $3
+`
+
+type GetProviderCredentialForOwnerParams struct {
+	ID          pgtype.UUID
+	ProjectID   pgtype.UUID
+	OwnerUserID pgtype.UUID
+}
+
+type GetProviderCredentialForOwnerRow struct {
+	ID         pgtype.UUID
+	ProjectID  pgtype.UUID
+	Provider   string
+	Label      string
+	KeyVersion int16
+	Status     string
+	CreatedAt  pgtype.Timestamptz
+	RotatedAt  pgtype.Timestamptz
+}
+
+func (q *Queries) GetProviderCredentialForOwner(ctx context.Context, arg GetProviderCredentialForOwnerParams) (GetProviderCredentialForOwnerRow, error) {
+	row := q.db.QueryRow(ctx, getProviderCredentialForOwner, arg.ID, arg.ProjectID, arg.OwnerUserID)
+	var i GetProviderCredentialForOwnerRow
+	err := row.Scan(
+		&i.ID,
+		&i.ProjectID,
+		&i.Provider,
+		&i.Label,
+		&i.KeyVersion,
+		&i.Status,
+		&i.CreatedAt,
+		&i.RotatedAt,
+	)
+	return i, err
+}
+
 const listProviderCredentialsForOwner = `-- name: ListProviderCredentialsForOwner :many
 SELECT
     credentials.id,

@@ -38,8 +38,12 @@ func NewHandler(
 	if credentialCipher == nil {
 		return nil, errors.New("provider credential cipher is required")
 	}
-	sealCredential := func(secret []byte) (credential.SealedSecret, error) {
-		encrypted, err := credentialCipher.Encrypt(secret)
+	sealCredential := func(secret []byte, context credential.SealContext) (credential.SealedSecret, error) {
+		encrypted, err := credentialCipher.Encrypt(secret, security.CredentialIdentity{
+			CredentialID: context.CredentialID,
+			ProjectID:    context.ProjectID,
+			Provider:     string(context.Provider),
+		})
 		if err != nil {
 			return credential.SealedSecret{}, err
 		}

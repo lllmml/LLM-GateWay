@@ -22,7 +22,7 @@ include .env
 export
 endif
 
-.PHONY: bootstrap web-install dev dev-backend dev-web test test-backend test-web \
+.PHONY: bootstrap web-install dev dev-backend dev-web test test-backend test-web test-dev-supervisor \
 	typecheck typecheck-backend typecheck-web format lint lint-backend lint-web \
 	build build-backend build-web integration race bench generate \
 	postgres-up postgres-down migrate-version migrate-up migrate-down-one
@@ -52,10 +52,7 @@ $(SQLC):
 	GOBIN=$(TOOLS_BIN) $(GO) install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION)
 
 dev: postgres-up
-	@$(MAKE) dev-backend & backend_pid=$$!; \
-	$(MAKE) dev-web & web_pid=$$!; \
-	trap 'kill $$backend_pid $$web_pid 2>/dev/null' INT TERM EXIT; \
-	wait $$backend_pid $$web_pid
+	@/bin/sh scripts/dev-supervisor.sh "$(GO)" "$(NPM)" "$(WEB_DIR)"
 
 dev-backend:
 	$(GO) run ./cmd/gateway
@@ -63,13 +60,16 @@ dev-backend:
 dev-web:
 	cd $(WEB_DIR) && $(NPM) run dev
 
-test: test-backend test-web
+test: test-backend test-web test-dev-supervisor
 
 test-backend:
 	$(GO) test ./...
 
 test-web:
 	cd $(WEB_DIR) && $(NPM) test
+
+test-dev-supervisor:
+	/bin/sh scripts/dev-supervisor_test.sh
 
 typecheck: typecheck-backend typecheck-web
 

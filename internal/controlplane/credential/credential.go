@@ -2,7 +2,9 @@ package credential
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -38,6 +40,7 @@ type Credential struct {
 }
 
 type CreateParams struct {
+	ID               string
 	OwnerUserID      string
 	ProjectID        string
 	Provider         Provider
@@ -58,6 +61,7 @@ type RotateParams struct {
 
 type Store interface {
 	CreateCredential(context.Context, CreateParams) (Credential, error)
+	GetCredential(context.Context, string, string, string) (Credential, error)
 	ListCredentials(context.Context, string, string) ([]Credential, error)
 	RotateCredential(context.Context, RotateParams) (Credential, error)
 	DisableCredential(context.Context, string, string, string) (Credential, error)
@@ -69,7 +73,13 @@ type SealedSecret struct {
 	KeyVersion int16
 }
 
-type SealSecret func([]byte) (SealedSecret, error)
+type SealContext struct {
+	CredentialID string
+	ProjectID    string
+	Provider     Provider
+}
+
+type SealSecret func([]byte, SealContext) (SealedSecret, error)
 
 type Service struct {
 	store Store
@@ -92,11 +102,20 @@ func (s *Service) Create(ctx context.Context, ownerUserID, projectID, provider, 
 		return Credential{}, err
 	}
 	defer clear(secretBytes)
-	encrypted, err := s.seal(secretBytes)
+	credentialID, err := newCredentialID()
+	if err != nil {
+		return Credential{}, err
+	}
+	encrypted, err := s.seal(secretBytes, SealContext{
+		CredentialID: credentialID,
+		ProjectID:    projectID,
+		Provider:     parsedProvider,
+	})
 	if err != nil {
 		return Credential{}, err
 	}
 	return s.store.CreateCredential(ctx, CreateParams{
+		ID:               credentialID,
 		OwnerUserID:      ownerUserID,
 		ProjectID:        projectID,
 		Provider:         parsedProvider,
@@ -117,18 +136,36 @@ func (s *Service) Rotate(ctx context.Context, ownerUserID, projectID, credential
 		return Credential{}, err
 	}
 	defer clear(secretBytes)
-	encrypted, err := s.seal(secretBytes)
+	current, err := s.store.GetCredential(ctx, ownerUserID, projectID, credentialID)
+	if err != nil {
+		return Credential{}, err
+	}
+	encrypted, err := s.seal(secretBytes, SealContext{
+		CredentialID: current.ID,
+		ProjectID:    current.ProjectID,
+		Provider:     current.Provider,
+	})
 	if err != nil {
 		return Credential{}, err
 	}
 	return s.store.RotateCredential(ctx, RotateParams{
 		OwnerUserID:      ownerUserID,
-		ProjectID:        projectID,
-		CredentialID:     credentialID,
+		ProjectID:        current.ProjectID,
+		CredentialID:     current.ID,
 		SecretCiphertext: encrypted.Ciphertext,
 		SecretNonce:      encrypted.Nonce,
 		KeyVersion:       encrypted.KeyVersion,
 	})
+}
+
+func newCredentialID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", fmt.Errorf("generate provider credential ID: %w", err)
+	}
+	id[6] = (id[6] & 0x0f) | 0x40
+	id[8] = (id[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", id[0:4], id[4:6], id[6:8], id[8:10], id[10:16]), nil
 }
 
 func (s *Service) Disable(ctx context.Context, ownerUserID, projectID, credentialID string) (Credential, error) {

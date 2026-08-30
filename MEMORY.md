@@ -4,7 +4,7 @@ Update this after major decisions, completed phases, or bugs that future agents 
 
 ## Current State
 
-- Current task: Week 2 provider credential encrypted CRUD and the minimal React console shell are implemented; automated and local HTTP runtime checks pass.
+- Current task: PR #1 commit 7 review findings are fixed; credential identity binding, pairwise key separation, canonical Vite port enforcement, and dev child supervision pass automated/runtime checks.
 - Current phase: Week 2 Control Plane Core implementation is complete; its manual visual acceptance check remains.
 - Next step: Review the console at desktop and mobile widths, then propose the bounded Week 3 first-provider/non-streaming foundation plan.
 - Blocked by: This agent environment has no browser runtime, so the required visual desktop/mobile check could not be executed. Default port `:8080` remains occupied; use address overrides or identify its owner before using defaults.
@@ -28,6 +28,8 @@ Update this after major decisions, completed phases, or bugs that future agents 
 - 2026-08-30: Provider credentials use AES-256-GCM with a fresh nonce per encryption and persisted key version `1`; `CREDENTIAL_MASTER_KEY` must decode from standard Base64 to exactly 32 bytes, and metadata APIs never return the secret envelope.
 - 2026-08-30: Provider credential create/list/rotate/disable operations are ownership-scoped; rotation atomically replaces ciphertext/nonce/key-version metadata, while credential deletion, re-enable, live provider validation, and master-key re-encryption remain outside the Week 2 slice.
 - 2026-08-30: The minimal React/Vite console uses same-origin `/api` and `/auth` development proxies, server-side session discovery through `/api/v1/me`, CSRF-protected logout, and placeholder operational routes; full management screens remain later milestones.
+- 2026-08-30: Provider credential AES-GCM envelopes bind a versioned binary AAD context containing credential ID, project ID, provider, and key version; credential IDs are created before encryption, and rotation reloads immutable ownership-scoped metadata before resealing.
+- 2026-08-30: Credential, session, and virtual-key configuration keys must be pairwise distinct. Vite fails fast if canonical port `5173` is occupied, while a `/bin/sh` supervisor uses isolated Linux process groups to terminate and reap both dev process trees.
 
 ## AI / Tooling Decisions
 
