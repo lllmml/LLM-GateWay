@@ -60,6 +60,7 @@ type RotateParams struct {
 }
 
 type Store interface {
+	ResolveProjectID(context.Context, string, string) (string, error)
 	CreateCredential(context.Context, CreateParams) (Credential, error)
 	GetCredential(context.Context, string, string, string) (Credential, error)
 	ListCredentials(context.Context, string, string) ([]Credential, error)
@@ -102,6 +103,10 @@ func (s *Service) Create(ctx context.Context, ownerUserID, projectID, provider, 
 		return Credential{}, err
 	}
 	defer clear(secretBytes)
+	projectID, err = s.store.ResolveProjectID(ctx, ownerUserID, projectID)
+	if err != nil {
+		return Credential{}, err
+	}
 	credentialID, err := newCredentialID()
 	if err != nil {
 		return Credential{}, err

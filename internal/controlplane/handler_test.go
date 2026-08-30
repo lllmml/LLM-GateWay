@@ -229,6 +229,12 @@ type handlerCredentialStore struct {
 	lastProject string
 }
 
+func (s *handlerCredentialStore) ResolveProjectID(_ context.Context, ownerUserID, projectID string) (string, error) {
+	s.lastOwner = ownerUserID
+	s.lastProject = projectID
+	return projectID, nil
+}
+
 func (s *handlerCredentialStore) CreateCredential(_ context.Context, params credential.CreateParams) (credential.Credential, error) {
 	s.createCalls++
 	s.lastOwner = params.OwnerUserID

@@ -6,8 +6,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -161,6 +164,64 @@ func TestProviderCredentialServicePersistsOnlyRecoverableCiphertext(t *testing.T
 	})
 	if err != nil {
 		t.Fatalf("create credential service: %v", err)
+	}
+
+	otherOwner, err := store.UpsertGitHubUser(ctx, controlplane.GitHubUser{
+		GitHubID:    5004,
+		GitHubLogin: "encrypted-credential-other",
+	})
+	if err != nil {
+		t.Fatalf("upsert other owner: %v", err)
+	}
+	otherProject, err := store.CreateProject(ctx, projectdomain.CreateParams{
+		OwnerUserID: otherOwner.ID,
+		Name:        "Other Encrypted Credential Gateway",
+		Slug:        "other-encrypted-credential-gateway",
+	})
+	if err != nil {
+		t.Fatalf("create other project: %v", err)
+	}
+
+	credentialMux := http.NewServeMux()
+	credential.NewHandler(service, func(*http.Request) (string, bool) { return owner.ID, true }).Register(credentialMux)
+	for _, test := range []struct {
+		name      string
+		projectID string
+	}{
+		{name: "malformed project", projectID: "not-a-uuid"},
+		{name: "missing project", projectID: formatUUID(newTestUUID(t))},
+		{name: "cross-owner project", projectID: otherProject.ID},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/api/v1/projects/"+test.projectID+"/provider-credentials",
+				strings.NewReader(`{"provider":"openai","label":"prod","secret":"provider-secret"}`),
+			)
+			response := httptest.NewRecorder()
+			credentialMux.ServeHTTP(response, request)
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusNotFound, response.Body.String())
+			}
+			var body struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if body.Error.Code != "project_not_found" {
+				t.Fatalf("error code = %q, want project_not_found", body.Error.Code)
+			}
+			var credentialCount int
+			if err := store.pool.QueryRow(ctx, "SELECT count(*) FROM provider_credentials").Scan(&credentialCount); err != nil {
+				t.Fatalf("count provider credentials: %v", err)
+			}
+			if credentialCount != 0 {
+				t.Fatalf("persisted credential count = %d, want 0", credentialCount)
+			}
+		})
 	}
 
 	rawSecret := []byte("provider-secret-not-stored-in-plaintext")

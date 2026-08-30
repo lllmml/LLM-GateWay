@@ -16,6 +16,8 @@ go_command=$1
 npm_command=$2
 web_directory=$3
 status_directory=/tmp/gateway-dev-supervisor.$$
+termination_grace_polls=30
+termination_poll_interval=0.1
 
 if ! mkdir "$status_directory"; then
 	echo "could not create dev supervisor state directory" >&2
@@ -38,15 +40,32 @@ run_managed() {
 	managed_pid=
 
 	terminate_managed_group() {
-		if [ -n "$managed_pid" ] && kill -0 -"$managed_pid" 2>/dev/null; then
-			kill -TERM -"$managed_pid" 2>/dev/null || :
+		if [ -z "$managed_pid" ]; then
+			return
 		fi
-		if [ -n "$managed_pid" ]; then
+		if ! kill -0 -"$managed_pid" 2>/dev/null; then
 			wait "$managed_pid" 2>/dev/null || :
+			return
 		fi
-		if [ -n "$managed_pid" ] && kill -0 -"$managed_pid" 2>/dev/null; then
-			kill -KILL -"$managed_pid" 2>/dev/null || :
-		fi
+
+		kill -TERM -"$managed_pid" 2>/dev/null || :
+		(
+			remaining_polls=$termination_grace_polls
+			while kill -0 -"$managed_pid" 2>/dev/null && [ "$remaining_polls" -gt 0 ]; do
+				sleep "$termination_poll_interval"
+				remaining_polls=$((remaining_polls - 1))
+			done
+			if kill -0 -"$managed_pid" 2>/dev/null; then
+				echo "dev supervisor: managed process group exceeded TERM grace period; sent SIGKILL" >&2
+				kill -KILL -"$managed_pid" 2>/dev/null || :
+			fi
+		) &
+		termination_guard_pid=$!
+
+		# This wait is bounded by the concurrent termination guard, which sends
+		# SIGKILL to the entire process group when the grace period expires.
+		wait "$managed_pid" 2>/dev/null || :
+		wait "$termination_guard_pid" 2>/dev/null || :
 	}
 
 	stop_managed() {
@@ -67,9 +86,7 @@ run_managed() {
 	managed_exit_status=$?
 	trap - HUP INT TERM
 	if kill -0 -"$managed_pid" 2>/dev/null; then
-		kill -TERM -"$managed_pid" 2>/dev/null || :
-		sleep 1
-		kill -KILL -"$managed_pid" 2>/dev/null || :
+		terminate_managed_group
 	fi
 	printf '%s\n' "$managed_exit_status" >"$managed_status_file"
 	return "$managed_exit_status"

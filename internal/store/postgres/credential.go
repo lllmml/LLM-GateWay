@@ -10,6 +10,24 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/credential"
 )
 
+func (s *Store) ResolveProjectID(ctx context.Context, ownerUserID, projectID string) (string, error) {
+	ownerID, selectedProjectID, err := credentialOwnerAndProjectIDs(ownerUserID, projectID)
+	if err != nil {
+		return "", err
+	}
+	stored, err := s.queries.GetProjectForOwner(ctx, GetProjectForOwnerParams{
+		ID:          selectedProjectID,
+		OwnerUserID: ownerID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", credential.ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	return formatUUID(stored.ID), nil
+}
+
 func (s *Store) CreateCredential(ctx context.Context, params credential.CreateParams) (credential.Credential, error) {
 	ownerID, projectID, err := credentialOwnerAndProjectIDs(params.OwnerUserID, params.ProjectID)
 	if err != nil {

@@ -254,6 +254,15 @@ type httpStore struct {
 	lastProject string
 }
 
+func (s *httpStore) ResolveProjectID(_ context.Context, ownerUserID, projectID string) (string, error) {
+	s.lastOwner = ownerUserID
+	s.lastProject = projectID
+	if s.err != nil {
+		return "", s.err
+	}
+	return projectID, nil
+}
+
 func (s *httpStore) CreateCredential(_ context.Context, params CreateParams) (Credential, error) {
 	s.calls++
 	s.created = params

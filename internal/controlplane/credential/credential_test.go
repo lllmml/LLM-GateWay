@@ -26,6 +26,23 @@ func TestServiceCreateValidatesBeforeSealingOrStore(t *testing.T) {
 	}
 }
 
+func TestServiceCreateResolvesOwnedProjectBeforeSealing(t *testing.T) {
+	store := &fakeStore{projectErr: ErrNotFound}
+	sealCalls := 0
+	service := newTestService(t, store, func([]byte, SealContext) (SealedSecret, error) {
+		sealCalls++
+		return SealedSecret{}, nil
+	})
+
+	_, err := service.Create(context.Background(), "owner-1", "not-a-uuid", "openai", "local", "secret")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Create error = %v, want ErrNotFound", err)
+	}
+	if sealCalls != 0 || store.createCalls != 0 {
+		t.Fatalf("seal calls = %d, create calls = %d; want neither called", sealCalls, store.createCalls)
+	}
+}
+
 func TestServiceCreateSealsSecretAndStoresOnlyEncryptedMaterial(t *testing.T) {
 	store := &fakeStore{}
 	service := newTestService(t, store, func(plaintext []byte, context SealContext) (SealedSecret, error) {
@@ -167,7 +184,17 @@ type fakeStore struct {
 	lastProject    string
 	lastCredential string
 	err            error
+	projectErr     error
 	current        Credential
+}
+
+func (s *fakeStore) ResolveProjectID(_ context.Context, ownerUserID, projectID string) (string, error) {
+	s.lastOwner = ownerUserID
+	s.lastProject = projectID
+	if s.projectErr != nil {
+		return "", s.projectErr
+	}
+	return projectID, nil
 }
 
 func (s *fakeStore) CreateCredential(_ context.Context, params CreateParams) (Credential, error) {
