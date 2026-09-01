@@ -11,6 +11,7 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/apikey"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/credential"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/project"
+	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/providerconfig"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
 )
 
@@ -23,11 +24,12 @@ func TestControlPlaneProjectKeyAndCredentialRoutesUseSessionOwnerAndCSRF(t *test
 	projects := &handlerProjectStore{}
 	keys := &handlerKeyStore{}
 	credentials := &handlerCredentialStore{}
+	configs := &handlerProviderConfigStore{}
 	cipher, err := security.NewCredentialCipher(bytes.Repeat([]byte{8}, 32))
 	if err != nil {
 		t.Fatalf("new credential cipher: %v", err)
 	}
-	handler, err := NewHandler(auth, projects, keys, bytes.Repeat([]byte{9}, 32), credentials, cipher)
+	handler, err := NewHandler(auth, projects, keys, bytes.Repeat([]byte{9}, 32), credentials, cipher, configs)
 	if err != nil {
 		t.Fatalf("new handler: %v", err)
 	}
@@ -159,6 +161,31 @@ func TestControlPlaneProjectKeyAndCredentialRoutesUseSessionOwnerAndCSRF(t *test
 	if credentials.createCalls != 1 || credentials.lastOwner != user.ID || credentials.lastProject != credentialProjectID {
 		t.Fatal("credential create did not use session owner and path project")
 	}
+
+	missingProviderConfigCSRF := httptest.NewRequest(http.MethodPut, "/api/v1/projects/"+credentialProjectID+"/provider-configs/openai", bytes.NewBufferString(`{"credential_id":"`+credentialProjectID+`","enabled":true}`))
+	missingProviderConfigCSRF.AddCookie(sessionCookie)
+	missingProviderConfigCSRFResponse := httptest.NewRecorder()
+	handler.ServeHTTP(missingProviderConfigCSRFResponse, missingProviderConfigCSRF)
+	if missingProviderConfigCSRFResponse.Code != http.StatusForbidden {
+		t.Fatalf("provider config without CSRF status = %d, want %d", missingProviderConfigCSRFResponse.Code, http.StatusForbidden)
+	}
+	if configs.upsertCalls != 0 {
+		t.Fatal("provider config without CSRF reached store")
+	}
+
+	providerConfigRequest := httptest.NewRequest(http.MethodPut, "/api/v1/projects/"+credentialProjectID+"/provider-configs/openai", bytes.NewBufferString(`{"credential_id":"`+credentialProjectID+`","enabled":true}`))
+	providerConfigRequest.Header.Set("Origin", "http://127.0.0.1:8081")
+	providerConfigRequest.Header.Set("X-CSRF-Token", csrfCookie.Value)
+	providerConfigRequest.AddCookie(sessionCookie)
+	providerConfigRequest.AddCookie(csrfCookie)
+	providerConfigResponse := httptest.NewRecorder()
+	handler.ServeHTTP(providerConfigResponse, providerConfigRequest)
+	if providerConfigResponse.Code != http.StatusOK {
+		t.Fatalf("provider config status = %d, want %d; body=%s", providerConfigResponse.Code, http.StatusOK, providerConfigResponse.Body.String())
+	}
+	if configs.upsertCalls != 1 || configs.lastOwner != user.ID || configs.lastProject != credentialProjectID {
+		t.Fatal("provider config did not use session owner and path project")
+	}
 }
 
 type handlerProjectStore struct {
@@ -267,4 +294,23 @@ func (s *handlerCredentialStore) RotateCredential(context.Context, credential.Ro
 
 func (s *handlerCredentialStore) DisableCredential(context.Context, string, string, string) (credential.Credential, error) {
 	return credential.Credential{}, credential.ErrNotFound
+}
+
+type handlerProviderConfigStore struct {
+	upsertCalls int
+	lastOwner   string
+	lastProject string
+}
+
+func (s *handlerProviderConfigStore) UpsertProviderConfig(_ context.Context, params providerconfig.UpsertParams) (providerconfig.Config, error) {
+	s.upsertCalls++
+	s.lastOwner = params.OwnerUserID
+	s.lastProject = params.ProjectID
+	return providerconfig.Config{
+		ProjectID:    params.ProjectID,
+		Provider:     params.Provider,
+		CredentialID: params.CredentialID,
+		Enabled:      params.Enabled,
+		UpdatedAt:    time.Now().UTC(),
+	}, nil
 }

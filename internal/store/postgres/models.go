@@ -8,6 +8,46 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type GatewayRequest struct {
+	ID                   pgtype.UUID
+	ProjectID            pgtype.UUID
+	VirtualKeyID         pgtype.UUID
+	ProviderCredentialID pgtype.UUID
+	Provider             string
+	Model                string
+	IsStream             bool
+	Status               string
+	StartedAt            pgtype.Timestamptz
+	FirstChunkAt         pgtype.Timestamptz
+	CompletedAt          pgtype.Timestamptz
+	LatencyMs            pgtype.Int8
+	TtftMs               pgtype.Int8
+	UpstreamHttpStatus   pgtype.Int4
+	ErrorCategory        pgtype.Text
+	RetryCount           int16
+	PromptTokens         pgtype.Int8
+	CompletionTokens     pgtype.Int8
+	TotalTokens          pgtype.Int8
+	UsageSource          pgtype.Text
+	PricingID            pgtype.UUID
+	EstimatedCostNanoUsd pgtype.Int8
+	UpstreamRequestID    pgtype.Text
+	TraceID              pgtype.Text
+	CreatedAt            pgtype.Timestamptz
+}
+
+type ModelPrice struct {
+	ID                      pgtype.UUID
+	Provider                string
+	Model                   string
+	InputNanoUsdPerMillion  int64
+	OutputNanoUsdPerMillion int64
+	EffectiveFrom           pgtype.Timestamptz
+	EffectiveTo             pgtype.Timestamptz
+	SourceNote              string
+	CreatedAt               pgtype.Timestamptz
+}
+
 type Project struct {
 	ID          pgtype.UUID
 	OwnerUserID pgtype.UUID
@@ -16,6 +56,15 @@ type Project struct {
 	Status      string
 	CreatedAt   pgtype.Timestamptz
 	UpdatedAt   pgtype.Timestamptz
+}
+
+type ProjectProviderConfig struct {
+	ProjectID       pgtype.UUID
+	Provider        string
+	CredentialID    pgtype.UUID
+	Enabled         bool
+	BaseUrlOverride pgtype.Text
+	UpdatedAt       pgtype.Timestamptz
 }
 
 type ProviderCredential struct {

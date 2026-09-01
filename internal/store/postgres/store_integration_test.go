@@ -27,6 +27,9 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/apikey"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/credential"
 	projectdomain "github.com/lllmml/production-go-llm-gateway/internal/controlplane/project"
+	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/providerconfig"
+	"github.com/lllmml/production-go-llm-gateway/internal/dataplane"
+	"github.com/lllmml/production-go-llm-gateway/internal/provider"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
 )
 
@@ -116,6 +119,36 @@ func TestProviderCredentialMigrationUpAndDown(t *testing.T) {
 		t.Fatal("provider_credentials table still exists after down migration")
 	}
 
+	applyMigration(t, ctx, pool, "000002_virtual_api_keys.down.sql")
+	applyMigration(t, ctx, pool, "000001_control_plane_foundation.down.sql")
+}
+
+func TestDataPlaneFoundationMigrationUpAndDown(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pool, _, cleanup := newIsolatedPool(t, ctx)
+	defer cleanup()
+
+	applyMigration(t, ctx, pool, "000001_control_plane_foundation.up.sql")
+	applyMigration(t, ctx, pool, "000002_virtual_api_keys.up.sql")
+	applyMigration(t, ctx, pool, "000003_provider_credentials.up.sql")
+	applyMigration(t, ctx, pool, "000004_data_plane_foundation.up.sql")
+
+	for _, table := range []string{"project_provider_configs", "model_prices", "gateway_requests"} {
+		if !tableExists(t, ctx, pool, table) {
+			t.Fatalf("table %s does not exist after up migration", table)
+		}
+	}
+
+	applyMigration(t, ctx, pool, "000004_data_plane_foundation.down.sql")
+	for _, table := range []string{"gateway_requests", "model_prices", "project_provider_configs"} {
+		if tableExists(t, ctx, pool, table) {
+			t.Fatalf("table %s still exists after down migration", table)
+		}
+	}
+
+	applyMigration(t, ctx, pool, "000003_provider_credentials.down.sql")
 	applyMigration(t, ctx, pool, "000002_virtual_api_keys.down.sql")
 	applyMigration(t, ctx, pool, "000001_control_plane_foundation.down.sql")
 }
@@ -994,6 +1027,280 @@ func TestControlPlaneStoreAdapters(t *testing.T) {
 	}
 }
 
+func TestDataPlaneStoreAdapterCreatesAndFinalizesGatewayRequest(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	store, cleanup := newMigratedStore(t, ctx)
+	defer cleanup()
+
+	owner, err := store.UpsertGitHubUser(ctx, controlplane.GitHubUser{GitHubID: 7001, GitHubLogin: "dataplane-owner"})
+	if err != nil {
+		t.Fatalf("upsert owner: %v", err)
+	}
+	other, err := store.UpsertGitHubUser(ctx, controlplane.GitHubUser{GitHubID: 7002, GitHubLogin: "dataplane-other"})
+	if err != nil {
+		t.Fatalf("upsert other owner: %v", err)
+	}
+	project, err := store.CreateProject(ctx, projectdomain.CreateParams{OwnerUserID: owner.ID, Name: "Data Plane", Slug: "data-plane"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	otherProject, err := store.CreateProject(ctx, projectdomain.CreateParams{OwnerUserID: other.ID, Name: "Other Data Plane", Slug: "other-data-plane"})
+	if err != nil {
+		t.Fatalf("create other project: %v", err)
+	}
+
+	pepper := bytes.Repeat([]byte{9}, 32)
+	keyService, err := apikey.NewService(store, pepper)
+	if err != nil {
+		t.Fatalf("create key service: %v", err)
+	}
+	keyResult, err := keyService.Create(ctx, owner.ID, project.ID, "gateway-client")
+	if err != nil {
+		t.Fatalf("create virtual key: %v", err)
+	}
+	parsedKey, err := sharedapikey.ParseRawKey(keyResult.RawKey)
+	if err != nil {
+		t.Fatalf("parse virtual key: %v", err)
+	}
+	keyHash, err := sharedapikey.HashKey(keyResult.RawKey, pepper)
+	if err != nil {
+		t.Fatalf("hash virtual key: %v", err)
+	}
+	auth, err := store.AuthenticateVirtualKey(ctx, parsedKey.Prefix, keyHash)
+	if err != nil {
+		t.Fatalf("authenticate virtual key: %v", err)
+	}
+	if auth.ProjectID != project.ID || auth.VirtualKeyID != keyResult.Key.ID || auth.KeyPrefix != keyResult.Key.Prefix {
+		t.Fatalf("auth context = %+v", auth)
+	}
+	keyID, err := parseUUID(keyResult.Key.ID)
+	if err != nil {
+		t.Fatalf("parse key ID: %v", err)
+	}
+	if lastUsedAt := readVirtualAPIKey(t, ctx, store, keyID).LastUsedAt; lastUsedAt.Valid {
+		t.Fatalf("data plane auth updated last_used_at: %+v", lastUsedAt)
+	}
+	if _, err := store.AuthenticateVirtualKey(ctx, parsedKey.Prefix, bytes.Repeat([]byte{1}, 32)); !errors.Is(err, dataplane.ErrNotFound) {
+		t.Fatalf("bad key auth error = %v, want dataplane.ErrNotFound", err)
+	}
+	if _, err := store.ResolveProviderCredential(ctx, project.ID, provider.OpenAI); !errors.Is(err, dataplane.ErrNotFound) {
+		t.Fatalf("missing provider config error = %v, want dataplane.ErrNotFound", err)
+	}
+	var requestCount int
+	if err := store.pool.QueryRow(ctx, "SELECT count(*) FROM gateway_requests").Scan(&requestCount); err != nil {
+		t.Fatalf("count gateway requests: %v", err)
+	}
+	if requestCount != 0 {
+		t.Fatalf("gateway request count = %d, want 0", requestCount)
+	}
+
+	cipher, credentialService := newCredentialServiceForIntegration(t, store)
+	createdCredential, err := credentialService.Create(ctx, owner.ID, project.ID, "openai", "primary", "sk-live-not-logged")
+	if err != nil {
+		t.Fatalf("create credential: %v", err)
+	}
+	otherCredential, err := credentialService.Create(ctx, other.ID, otherProject.ID, "openai", "other", "sk-other-not-logged")
+	if err != nil {
+		t.Fatalf("create other credential: %v", err)
+	}
+	wrongProviderCredential, err := credentialService.Create(ctx, owner.ID, project.ID, "deepseek", "wrong-provider", "sk-deepseek-not-logged")
+	if err != nil {
+		t.Fatalf("create wrong-provider credential: %v", err)
+	}
+	replacementCredential, err := credentialService.Create(ctx, owner.ID, project.ID, "openai", "replacement", "sk-live-restored")
+	if err != nil {
+		t.Fatalf("create replacement credential: %v", err)
+	}
+
+	if _, err := store.UpsertProviderConfig(ctx, providerconfig.UpsertParams{
+		OwnerUserID:  owner.ID,
+		ProjectID:    project.ID,
+		Provider:     string(provider.OpenAI),
+		CredentialID: otherCredential.ID,
+		Enabled:      true,
+	}); !errors.Is(err, providerconfig.ErrNotFound) {
+		t.Fatalf("cross-project provider config error = %v, want ErrNotFound", err)
+	}
+	if _, err := store.UpsertProviderConfig(ctx, providerconfig.UpsertParams{
+		OwnerUserID:  owner.ID,
+		ProjectID:    project.ID,
+		Provider:     string(provider.OpenAI),
+		CredentialID: wrongProviderCredential.ID,
+		Enabled:      true,
+	}); !errors.Is(err, providerconfig.ErrNotFound) {
+		t.Fatalf("provider-mismatched config error = %v, want ErrNotFound", err)
+	}
+
+	config, err := store.UpsertProviderConfig(ctx, providerconfig.UpsertParams{
+		OwnerUserID:  owner.ID,
+		ProjectID:    project.ID,
+		Provider:     string(provider.OpenAI),
+		CredentialID: createdCredential.ID,
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("upsert provider config: %v", err)
+	}
+	if config.ProjectID != project.ID || config.CredentialID != createdCredential.ID || !config.Enabled {
+		t.Fatalf("provider config = %+v", config)
+	}
+
+	if _, err := store.UpsertProviderConfig(ctx, providerconfig.UpsertParams{
+		OwnerUserID:  owner.ID,
+		ProjectID:    project.ID,
+		Provider:     string(provider.OpenAI),
+		CredentialID: createdCredential.ID,
+		Enabled:      false,
+	}); err != nil {
+		t.Fatalf("disable provider config: %v", err)
+	}
+	if _, err := store.ResolveProviderCredential(ctx, project.ID, provider.OpenAI); !errors.Is(err, dataplane.ErrNotFound) {
+		t.Fatalf("disabled provider config error = %v, want dataplane.ErrNotFound", err)
+	}
+	if _, err := store.UpsertProviderConfig(ctx, providerconfig.UpsertParams{
+		OwnerUserID:  owner.ID,
+		ProjectID:    project.ID,
+		Provider:     string(provider.OpenAI),
+		CredentialID: createdCredential.ID,
+		Enabled:      true,
+	}); err != nil {
+		t.Fatalf("re-enable provider config: %v", err)
+	}
+
+	resolved, err := store.ResolveProviderCredential(ctx, project.ID, provider.OpenAI)
+	if err != nil {
+		t.Fatalf("resolve provider credential: %v", err)
+	}
+	if resolved.ID != createdCredential.ID || resolved.ProjectID != project.ID || resolved.Provider != provider.OpenAI {
+		t.Fatalf("resolved credential = %+v", resolved)
+	}
+	plaintext, err := cipher.Decrypt(security.EncryptedCredential{
+		Ciphertext: resolved.SecretCiphertext,
+		Nonce:      resolved.SecretNonce,
+		KeyVersion: resolved.KeyVersion,
+	}, security.CredentialIdentity{
+		CredentialID: resolved.ID,
+		ProjectID:    resolved.ProjectID,
+		Provider:     string(resolved.Provider),
+	})
+	if err != nil {
+		t.Fatalf("decrypt resolved credential: %v", err)
+	}
+	if string(plaintext) != "sk-live-not-logged" {
+		t.Fatal("resolved credential plaintext mismatch")
+	}
+	clear(plaintext)
+
+	if _, err := store.DisableCredential(ctx, owner.ID, project.ID, createdCredential.ID); err != nil {
+		t.Fatalf("disable credential: %v", err)
+	}
+	if _, err := store.ResolveProviderCredential(ctx, project.ID, provider.OpenAI); !errors.Is(err, dataplane.ErrNotFound) {
+		t.Fatalf("disabled credential resolve error = %v, want dataplane.ErrNotFound", err)
+	}
+	if _, err := store.UpsertProviderConfig(ctx, providerconfig.UpsertParams{
+		OwnerUserID:  owner.ID,
+		ProjectID:    project.ID,
+		Provider:     string(provider.OpenAI),
+		CredentialID: replacementCredential.ID,
+		Enabled:      true,
+	}); err != nil {
+		t.Fatalf("switch provider config to replacement credential: %v", err)
+	}
+	createdCredential = replacementCredential
+
+	startedAt := time.Now().UTC().Add(-time.Second)
+	record, err := store.CreateGatewayRequest(ctx, dataplane.CreateRequestParams{
+		ProjectID:            project.ID,
+		VirtualKeyID:         keyResult.Key.ID,
+		ProviderCredentialID: createdCredential.ID,
+		Provider:             provider.OpenAI,
+		Model:                "gpt-test",
+		IsStream:             false,
+		StartedAt:            startedAt,
+	})
+	if err != nil {
+		t.Fatalf("create gateway request: %v", err)
+	}
+	promptTokens, completionTokens, totalTokens := int64(7), int64(3), int64(10)
+	upstreamStatus := int32(http.StatusOK)
+	usageSource := "provider"
+	upstreamRequestID := "req_integration"
+	if err := store.FinalizeGatewayRequest(ctx, dataplane.FinalizeParams{
+		ID:                 record.ID,
+		Status:             "succeeded",
+		CompletedAt:        time.Now().UTC(),
+		LatencyMS:          ptrInt64(42),
+		UpstreamHTTPStatus: &upstreamStatus,
+		RetryCount:         0,
+		PromptTokens:       &promptTokens,
+		CompletionTokens:   &completionTokens,
+		TotalTokens:        &totalTokens,
+		UsageSource:        &usageSource,
+		UpstreamRequestID:  &upstreamRequestID,
+	}); err != nil {
+		t.Fatalf("finalize gateway request: %v", err)
+	}
+	requestID, err := parseUUID(record.ID)
+	if err != nil {
+		t.Fatalf("parse request ID: %v", err)
+	}
+	persisted, err := store.queries.GetGatewayRequest(ctx, requestID)
+	if err != nil {
+		t.Fatalf("get gateway request: %v", err)
+	}
+	if persisted.Status != "succeeded" || persisted.TotalTokens.Int64 != 10 || persisted.UpstreamRequestID.String != "req_integration" {
+		t.Fatalf("persisted request = %+v", persisted)
+	}
+
+	if _, err := store.DisableKey(ctx, owner.ID, project.ID, keyResult.Key.ID); err != nil {
+		t.Fatalf("disable key: %v", err)
+	}
+	if _, err := store.AuthenticateVirtualKey(ctx, parsedKey.Prefix, keyHash); !errors.Is(err, dataplane.ErrNotFound) {
+		t.Fatalf("disabled key auth error = %v, want dataplane.ErrNotFound", err)
+	}
+	revokedKey, err := keyService.Create(ctx, owner.ID, project.ID, "revoked-client")
+	if err != nil {
+		t.Fatalf("create revoked key: %v", err)
+	}
+	revokedParsed, err := sharedapikey.ParseRawKey(revokedKey.RawKey)
+	if err != nil {
+		t.Fatalf("parse revoked key: %v", err)
+	}
+	revokedHash, err := sharedapikey.HashKey(revokedKey.RawKey, pepper)
+	if err != nil {
+		t.Fatalf("hash revoked key: %v", err)
+	}
+	if _, err := store.RevokeKey(ctx, owner.ID, project.ID, revokedKey.Key.ID); err != nil {
+		t.Fatalf("revoke key: %v", err)
+	}
+	if _, err := store.AuthenticateVirtualKey(ctx, revokedParsed.Prefix, revokedHash); !errors.Is(err, dataplane.ErrNotFound) {
+		t.Fatalf("revoked key auth error = %v, want dataplane.ErrNotFound", err)
+	}
+	if _, err := store.pool.Exec(ctx, "UPDATE projects SET status = 'disabled' WHERE id = $1", credentialIDParamsProject(t, project.ID)); err != nil {
+		t.Fatalf("disable project: %v", err)
+	}
+	activeAfterProjectDisable, err := keyService.Create(ctx, other.ID, otherProject.ID, "still-active")
+	if err != nil {
+		t.Fatalf("create other active key: %v", err)
+	}
+	otherParsed, err := sharedapikey.ParseRawKey(activeAfterProjectDisable.RawKey)
+	if err != nil {
+		t.Fatalf("parse other active key: %v", err)
+	}
+	otherHash, err := sharedapikey.HashKey(activeAfterProjectDisable.RawKey, pepper)
+	if err != nil {
+		t.Fatalf("hash other active key: %v", err)
+	}
+	if _, err := store.AuthenticateVirtualKey(ctx, parsedKey.Prefix, keyHash); !errors.Is(err, dataplane.ErrNotFound) {
+		t.Fatalf("disabled project auth error = %v, want dataplane.ErrNotFound", err)
+	}
+	if _, err := store.AuthenticateVirtualKey(ctx, otherParsed.Prefix, otherHash); err != nil {
+		t.Fatalf("other active key auth after project disable: %v", err)
+	}
+}
+
 func newMigratedStore(t *testing.T, ctx context.Context) (*Store, func()) {
 	t.Helper()
 
@@ -1001,6 +1308,7 @@ func newMigratedStore(t *testing.T, ctx context.Context) (*Store, func()) {
 	applyMigration(t, ctx, pool, "000001_control_plane_foundation.up.sql")
 	applyMigration(t, ctx, pool, "000002_virtual_api_keys.up.sql")
 	applyMigration(t, ctx, pool, "000003_provider_credentials.up.sql")
+	applyMigration(t, ctx, pool, "000004_data_plane_foundation.up.sql")
 
 	store := &Store{
 		pool:    pool,
@@ -1029,6 +1337,37 @@ func credentialIDParamsOwner(t *testing.T, ownerID string) pgtype.UUID {
 		t.Fatalf("parse owner ID: %v", err)
 	}
 	return id
+}
+
+func newCredentialServiceForIntegration(t *testing.T, store *Store) (*security.CredentialCipher, *credential.Service) {
+	t.Helper()
+	cipher, err := security.NewCredentialCipher(bytes.Repeat([]byte{9}, 32))
+	if err != nil {
+		t.Fatalf("create credential cipher: %v", err)
+	}
+	service, err := credential.NewService(store, func(secret []byte, context credential.SealContext) (credential.SealedSecret, error) {
+		encrypted, err := cipher.Encrypt(secret, security.CredentialIdentity{
+			CredentialID: context.CredentialID,
+			ProjectID:    context.ProjectID,
+			Provider:     string(context.Provider),
+		})
+		if err != nil {
+			return credential.SealedSecret{}, err
+		}
+		return credential.SealedSecret{
+			Ciphertext: encrypted.Ciphertext,
+			Nonce:      encrypted.Nonce,
+			KeyVersion: encrypted.KeyVersion,
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("create credential service: %v", err)
+	}
+	return cipher, service
+}
+
+func ptrInt64(value int64) *int64 {
+	return &value
 }
 
 func readVirtualAPIKey(t *testing.T, ctx context.Context, store *Store, id pgtype.UUID) VirtualApiKey {

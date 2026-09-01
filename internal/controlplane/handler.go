@@ -8,6 +8,7 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/apikey"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/credential"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/project"
+	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/providerconfig"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
 )
 
@@ -18,6 +19,7 @@ func NewHandler(
 	virtualKeyPepper []byte,
 	credentials credential.Store,
 	credentialCipher *security.CredentialCipher,
+	providerConfigs providerconfig.Store,
 ) (http.Handler, error) {
 	root := http.NewServeMux()
 	auth.Register(root)
@@ -58,6 +60,11 @@ func NewHandler(
 		return nil, fmt.Errorf("configure provider credentials: %w", err)
 	}
 	credential.NewHandler(credentialService, currentUserID).Register(projectMux)
+	providerConfigService, err := providerconfig.NewService(providerConfigs)
+	if err != nil {
+		return nil, fmt.Errorf("configure provider configs: %w", err)
+	}
+	providerconfig.NewHandler(providerConfigService, currentUserID).Register(projectMux)
 
 	protectedProjects := auth.RequireSession(auth.RequireSameOrigin(projectMux))
 	root.Handle("/api/v1/projects", protectedProjects)

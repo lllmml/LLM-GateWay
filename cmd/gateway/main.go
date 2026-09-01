@@ -3,15 +3,20 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"golang.org/x/oauth2"
 
 	"github.com/lllmml/production-go-llm-gateway/internal/app"
 	"github.com/lllmml/production-go-llm-gateway/internal/config"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane"
+	"github.com/lllmml/production-go-llm-gateway/internal/dataplane"
+	"github.com/lllmml/production-go-llm-gateway/internal/provider"
+	"github.com/lllmml/production-go-llm-gateway/internal/provider/openai"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
 	"github.com/lllmml/production-go-llm-gateway/internal/store/postgres"
 	"github.com/lllmml/production-go-llm-gateway/internal/telemetry"
@@ -66,11 +71,29 @@ func run() error {
 		cfg.VirtualKeyPepper,
 		database,
 		credentialCipher,
+		database,
 	)
 	if err != nil {
 		database.Close()
 		return fmt.Errorf("configure control plane: %w", err)
 	}
+	openAITransport := openai.NewTransport()
+	defer openAITransport.CloseIdleConnections()
+	openAIHTTPClient := &http.Client{Transport: openAITransport}
+	dataPlaneService, err := dataplane.NewService(dataplane.Options{
+		Store:            database,
+		VirtualKeyPepper: cfg.VirtualKeyPepper,
+		CredentialCipher: credentialCipher,
+		UpstreamTimeout:  time.Minute,
+		Providers:        map[provider.Name]provider.Client{provider.OpenAI: openai.New(openAIHTTPClient)},
+		Logger:           logger,
+	})
+	if err != nil {
+		database.Close()
+		return fmt.Errorf("configure data plane: %w", err)
+	}
+	dataPlaneMux := http.NewServeMux()
+	dataplane.NewHandler(dataPlaneService).Register(dataPlaneMux)
 
 	application := app.New(app.Options{
 		DataPlaneAddr:       cfg.DataPlaneAddr,
@@ -78,6 +101,7 @@ func run() error {
 		OpsAddr:             cfg.OpsAddr,
 		ReadinessTimeout:    cfg.ReadinessTimeout,
 		ShutdownTimeout:     cfg.ShutdownTimeout,
+		DataPlaneHandler:    dataPlaneMux,
 		ControlPlaneHandler: controlPlaneHandler,
 	}, database, logger)
 
