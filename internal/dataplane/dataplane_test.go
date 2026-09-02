@@ -183,7 +183,7 @@ func TestUnknownProviderDoesNotCreateRequestOrCallProvider(t *testing.T) {
 	}
 }
 
-func TestStreamRequestReturnsUnsupportedBeforeCreateOrUpstream(t *testing.T) {
+func TestStreamRequestReturnsUnsupportedFeature(t *testing.T) {
 	store, rawKey := newAuthorizedStore(t)
 	client := &fakeProviderClient{}
 	service := newTestService(t, store, client)
@@ -198,7 +198,7 @@ func TestStreamRequestReturnsUnsupportedBeforeCreateOrUpstream(t *testing.T) {
 		Stream:   true,
 	})
 	var gatewayErr *GatewayError
-	if !errors.As(err, &gatewayErr) || gatewayErr.Category != provider.InvalidRequest || !strings.Contains(gatewayErr.Message, "streaming") {
+	if !errors.As(err, &gatewayErr) || gatewayErr.Category != provider.UnsupportedFeature || gatewayErr.Message != "streaming chat completions are not supported in this milestone" {
 		t.Fatalf("error = %#v", err)
 	}
 	if store.resolveCalls != 0 || store.createCalls != 0 || store.finalizeCalls != 0 || client.calls != 0 {
@@ -370,7 +370,7 @@ func TestHandlerPassesStreamToServiceAndRejectsBeforeUpstream(t *testing.T) {
 	if store.createCalls != 0 || client.calls != 0 {
 		t.Fatalf("create calls=%d client calls=%d", store.createCalls, client.calls)
 	}
-	if !strings.Contains(response.Body.String(), `"code":"invalid_request"`) || !strings.Contains(response.Body.String(), `"type":"invalid_request"`) {
+	if !strings.Contains(response.Body.String(), `"code":"unsupported_feature"`) || !strings.Contains(response.Body.String(), `"type":"unsupported_feature"`) {
 		t.Fatalf("body = %s", response.Body.String())
 	}
 }

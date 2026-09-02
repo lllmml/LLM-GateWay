@@ -161,7 +161,7 @@ func (s *Service) CompleteChat(ctx context.Context, auth AuthContext, traceID st
 		return provider.Result{}, GatewayRequest{}, NewError(provider.ModelNotSupported, "model must use provider/model-id format")
 	}
 	if chat.Stream {
-		return provider.Result{}, GatewayRequest{}, NewError(provider.InvalidRequest, "streaming chat completions are not supported in this milestone")
+		return provider.Result{}, GatewayRequest{}, NewError(provider.UnsupportedFeature, "streaming chat completions are not supported in this milestone")
 	}
 	client, ok := s.providers.Lookup(modelRef.Provider)
 	if !ok {

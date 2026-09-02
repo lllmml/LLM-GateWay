@@ -22,6 +22,7 @@ const (
 	AuthenticationFailed  ErrorCategory = "authentication_failed"
 	AuthorizationFailed   ErrorCategory = "authorization_failed"
 	RateLimited           ErrorCategory = "rate_limited"
+	UnsupportedFeature    ErrorCategory = "unsupported_feature"
 	ProviderNotConfigured ErrorCategory = "provider_not_configured"
 	ModelNotSupported     ErrorCategory = "model_not_supported"
 	ProviderRateLimited   ErrorCategory = "provider_rate_limited"
@@ -86,6 +87,7 @@ type Client interface {
 	CompleteChat(context.Context, ChatRequest, Credential) (Result, error)
 }
 
+// Registry manages configured provider clients.
 type Registry struct {
 	clients map[Name]Client
 }

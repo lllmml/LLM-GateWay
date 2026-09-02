@@ -161,7 +161,7 @@ func writeGatewayError(response http.ResponseWriter, record GatewayRequest, err 
 	}
 	status := http.StatusInternalServerError
 	switch gatewayErr.Category {
-	case provider.InvalidRequest, provider.ModelNotSupported, provider.ProviderNotConfigured:
+	case provider.InvalidRequest, provider.UnsupportedFeature, provider.ModelNotSupported, provider.ProviderNotConfigured:
 		status = http.StatusBadRequest
 	case provider.AuthenticationFailed:
 		status = http.StatusUnauthorized
