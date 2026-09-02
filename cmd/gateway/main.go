@@ -80,12 +80,19 @@ func run() error {
 	openAITransport := openai.NewTransport()
 	defer openAITransport.CloseIdleConnections()
 	openAIHTTPClient := &http.Client{Transport: openAITransport}
+	providerRegistry, err := provider.NewRegistry(map[provider.Name]provider.Client{
+		provider.OpenAI: openai.New(openAIHTTPClient),
+	})
+	if err != nil {
+		database.Close()
+		return fmt.Errorf("configure provider registry: %w", err)
+	}
 	dataPlaneService, err := dataplane.NewService(dataplane.Options{
 		Store:            database,
 		VirtualKeyPepper: cfg.VirtualKeyPepper,
 		CredentialCipher: credentialCipher,
 		UpstreamTimeout:  time.Minute,
-		Providers:        map[provider.Name]provider.Client{provider.OpenAI: openai.New(openAIHTTPClient)},
+		ProviderRegistry: providerRegistry,
 		Logger:           logger,
 	})
 	if err != nil {

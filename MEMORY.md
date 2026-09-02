@@ -6,6 +6,7 @@ Update this after major decisions, completed phases, or bugs that future agents 
 
 - Current task: Week 3 OpenAI non-streaming Data Plane foundation is implemented and verified with virtual-key auth, explicit provider credential selection, durable request create/finalize, a direct adapter, and a deterministic mock provider.
 - Current phase: Week 3 First Provider, Non-Streaming is complete.
+- Week 3 PR2 review fix: provider registry now supports dynamic provider namespaces, X-Request-ID/UUID trace propagation is preserved, and the stream flag reaches the service while SSE handling remains deferred to Week 4.
 - Next step: Propose the bounded Week 4 Streaming Core plan before changing SSE, flushing, cancellation, or downstream response-commit behavior.
 - Blocked by: None. Real-provider smoke tests remain opt-in and require explicit cost-bearing approval.
 
@@ -35,6 +36,7 @@ Update this after major decisions, completed phases, or bugs that future agents 
 - 2026-09-01: Every upstream-bound request creates `gateway_requests(status = in_progress)` before credential decryption/provider work and finalizes the same row before a successful response. Finalization uses a separate bounded context so downstream cancellation does not erase lifecycle evidence.
 - 2026-09-01: The OpenAI adapter owns wire translation, upstream authentication, bounded response decoding, usage extraction, request-ID extraction, and error classification. The Data Plane service owns deadlines, lifecycle ordering, stable client errors, and the Week 3 no-retry policy.
 - 2026-09-01: One long-lived explicit `http.Transport` is reused by the OpenAI client; the deterministic mock provider supplies non-stream success, error, delay, and malformed-response tests without real provider calls.
+- 2026-09-01: Provider lookup is registry-backed and no longer limited by a hardcoded `ParseModel` namespace whitelist; unknown provider namespaces can parse and then fail later through explicit registry lookup/configuration.
 
 ## AI / Tooling Decisions
 

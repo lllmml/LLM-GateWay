@@ -93,7 +93,7 @@ type Options struct {
 	VirtualKeyPepper []byte
 	CredentialCipher *security.CredentialCipher
 	UpstreamTimeout  time.Duration
-	Providers        map[provider.Name]provider.Client
+	ProviderRegistry *provider.Registry
 	Logger           *slog.Logger
 }
 
@@ -102,7 +102,7 @@ type Service struct {
 	virtualKeyPepper []byte
 	credentialCipher *security.CredentialCipher
 	upstreamTimeout  time.Duration
-	providers        map[provider.Name]provider.Client
+	providers        *provider.Registry
 	logger           *slog.Logger
 }
 
@@ -119,26 +119,19 @@ func NewService(options Options) (*Service, error) {
 	if options.UpstreamTimeout <= 0 {
 		return nil, errors.New("upstream timeout must be positive")
 	}
-	if len(options.Providers) == 0 {
-		return nil, errors.New("at least one provider is required")
+	if options.ProviderRegistry == nil {
+		return nil, errors.New("provider registry is required")
 	}
 	logger := options.Logger
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
-	}
-	providers := make(map[provider.Name]provider.Client, len(options.Providers))
-	for name, client := range options.Providers {
-		if client == nil {
-			return nil, fmt.Errorf("%s provider client is required", name)
-		}
-		providers[name] = client
 	}
 	return &Service{
 		store:            options.Store,
 		virtualKeyPepper: append([]byte(nil), options.VirtualKeyPepper...),
 		credentialCipher: options.CredentialCipher,
 		upstreamTimeout:  options.UpstreamTimeout,
-		providers:        providers,
+		providers:        options.ProviderRegistry,
 		logger:           logger,
 	}, nil
 }
@@ -165,13 +158,13 @@ func (s *Service) Authenticate(ctx context.Context, rawKey string) (AuthContext,
 func (s *Service) CompleteChat(ctx context.Context, auth AuthContext, traceID string, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
 	modelRef, err := provider.ParseModel(chat.Model)
 	if err != nil {
-		return provider.Result{}, GatewayRequest{}, NewError(provider.ModelNotSupported, "model must use openai/model-id format")
+		return provider.Result{}, GatewayRequest{}, NewError(provider.ModelNotSupported, "model must use provider/model-id format")
 	}
-	if modelRef.Provider != provider.OpenAI {
-		return provider.Result{}, GatewayRequest{}, NewError(provider.ModelNotSupported, "only openai models are supported in this milestone")
+	if chat.Stream {
+		return provider.Result{}, GatewayRequest{}, NewError(provider.InvalidRequest, "streaming chat completions are not supported in this milestone")
 	}
-	client := s.providers[modelRef.Provider]
-	if client == nil {
+	client, ok := s.providers.Lookup(modelRef.Provider)
+	if !ok {
 		return provider.Result{}, GatewayRequest{}, NewError(provider.ProviderNotConfigured, "provider is not configured")
 	}
 	credential, err := s.store.ResolveProviderCredential(ctx, auth.ProjectID, modelRef.Provider)
@@ -189,7 +182,7 @@ func (s *Service) CompleteChat(ctx context.Context, auth AuthContext, traceID st
 		ProviderCredentialID: credential.ID,
 		Provider:             modelRef.Provider,
 		Model:                modelRef.Model,
-		IsStream:             false,
+		IsStream:             chat.Stream,
 		StartedAt:            now,
 		TraceID:              traceID,
 	})
@@ -295,6 +288,7 @@ func (s *Service) persistenceError(record GatewayRequest, category provider.Erro
 	s.logger.Error("gateway request finalization failed",
 		slog.String("gateway_request_id", record.ID),
 		slog.String("provider", string(record.Provider)),
+		slog.String("project_id", record.ProjectID),
 		slog.String("category", string(category)),
 		slog.String("error", err.Error()),
 	)

@@ -36,6 +36,7 @@ const (
 type ChatRequest struct {
 	Model    string
 	Messages []Message
+	Stream   bool
 }
 
 type Message struct {
@@ -85,6 +86,35 @@ type Client interface {
 	CompleteChat(context.Context, ChatRequest, Credential) (Result, error)
 }
 
+type Registry struct {
+	clients map[Name]Client
+}
+
+func NewRegistry(clients map[Name]Client) (*Registry, error) {
+	if len(clients) == 0 {
+		return nil, errors.New("at least one provider is required")
+	}
+	copied := make(map[Name]Client, len(clients))
+	for name, client := range clients {
+		if strings.TrimSpace(string(name)) == "" {
+			return nil, errors.New("provider name is required")
+		}
+		if client == nil {
+			return nil, fmt.Errorf("%s provider client is required", name)
+		}
+		copied[name] = client
+	}
+	return &Registry{clients: copied}, nil
+}
+
+func (r *Registry) Lookup(name Name) (Client, bool) {
+	if r == nil {
+		return nil, false
+	}
+	client, ok := r.clients[name]
+	return client, ok
+}
+
 type ModelRef struct {
 	Provider Name
 	Model    string
@@ -95,16 +125,7 @@ func ParseModel(model string) (ModelRef, error) {
 	if !ok || providerName == "" || providerModel == "" || strings.Contains(providerModel, "/") {
 		return ModelRef{}, &Error{Category: ModelNotSupported, Message: "model must use provider/model-id format"}
 	}
-	switch Name(providerName) {
-	case OpenAI:
-		return ModelRef{Provider: OpenAI, Model: providerModel}, nil
-	case Anthropic:
-		return ModelRef{Provider: Anthropic, Model: providerModel}, nil
-	case DeepSeek:
-		return ModelRef{Provider: DeepSeek, Model: providerModel}, nil
-	default:
-		return ModelRef{}, &Error{Category: ModelNotSupported, Message: "provider namespace is not supported"}
-	}
+	return ModelRef{Provider: Name(providerName), Model: providerModel}, nil
 }
 
 type Error struct {

@@ -1,8 +1,10 @@
 package dataplane
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -50,7 +52,12 @@ func (h *Handler) chatCompletions(response http.ResponseWriter, request *http.Re
 		writeError(response, http.StatusBadRequest, provider.InvalidRequest, code, err.Error())
 		return
 	}
-	result, record, err := h.service.CompleteChat(request.Context(), auth, "", chat)
+	traceID, err := requestTraceID(request)
+	if err != nil {
+		writeError(response, http.StatusInternalServerError, provider.InternalError, "internal_error", "request could not be completed")
+		return
+	}
+	result, record, err := h.service.CompleteChat(request.Context(), auth, traceID, chat)
 	if err != nil {
 		writeGatewayError(response, record, err)
 		return
@@ -82,9 +89,6 @@ func decodeChatRequest(response http.ResponseWriter, request *http.Request) (pro
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return provider.ChatRequest{}, errors.New("request body must contain one JSON value")
 	}
-	if body.Stream != nil && *body.Stream {
-		return provider.ChatRequest{}, unsupportedParameter("stream is not supported in this milestone")
-	}
 	model := strings.TrimSpace(body.Model)
 	if model == "" {
 		return provider.ChatRequest{}, errors.New("model is required")
@@ -103,7 +107,34 @@ func decodeChatRequest(response http.ResponseWriter, request *http.Request) (pro
 		}
 		messages = append(messages, provider.Message{Role: role, Content: current.Content})
 	}
-	return provider.ChatRequest{Model: model, Messages: messages}, nil
+	stream := false
+	if body.Stream != nil {
+		stream = *body.Stream
+	}
+	return provider.ChatRequest{Model: model, Messages: messages, Stream: stream}, nil
+}
+
+func requestTraceID(request *http.Request) (string, error) {
+	if traceID := strings.TrimSpace(request.Header.Get("X-Request-ID")); traceID != "" {
+		return traceID, nil
+	}
+	return newUUIDV4()
+}
+
+func newUUIDV4() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	raw[6] = (raw[6] & 0x0f) | 0x40
+	raw[8] = (raw[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		raw[0:4],
+		raw[4:6],
+		raw[6:8],
+		raw[8:10],
+		raw[10:16],
+	), nil
 }
 
 func bearerToken(header string) (string, bool) {
