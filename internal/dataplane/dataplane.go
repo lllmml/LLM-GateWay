@@ -61,8 +61,10 @@ type CreateRequestParams struct {
 type FinalizeParams struct {
 	ID                   string
 	Status               string
+	FirstChunkAt         *time.Time
 	CompletedAt          time.Time
 	LatencyMS            *int64
+	TTFTMS               *int64
 	UpstreamHTTPStatus   *int32
 	ErrorCategory        *provider.ErrorCategory
 	RetryCount           int16
@@ -86,6 +88,12 @@ type Store interface {
 	ResolveProviderCredential(context.Context, string, provider.Name) (ProviderCredential, error)
 	CreateGatewayRequest(context.Context, CreateRequestParams) (GatewayRequest, error)
 	FinalizeGatewayRequest(context.Context, FinalizeParams) error
+}
+
+type StreamSink interface {
+	Prepare(GatewayRequest) error
+	WriteEvent(provider.StreamEvent) error
+	Committed() bool
 }
 
 type Options struct {
@@ -226,6 +234,125 @@ func (s *Service) CompleteChat(ctx context.Context, auth AuthContext, traceID st
 	return result, record, nil
 }
 
+func (s *Service) StreamChat(ctx context.Context, auth AuthContext, traceID string, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
+	if sink == nil {
+		return GatewayRequest{}, NewError(provider.InternalError, "request could not be completed")
+	}
+	modelRef, err := provider.ParseModel(chat.Model)
+	if err != nil {
+		return GatewayRequest{}, NewError(provider.ModelNotSupported, "model must use provider/model-id format")
+	}
+	client, ok := s.providers.Lookup(modelRef.Provider)
+	if !ok {
+		return GatewayRequest{}, NewError(provider.ProviderNotConfigured, "provider is not configured")
+	}
+	streamingClient, ok := client.(provider.StreamingClient)
+	if !ok {
+		return GatewayRequest{}, NewError(provider.UnsupportedFeature, "streaming chat completions are not supported for this provider")
+	}
+	credential, err := s.store.ResolveProviderCredential(ctx, auth.ProjectID, modelRef.Provider)
+	if errors.Is(err, ErrNotFound) {
+		return GatewayRequest{}, NewError(provider.ProviderNotConfigured, "provider is not configured")
+	}
+	if err != nil {
+		return GatewayRequest{}, err
+	}
+
+	now := time.Now().UTC()
+	record, err := s.store.CreateGatewayRequest(ctx, CreateRequestParams{
+		ProjectID:            auth.ProjectID,
+		VirtualKeyID:         auth.VirtualKeyID,
+		ProviderCredentialID: credential.ID,
+		Provider:             modelRef.Provider,
+		Model:                modelRef.Model,
+		IsStream:             true,
+		StartedAt:            now,
+		TraceID:              traceID,
+	})
+	if err != nil {
+		return GatewayRequest{}, err
+	}
+	record.Provider = modelRef.Provider
+
+	apiKey, err := s.decryptCredential(credential)
+	if err != nil {
+		category := provider.ProviderNotConfigured
+		if finalizeErr := s.finalizeStream(ctx, record, nil, &category, nil, nil, nil); finalizeErr != nil {
+			return record, s.persistenceError(record, category, finalizeErr)
+		}
+		return record, NewError(provider.ProviderNotConfigured, "provider credential could not be decrypted")
+	}
+	defer clear(apiKey)
+
+	upstreamCtx, cancel := context.WithTimeout(ctx, s.upstreamTimeout)
+	defer cancel()
+	upstreamChat := chat
+	upstreamChat.Model = modelRef.Model
+	upstreamChat.Stream = true
+	result, err := streamingClient.StreamChat(upstreamCtx, upstreamChat, provider.Credential{
+		APIKey:          apiKey,
+		BaseURLOverride: credential.BaseURLOverride,
+	})
+	if err != nil {
+		gatewayErr := errorFromProvider(err)
+		if gatewayErr == nil {
+			gatewayErr = NewError(provider.ProviderUnavailable, "provider request failed")
+		}
+		if finalizeErr := s.finalizeStream(ctx, record, &result, &gatewayErr.Category, nil, nil, nil); finalizeErr != nil {
+			return record, s.persistenceError(record, gatewayErr.Category, finalizeErr)
+		}
+		return record, gatewayErr
+	}
+	if result.Stream == nil {
+		category := provider.ProviderUnavailable
+		if finalizeErr := s.finalizeStream(ctx, record, &result, &category, nil, nil, nil); finalizeErr != nil {
+			return record, s.persistenceError(record, category, finalizeErr)
+		}
+		return record, NewError(provider.ProviderUnavailable, "provider stream could not be opened")
+	}
+	defer result.Stream.Close()
+
+	if err := sink.Prepare(record); err != nil {
+		category := provider.StreamInterrupted
+		if finalizeErr := s.finalizeStream(ctx, record, &result, &category, nil, nil, nil); finalizeErr != nil {
+			return record, s.persistenceError(record, category, finalizeErr)
+		}
+		return record, NewError(provider.StreamInterrupted, "stream interrupted")
+	}
+
+	var firstChunkAt *time.Time
+	var ttftMS *int64
+	for {
+		event, err := result.Stream.Next()
+		if err != nil {
+			category := provider.StreamInterrupted
+			if finalizeErr := s.finalizeStream(ctx, record, &result, &category, nil, firstChunkAt, ttftMS); finalizeErr != nil {
+				return record, s.persistenceError(record, category, finalizeErr)
+			}
+			return record, NewError(provider.StreamInterrupted, "stream interrupted")
+		}
+		if err := sink.WriteEvent(event); err != nil {
+			category := provider.StreamInterrupted
+			if finalizeErr := s.finalizeStream(ctx, record, &result, &category, nil, firstChunkAt, ttftMS); finalizeErr != nil {
+				return record, s.persistenceError(record, category, finalizeErr)
+			}
+			return record, NewError(provider.StreamInterrupted, "stream interrupted")
+		}
+		if !event.Done && firstChunkAt == nil {
+			now := time.Now().UTC()
+			ttft := now.Sub(record.StartedAt).Milliseconds()
+			firstChunkAt = &now
+			ttftMS = &ttft
+		}
+		if event.Done {
+			if err := s.finalizeStream(ctx, record, &result, nil, result.Stream.Usage(), firstChunkAt, ttftMS); err != nil {
+				return record, s.persistenceError(record, "", err)
+			}
+			return record, nil
+		}
+	}
+}
+
 func (s *Service) decryptCredential(credential ProviderCredential) ([]byte, error) {
 	return s.credentialCipher.Decrypt(security.EncryptedCredential{
 		Ciphertext: credential.SecretCiphertext,
@@ -239,6 +366,17 @@ func (s *Service) decryptCredential(credential ProviderCredential) ([]byte, erro
 }
 
 func (s *Service) finalize(ctx context.Context, record GatewayRequest, result *provider.Result, category *provider.ErrorCategory, usage *provider.Usage) error {
+	var streamResult *provider.StreamResult
+	if result != nil {
+		streamResult = &provider.StreamResult{
+			UpstreamStatus:    result.UpstreamStatus,
+			UpstreamRequestID: result.UpstreamRequestID,
+		}
+	}
+	return s.finalizeStream(ctx, record, streamResult, category, usage, nil, nil)
+}
+
+func (s *Service) finalizeStream(ctx context.Context, record GatewayRequest, result *provider.StreamResult, category *provider.ErrorCategory, usage *provider.Usage, firstChunkAt *time.Time, ttftMS *int64) error {
 	finalizeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeTimeout)
 	defer cancel()
 
@@ -271,8 +409,10 @@ func (s *Service) finalize(ctx context.Context, record GatewayRequest, result *p
 	return s.store.FinalizeGatewayRequest(finalizeCtx, FinalizeParams{
 		ID:                 record.ID,
 		Status:             status,
+		FirstChunkAt:       firstChunkAt,
 		CompletedAt:        completedAt,
 		LatencyMS:          &latency,
+		TTFTMS:             ttftMS,
 		UpstreamHTTPStatus: upstreamStatus,
 		ErrorCategory:      category,
 		RetryCount:         0,
@@ -343,6 +483,8 @@ func clientMessage(category provider.ErrorCategory) string {
 		return "provider rejected the request"
 	case provider.ProviderUnavailable:
 		return "provider is unavailable"
+	case provider.StreamInterrupted:
+		return "stream interrupted"
 	default:
 		return "request could not be completed"
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -321,6 +322,220 @@ func TestSuccessfulProviderWithFinalizeFailureReturnsPersistenceError(t *testing
 	}
 }
 
+func TestStreamChatWritesChunksAndFinalizesUsageAndTTFT(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	stream := &fakeChatStream{
+		events: []provider.StreamEvent{
+			{Data: []byte(`{"id":"chunk_1","choices":[{"delta":{"content":"hello"}}]}`)},
+			{Data: []byte(`{"id":"chunk_2","choices":[{"delta":{"content":" world"}}]}`)},
+			{Data: []byte("[DONE]"), Done: true},
+		},
+		usage: &provider.Usage{PromptTokens: 7, CompletionTokens: 3, TotalTokens: 10},
+	}
+	client := &fakeProviderClient{streamResult: provider.StreamResult{
+		Stream:            stream,
+		UpstreamStatus:    http.StatusOK,
+		UpstreamRequestID: "req_stream",
+	}}
+	service := newTestService(t, store, client)
+	sink := &recordingStreamSink{}
+
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	record, err := service.StreamChat(context.Background(), auth, "trace-stream", provider.ChatRequest{
+		Model:    "openai/gpt-test",
+		Messages: []provider.Message{{Role: "user", Content: "hello"}},
+		Stream:   true,
+	}, sink)
+	if err != nil {
+		t.Fatalf("stream chat: %v", err)
+	}
+	if record.ID != testRequestID || client.streamCalls != 1 || client.lastChat.Model != "gpt-test" || !client.lastChat.Stream {
+		t.Fatalf("record=%+v calls=%d chat=%+v", record, client.streamCalls, client.lastChat)
+	}
+	if !stream.closed {
+		t.Fatal("stream was not closed")
+	}
+	if store.lastCreate.TraceID != "trace-stream" || !store.lastCreate.IsStream {
+		t.Fatalf("create params = %+v", store.lastCreate)
+	}
+	if store.lastFinalize.Status != "succeeded" || store.lastFinalize.ErrorCategory != nil {
+		t.Fatalf("finalize = %+v", store.lastFinalize)
+	}
+	if store.lastFinalize.FirstChunkAt == nil || store.lastFinalize.TTFTMS == nil || *store.lastFinalize.TTFTMS < 0 {
+		t.Fatalf("stream timing not persisted: %+v", store.lastFinalize)
+	}
+	if store.lastFinalize.UpstreamHTTPStatus == nil || *store.lastFinalize.UpstreamHTTPStatus != http.StatusOK {
+		t.Fatalf("upstream status not persisted: %+v", store.lastFinalize)
+	}
+	if store.lastFinalize.UpstreamRequestID == nil || *store.lastFinalize.UpstreamRequestID != "req_stream" {
+		t.Fatalf("upstream request ID not persisted: %+v", store.lastFinalize)
+	}
+	if store.lastFinalize.TotalTokens == nil || *store.lastFinalize.TotalTokens != 10 {
+		t.Fatalf("usage not persisted: %+v", store.lastFinalize)
+	}
+	if len(sink.events) != 3 || !sink.events[2].Done {
+		t.Fatalf("sink events = %+v", sink.events)
+	}
+}
+
+func TestStreamChatProviderErrorBeforeCommitReturnsJSONCapableError(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	client := &fakeProviderClient{
+		streamResult: provider.StreamResult{UpstreamStatus: http.StatusBadGateway, UpstreamRequestID: "req_bad"},
+		streamErr:    &provider.Error{Category: provider.ProviderUnavailable, Message: "raw upstream text"},
+	}
+	service := newTestService(t, store, client)
+	sink := &recordingStreamSink{}
+
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	record, err := service.StreamChat(context.Background(), auth, "", provider.ChatRequest{
+		Model:    "openai/gpt-test",
+		Messages: []provider.Message{{Role: "user", Content: "hello"}},
+		Stream:   true,
+	}, sink)
+	var gatewayErr *GatewayError
+	if !errors.As(err, &gatewayErr) || gatewayErr.Category != provider.ProviderUnavailable {
+		t.Fatalf("error = %#v", err)
+	}
+	if record.ID != testRequestID || sink.Committed() || len(sink.events) != 0 {
+		t.Fatalf("record=%+v committed=%v events=%+v", record, sink.Committed(), sink.events)
+	}
+	if store.lastFinalize.Status != "failed" || store.lastFinalize.ErrorCategory == nil || *store.lastFinalize.ErrorCategory != provider.ProviderUnavailable {
+		t.Fatalf("finalize = %+v", store.lastFinalize)
+	}
+	if store.lastFinalize.FirstChunkAt != nil || store.lastFinalize.TotalTokens != nil {
+		t.Fatalf("stream failure should not persist timing/usage: %+v", store.lastFinalize)
+	}
+}
+
+func TestStreamChatInterruptionAfterCommitFinalizesFailedWithoutUsage(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	stream := &fakeChatStream{
+		events: []provider.StreamEvent{{Data: []byte(`{"id":"chunk_1"}`)}},
+		errs:   []error{&provider.Error{Category: provider.StreamInterrupted, Message: "raw upstream body"}},
+		usage:  &provider.Usage{PromptTokens: 7, CompletionTokens: 3, TotalTokens: 10},
+	}
+	client := &fakeProviderClient{streamResult: provider.StreamResult{Stream: stream, UpstreamStatus: http.StatusOK}}
+	service := newTestService(t, store, client)
+	sink := &recordingStreamSink{}
+
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	_, err = service.StreamChat(context.Background(), auth, "", provider.ChatRequest{
+		Model:    "openai/gpt-test",
+		Messages: []provider.Message{{Role: "user", Content: "secret prompt"}},
+		Stream:   true,
+	}, sink)
+	var gatewayErr *GatewayError
+	if !errors.As(err, &gatewayErr) || gatewayErr.Category != provider.StreamInterrupted {
+		t.Fatalf("error = %#v", err)
+	}
+	if !sink.Committed() || len(sink.events) != 1 {
+		t.Fatalf("committed=%v events=%+v", sink.Committed(), sink.events)
+	}
+	if store.lastFinalize.Status != "failed" || store.lastFinalize.ErrorCategory == nil || *store.lastFinalize.ErrorCategory != provider.StreamInterrupted {
+		t.Fatalf("finalize = %+v", store.lastFinalize)
+	}
+	if store.lastFinalize.TotalTokens != nil {
+		t.Fatalf("interrupted stream persisted usage: %+v", store.lastFinalize)
+	}
+}
+
+func TestStreamChatDoesNotReadAheadWhenSinkBlocks(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	nextCalls := make(chan int, 3)
+	stream := &fakeChatStream{
+		events: []provider.StreamEvent{
+			{Data: []byte(`{"id":"chunk_1"}`)},
+			{Data: []byte(`{"id":"chunk_2"}`)},
+			{Data: []byte("[DONE]"), Done: true},
+		},
+		onNext: func(call int) {
+			nextCalls <- call
+		},
+	}
+	client := &fakeProviderClient{streamResult: provider.StreamResult{Stream: stream, UpstreamStatus: http.StatusOK}}
+	service := newTestService(t, store, client)
+	sink := &blockingStreamSink{started: make(chan struct{}), release: make(chan struct{})}
+
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.StreamChat(context.Background(), auth, "", provider.ChatRequest{
+			Model:    "openai/gpt-test",
+			Messages: []provider.Message{{Role: "user", Content: "hello"}},
+			Stream:   true,
+		}, sink)
+		done <- err
+	}()
+
+	if call := <-nextCalls; call != 1 {
+		t.Fatalf("first next call = %d", call)
+	}
+	<-sink.started
+	select {
+	case call := <-nextCalls:
+		t.Fatalf("stream read ahead while sink was blocked; next call = %d", call)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(sink.release)
+	if err := <-done; err != nil {
+		t.Fatalf("stream chat: %v", err)
+	}
+}
+
+func TestStreamChatCancellationClosesUpstreamStreamAndFinalizes(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	stream := &contextStream{}
+	client := &fakeProviderClient{
+		streamFactory: func(ctx context.Context) (provider.StreamResult, error) {
+			stream.ctx = ctx
+			return provider.StreamResult{Stream: stream, UpstreamStatus: http.StatusOK}, nil
+		},
+	}
+	service := newTestService(t, store, client)
+	sink := &recordingStreamSink{}
+
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.StreamChat(ctx, auth, "", provider.ChatRequest{
+			Model:    "openai/gpt-test",
+			Messages: []provider.Message{{Role: "user", Content: "hello"}},
+			Stream:   true,
+		}, sink)
+		done <- err
+	}()
+	cancel()
+
+	err = <-done
+	var gatewayErr *GatewayError
+	if !errors.As(err, &gatewayErr) || gatewayErr.Category != provider.StreamInterrupted {
+		t.Fatalf("error = %#v", err)
+	}
+	if !stream.closed {
+		t.Fatal("stream was not closed")
+	}
+	if store.finalizeCalls != 1 || store.finalizeCtxErr != nil || !store.finalizeHadDeadline {
+		t.Fatalf("finalize calls=%d ctx err=%v deadline=%v", store.finalizeCalls, store.finalizeCtxErr, store.finalizeHadDeadline)
+	}
+}
+
 func TestHandlerRejectsUnknownFieldBeforeUpstream(t *testing.T) {
 	store, rawKey := newAuthorizedStore(t)
 	client := &fakeProviderClient{}
@@ -350,7 +565,7 @@ func TestHandlerRejectsUnknownFieldBeforeUpstream(t *testing.T) {
 
 func TestHandlerPassesStreamToServiceAndRejectsBeforeUpstream(t *testing.T) {
 	store, rawKey := newAuthorizedStore(t)
-	client := &fakeProviderClient{}
+	client := &completeOnlyClient{}
 	service := newTestService(t, store, client)
 	handler := NewHandler(service)
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{
@@ -372,6 +587,82 @@ func TestHandlerPassesStreamToServiceAndRejectsBeforeUpstream(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), `"code":"unsupported_feature"`) || !strings.Contains(response.Body.String(), `"type":"unsupported_feature"`) {
 		t.Fatalf("body = %s", response.Body.String())
+	}
+}
+
+func TestHandlerStreamsSSEHeadersFramingAndDone(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	client := &fakeProviderClient{streamResult: provider.StreamResult{
+		Stream: &fakeChatStream{events: []provider.StreamEvent{
+			{Data: []byte(`{"id":"chunk_1","choices":[{"delta":{"content":"hello"}}]}`)},
+			{Event: "done", Data: []byte("[DONE]"), Done: true},
+		}},
+		UpstreamStatus: http.StatusOK,
+	}}
+	service := newTestService(t, store, client)
+	handler := NewHandler(service)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{
+		"model":"openai/gpt-test",
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response := httptest.NewRecorder()
+
+	handler.chatCompletions(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+	if got := response.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if got := response.Header().Get("Cache-Control"); got != "no-cache, no-store" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	if got := response.Header().Get("X-Gateway-Request-ID"); got != testRequestID {
+		t.Fatalf("request header = %q", got)
+	}
+	body := response.Body.String()
+	for _, want := range []string{`data: {"id":"chunk_1"`, "\n\nevent: done\ndata: [DONE]\n\n"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("body missing %q: %s", want, body)
+		}
+	}
+}
+
+func TestHandlerDoesNotWriteJSONErrorAfterCommittedStreamFailure(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	client := &fakeProviderClient{streamResult: provider.StreamResult{
+		Stream: &fakeChatStream{
+			events: []provider.StreamEvent{{Data: []byte(`{"id":"chunk_1"}`)}},
+			errs:   []error{&provider.Error{Category: provider.StreamInterrupted, Message: "raw provider failure"}},
+		},
+		UpstreamStatus: http.StatusOK,
+	}}
+	service := newTestService(t, store, client)
+	handler := NewHandler(service)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{
+		"model":"openai/gpt-test",
+		"messages":[{"role":"user","content":"secret prompt"}],
+		"stream":true
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response := httptest.NewRecorder()
+
+	handler.chatCompletions(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `data: {"id":"chunk_1"}`) {
+		t.Fatalf("body missing first chunk: %s", body)
+	}
+	if strings.Contains(body, `"error"`) || strings.Contains(body, "secret prompt") || strings.Contains(body, "raw provider failure") {
+		t.Fatalf("post-commit failure leaked JSON/raw content: %s", body)
 	}
 }
 
@@ -734,10 +1025,14 @@ func (s *fakeStore) FinalizeGatewayRequest(ctx context.Context, params FinalizeP
 
 type fakeProviderClient struct {
 	calls              int
+	streamCalls        int
 	lastChat           provider.ChatRequest
 	lastCredential     provider.Credential
 	result             provider.Result
 	err                error
+	streamResult       provider.StreamResult
+	streamErr          error
+	streamFactory      func(context.Context) (provider.StreamResult, error)
 	observeContext     func(context.Context)
 	sawCanceledContext bool
 }
@@ -752,4 +1047,126 @@ func (c *fakeProviderClient) CompleteChat(ctx context.Context, chat provider.Cha
 		c.sawCanceledContext = ctx.Err() != nil
 	}
 	return c.result, c.err
+}
+
+func (c *fakeProviderClient) StreamChat(ctx context.Context, chat provider.ChatRequest, credential provider.Credential) (provider.StreamResult, error) {
+	c.streamCalls++
+	c.lastChat = chat
+	c.lastCredential = credential
+	c.lastCredential.APIKey = append([]byte(nil), credential.APIKey...)
+	if c.streamFactory != nil {
+		return c.streamFactory(ctx)
+	}
+	return c.streamResult, c.streamErr
+}
+
+type completeOnlyClient struct {
+	calls int
+}
+
+func (c *completeOnlyClient) CompleteChat(context.Context, provider.ChatRequest, provider.Credential) (provider.Result, error) {
+	c.calls++
+	return provider.Result{}, nil
+}
+
+type fakeChatStream struct {
+	events []provider.StreamEvent
+	errs   []error
+	usage  *provider.Usage
+	onNext func(int)
+	nexts  int
+	closed bool
+}
+
+func (s *fakeChatStream) Next() (provider.StreamEvent, error) {
+	s.nexts++
+	if s.onNext != nil {
+		s.onNext(s.nexts)
+	}
+	if s.nexts <= len(s.events) {
+		return s.events[s.nexts-1], nil
+	}
+	errIndex := s.nexts - len(s.events) - 1
+	if errIndex >= 0 && errIndex < len(s.errs) {
+		return provider.StreamEvent{}, s.errs[errIndex]
+	}
+	return provider.StreamEvent{}, io.EOF
+}
+
+func (s *fakeChatStream) Close() error {
+	s.closed = true
+	return nil
+}
+
+func (s *fakeChatStream) Usage() *provider.Usage {
+	return s.usage
+}
+
+type contextStream struct {
+	ctx    context.Context
+	closed bool
+}
+
+func (s *contextStream) Next() (provider.StreamEvent, error) {
+	<-s.ctx.Done()
+	return provider.StreamEvent{}, s.ctx.Err()
+}
+
+func (s *contextStream) Close() error {
+	s.closed = true
+	return nil
+}
+
+func (s *contextStream) Usage() *provider.Usage {
+	return nil
+}
+
+type recordingStreamSink struct {
+	prepared  bool
+	committed bool
+	events    []provider.StreamEvent
+	err       error
+}
+
+func (s *recordingStreamSink) Prepare(GatewayRequest) error {
+	s.prepared = true
+	return nil
+}
+
+func (s *recordingStreamSink) WriteEvent(event provider.StreamEvent) error {
+	s.committed = true
+	if s.err != nil {
+		return s.err
+	}
+	s.events = append(s.events, event)
+	return nil
+}
+
+func (s *recordingStreamSink) Committed() bool {
+	return s.committed
+}
+
+type blockingStreamSink struct {
+	started   chan struct{}
+	release   chan struct{}
+	committed bool
+	signaled  bool
+}
+
+func (s *blockingStreamSink) Prepare(GatewayRequest) error {
+	return nil
+}
+
+func (s *blockingStreamSink) WriteEvent(provider.StreamEvent) error {
+	s.committed = true
+	if !s.signaled {
+		s.signaled = true
+		close(s.started)
+		<-s.release
+	}
+	return nil
+}
+
+func (s *blockingStreamSink) Committed() bool {
+	return s.committed
 }

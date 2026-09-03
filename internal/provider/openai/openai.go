@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
+	"github.com/lllmml/production-go-llm-gateway/internal/provider/sse"
 )
 
 const (
@@ -21,6 +23,7 @@ const (
 	chatCompletionsPath  = "/v1/chat/completions"
 	maxErrorBodyBytes    = 8 << 10
 	maxResponseBodyBytes = 8 << 20
+	maxStreamEventBytes  = 1 << 20
 )
 
 type Client struct {
@@ -54,30 +57,9 @@ func NewTransport() *http.Transport {
 }
 
 func (c *Client) CompleteChat(ctx context.Context, chat provider.ChatRequest, credential provider.Credential) (provider.Result, error) {
-	baseURL := c.baseURL
-	if credential.BaseURLOverride != "" {
-		baseURL = credential.BaseURLOverride
-	}
-	endpoint, err := chatEndpoint(baseURL)
+	encoded, endpoint, err := c.buildRequest(chat, credential, false)
 	if err != nil {
-		return provider.Result{}, &provider.Error{Category: provider.ProviderNotConfigured, Err: err}
-	}
-
-	model := chat.Model
-	if parsed, err := provider.ParseModel(chat.Model); err == nil && parsed.Provider == provider.OpenAI {
-		model = parsed.Model
-	}
-	body := requestBody{
-		Model:    model,
-		Messages: make([]message, 0, len(chat.Messages)),
-		Stream:   false,
-	}
-	for _, current := range chat.Messages {
-		body.Messages = append(body.Messages, message{Role: current.Role, Content: current.Content})
-	}
-	encoded, err := json.Marshal(body)
-	if err != nil {
-		return provider.Result{}, &provider.Error{Category: provider.InvalidRequest, Err: err}
+		return provider.Result{}, err
 	}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(encoded))
@@ -94,10 +76,7 @@ func (c *Client) CompleteChat(ctx context.Context, chat provider.ChatRequest, cr
 	}
 	defer response.Body.Close()
 
-	upstreamRequestID := response.Header.Get("X-Request-ID")
-	if upstreamRequestID == "" {
-		upstreamRequestID = response.Header.Get("OpenAI-Request-ID")
-	}
+	upstreamRequestID := upstreamRequestID(response)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return provider.Result{
 			UpstreamStatus:    response.StatusCode,
@@ -169,11 +148,7 @@ func (c *Client) CompleteChat(ctx context.Context, chat provider.ChatRequest, cr
 	}
 	var usage *provider.Usage
 	if decoded.Usage != nil {
-		usage = &provider.Usage{
-			PromptTokens:     decoded.Usage.PromptTokens,
-			CompletionTokens: decoded.Usage.CompletionTokens,
-			TotalTokens:      decoded.Usage.TotalTokens,
-		}
+		usage = usageFromResponse(decoded.Usage)
 		result.Usage = usage
 	}
 	return provider.Result{
@@ -182,6 +157,90 @@ func (c *Client) CompleteChat(ctx context.Context, chat provider.ChatRequest, cr
 		UpstreamStatus:    response.StatusCode,
 		UpstreamRequestID: upstreamRequestID,
 	}, nil
+}
+
+func (c *Client) StreamChat(ctx context.Context, chat provider.ChatRequest, credential provider.Credential) (provider.StreamResult, error) {
+	encoded, endpoint, err := c.buildRequest(chat, credential, true)
+	if err != nil {
+		return provider.StreamResult{}, err
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(encoded))
+	if err != nil {
+		return provider.StreamResult{}, &provider.Error{Category: provider.InternalError, Err: err}
+	}
+	request.Header.Set("Authorization", "Bearer "+string(credential.APIKey))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "text/event-stream")
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return provider.StreamResult{}, classifyTransportError(err)
+	}
+
+	upstreamRequestID := upstreamRequestID(response)
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		defer response.Body.Close()
+		return provider.StreamResult{
+			UpstreamStatus:    response.StatusCode,
+			UpstreamRequestID: upstreamRequestID,
+		}, classifyResponseError(response, upstreamRequestID)
+	}
+	if !isSSEContentType(response.Header.Get("Content-Type")) {
+		defer response.Body.Close()
+		return provider.StreamResult{
+				UpstreamStatus:    response.StatusCode,
+				UpstreamRequestID: upstreamRequestID,
+			}, &provider.Error{
+				Category:          provider.ProviderUnavailable,
+				StatusCode:        response.StatusCode,
+				UpstreamRequestID: upstreamRequestID,
+				Message:           "provider stream response content type is invalid",
+			}
+	}
+
+	return provider.StreamResult{
+		Stream: &chatStream{
+			body:              response.Body,
+			decoder:           sse.NewDecoder(response.Body, maxStreamEventBytes),
+			upstreamStatus:    response.StatusCode,
+			upstreamRequestID: upstreamRequestID,
+		},
+		UpstreamStatus:    response.StatusCode,
+		UpstreamRequestID: upstreamRequestID,
+	}, nil
+}
+
+func (c *Client) buildRequest(chat provider.ChatRequest, credential provider.Credential, stream bool) ([]byte, string, error) {
+	baseURL := c.baseURL
+	if credential.BaseURLOverride != "" {
+		baseURL = credential.BaseURLOverride
+	}
+	endpoint, err := chatEndpoint(baseURL)
+	if err != nil {
+		return nil, "", &provider.Error{Category: provider.ProviderNotConfigured, Err: err}
+	}
+
+	model := chat.Model
+	if parsed, err := provider.ParseModel(chat.Model); err == nil && parsed.Provider == provider.OpenAI {
+		model = parsed.Model
+	}
+	body := requestBody{
+		Model:    model,
+		Messages: make([]message, 0, len(chat.Messages)),
+		Stream:   stream,
+	}
+	if stream {
+		body.StreamOptions = &streamOptions{IncludeUsage: true}
+	}
+	for _, current := range chat.Messages {
+		body.Messages = append(body.Messages, message{Role: current.Role, Content: current.Content})
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return nil, "", &provider.Error{Category: provider.InvalidRequest, Err: err}
+	}
+	return encoded, endpoint, nil
 }
 
 func chatEndpoint(baseURL string) (string, error) {
@@ -204,6 +263,19 @@ func classifyTransportError(err error) error {
 		return &provider.Error{Category: provider.ProviderTimeout, Err: err}
 	}
 	return &provider.Error{Category: provider.ProviderUnavailable, Err: err}
+}
+
+func upstreamRequestID(response *http.Response) string {
+	id := response.Header.Get("X-Request-ID")
+	if id == "" {
+		id = response.Header.Get("OpenAI-Request-ID")
+	}
+	return id
+}
+
+func isSSEContentType(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	return err == nil && mediaType == "text/event-stream"
 }
 
 func classifyResponseError(response *http.Response, upstreamRequestID string) error {
@@ -271,10 +343,134 @@ func validateResponse(decoded responseBody) error {
 	return nil
 }
 
+func validateUsage(usage *responseUsage) error {
+	if usage == nil {
+		return nil
+	}
+	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.TotalTokens < 0 {
+		return errors.New("provider response usage values must be nonnegative")
+	}
+	if usage.TotalTokens < usage.PromptTokens+usage.CompletionTokens {
+		return errors.New("provider response usage totals are inconsistent")
+	}
+	return nil
+}
+
+func usageFromResponse(usage *responseUsage) *provider.Usage {
+	if usage == nil {
+		return nil
+	}
+	return &provider.Usage{
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		TotalTokens:      usage.TotalTokens,
+	}
+}
+
+type chatStream struct {
+	body              io.ReadCloser
+	decoder           *sse.Decoder
+	upstreamStatus    int
+	upstreamRequestID string
+	usage             *provider.Usage
+	done              bool
+}
+
+func (s *chatStream) Next() (provider.StreamEvent, error) {
+	if s.done {
+		return provider.StreamEvent{}, io.EOF
+	}
+	for {
+		event, err := s.decoder.Next()
+		if err != nil {
+			category := provider.StreamInterrupted
+			if errors.Is(err, sse.ErrEventTooLarge) {
+				category = provider.ProviderUnavailable
+			}
+			return provider.StreamEvent{}, &provider.Error{
+				Category:          category,
+				StatusCode:        s.upstreamStatus,
+				UpstreamRequestID: s.upstreamRequestID,
+				Err:               err,
+			}
+		}
+		data := bytes.TrimSpace(event.Data)
+		if bytes.Equal(data, []byte("[DONE]")) {
+			s.done = true
+			return provider.StreamEvent{Event: event.Name, Data: []byte("[DONE]"), Done: true}, nil
+		}
+		var decoded streamChunk
+		decoder := json.NewDecoder(bytes.NewReader(event.Data))
+		if err := decoder.Decode(&decoded); err != nil {
+			return provider.StreamEvent{}, &provider.Error{
+				Category:          provider.StreamInterrupted,
+				StatusCode:        s.upstreamStatus,
+				UpstreamRequestID: s.upstreamRequestID,
+				Err:               fmt.Errorf("decode provider stream event: %w", err),
+			}
+		}
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			return provider.StreamEvent{}, &provider.Error{
+				Category:          provider.StreamInterrupted,
+				StatusCode:        s.upstreamStatus,
+				UpstreamRequestID: s.upstreamRequestID,
+				Err:               fmt.Errorf("provider stream event contained multiple JSON values: %w", err),
+			}
+		}
+		if err := validateStreamChunk(decoded); err != nil {
+			return provider.StreamEvent{}, &provider.Error{
+				Category:          provider.StreamInterrupted,
+				StatusCode:        s.upstreamStatus,
+				UpstreamRequestID: s.upstreamRequestID,
+				Err:               err,
+			}
+		}
+		if decoded.Usage != nil {
+			s.usage = usageFromResponse(decoded.Usage)
+		}
+		return provider.StreamEvent{Event: event.Name, Data: append([]byte(nil), event.Data...)}, nil
+	}
+}
+
+func (s *chatStream) Close() error {
+	return s.body.Close()
+}
+
+func (s *chatStream) Usage() *provider.Usage {
+	if s.usage == nil {
+		return nil
+	}
+	copied := *s.usage
+	return &copied
+}
+
+func validateStreamChunk(decoded streamChunk) error {
+	if err := validateUsage(decoded.Usage); err != nil {
+		return err
+	}
+	if strings.TrimSpace(decoded.ID) == "" || strings.TrimSpace(decoded.Object) == "" || strings.TrimSpace(decoded.Model) == "" {
+		return errors.New("provider stream event missing required fields")
+	}
+	if len(decoded.Choices) == 0 && decoded.Usage == nil {
+		return errors.New("provider stream event missing choices")
+	}
+	for _, choice := range decoded.Choices {
+		if choice.Delta != nil && strings.TrimSpace(choice.Delta.Role) == "" && choice.Delta.Content == nil && choice.FinishReason == nil {
+			return errors.New("provider stream event delta is empty")
+		}
+	}
+	return nil
+}
+
 type requestBody struct {
-	Model    string    `json:"model"`
-	Messages []message `json:"messages"`
-	Stream   bool      `json:"stream"`
+	Model         string         `json:"model"`
+	Messages      []message      `json:"messages"`
+	Stream        bool           `json:"stream"`
+	StreamOptions *streamOptions `json:"stream_options,omitempty"`
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type message struct {
@@ -306,6 +502,26 @@ type responseUsage struct {
 	PromptTokens     int64 `json:"prompt_tokens"`
 	CompletionTokens int64 `json:"completion_tokens"`
 	TotalTokens      int64 `json:"total_tokens"`
+}
+
+type streamChunk struct {
+	ID      string         `json:"id"`
+	Object  string         `json:"object"`
+	Created int64          `json:"created"`
+	Model   string         `json:"model"`
+	Choices []streamChoice `json:"choices"`
+	Usage   *responseUsage `json:"usage"`
+}
+
+type streamChoice struct {
+	Index        int          `json:"index"`
+	Delta        *streamDelta `json:"delta"`
+	FinishReason *string      `json:"finish_reason"`
+}
+
+type streamDelta struct {
+	Role    string  `json:"role"`
+	Content *string `json:"content"`
 }
 
 type errorBody struct {

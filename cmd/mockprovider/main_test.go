@@ -64,6 +64,132 @@ func TestChatCompletionsCanReturnMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestStreamChatCompletionsReturnsSSEChunksUsageAndDone(t *testing.T) {
+	handler := newHandler(config{status: http.StatusOK, streamChunks: 2, streamUsage: true})
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"stream":true}`))
+	response := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d", response.Code)
+	}
+	if got := response.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if got := response.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	if got := response.Header().Get("X-Request-ID"); got != "req_mock_123" {
+		t.Fatalf("X-Request-ID = %q", got)
+	}
+	body := response.Body.String()
+	for _, want := range []string{`data: {`, `"object":"chat.completion.chunk"`, `"content":"mock chunk 1"`, `"content":"mock chunk 2"`, `"total_tokens":10`, "data: [DONE]\n\n"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("body missing %q: %s", want, body)
+		}
+	}
+	if first := strings.Index(body, `"content":"mock chunk 1"`); first < 0 {
+		t.Fatalf("first chunk missing: %s", body)
+	} else if second := strings.Index(body, `"content":"mock chunk 2"`); second < first {
+		t.Fatalf("chunks out of order: %s", body)
+	}
+	if response.flushes < 4 {
+		t.Fatalf("flushes = %d, want at least 4", response.flushes)
+	}
+}
+
+func TestStreamChatCompletionsUsesJSONForConfiguredProviderError(t *testing.T) {
+	handler := newHandler(config{status: http.StatusTooManyRequests, streamUsage: true})
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"stream":true}`))
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d", response.Code)
+	}
+	if got := response.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if body := response.Body.String(); strings.Contains(body, "data:") || !strings.Contains(body, `"mock provider error"`) {
+		t.Fatalf("body = %s", body)
+	}
+}
+
+func TestStreamChatCompletionsCanReturnMalformedSSE(t *testing.T) {
+	handler := newHandler(config{status: http.StatusOK, streamMalformed: true})
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"stream":true}`))
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d", response.Code)
+	}
+	if body := response.Body.String(); body != "data: {\"id\":\n\n" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestStreamChatCompletionsCanReturnOversizedSSEEvent(t *testing.T) {
+	handler := newHandler(config{status: http.StatusOK, streamOversized: true})
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"stream":true}`))
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	body := response.Body.String()
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d", response.Code)
+	}
+	if !strings.HasPrefix(body, "data: ") {
+		t.Fatalf("body prefix = %.16q", body)
+	}
+	if len(body) <= maxRequestBodyBytes {
+		t.Fatalf("body length = %d, want > %d", len(body), maxRequestBodyBytes)
+	}
+	if strings.Contains(body, "[DONE]") {
+		t.Fatalf("oversized stream should stop before DONE: %s", body[len(body)-32:])
+	}
+}
+
+func TestStreamChatCompletionsCanTerminateBeforeDone(t *testing.T) {
+	handler := newHandler(config{status: http.StatusOK, streamChunks: 2, streamAbrupt: true})
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"stream":true}`))
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	body := response.Body.String()
+	if !strings.Contains(body, `"content":"mock chunk 1"`) || !strings.Contains(body, `"content":"mock chunk 2"`) {
+		t.Fatalf("body = %s", body)
+	}
+	if strings.Contains(body, "[DONE]") {
+		t.Fatalf("abrupt stream should not include DONE: %s", body)
+	}
+}
+
+func TestStreamFirstTokenDelayRespectsRequestCancellation(t *testing.T) {
+	handler := newHandler(config{status: http.StatusOK, streamFirstTokenDelay: time.Minute})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodPost, chatCompletionsPath, strings.NewReader(`{"stream":true}`)).WithContext(ctx)
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d", response.Code)
+	}
+	if got := response.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if body := response.Body.String(); body != "" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
 func TestRejectsUnsupportedMethodAndRoute(t *testing.T) {
 	handler := newHandler(config{status: http.StatusOK})
 
@@ -110,4 +236,14 @@ func TestHeaderDelayRespectsRequestCancellation(t *testing.T) {
 	if body := response.Body.String(); body != "" {
 		t.Fatalf("body = %q", body)
 	}
+}
+
+type flushRecorder struct {
+	*httptest.ResponseRecorder
+	flushes int
+}
+
+func (r *flushRecorder) Flush() {
+	r.flushes++
+	r.ResponseRecorder.Flush()
 }

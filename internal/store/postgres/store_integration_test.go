@@ -1227,11 +1227,15 @@ func TestDataPlaneStoreAdapterCreatesAndFinalizesGatewayRequest(t *testing.T) {
 	upstreamStatus := int32(http.StatusOK)
 	usageSource := "provider"
 	upstreamRequestID := "req_integration"
+	firstChunkAt := startedAt.Add(25 * time.Millisecond)
+	ttftMS := int64(25)
 	if err := store.FinalizeGatewayRequest(ctx, dataplane.FinalizeParams{
 		ID:                 record.ID,
 		Status:             "succeeded",
+		FirstChunkAt:       &firstChunkAt,
 		CompletedAt:        time.Now().UTC(),
 		LatencyMS:          ptrInt64(42),
+		TTFTMS:             &ttftMS,
 		UpstreamHTTPStatus: &upstreamStatus,
 		RetryCount:         0,
 		PromptTokens:       &promptTokens,
@@ -1251,6 +1255,9 @@ func TestDataPlaneStoreAdapterCreatesAndFinalizesGatewayRequest(t *testing.T) {
 		t.Fatalf("get gateway request: %v", err)
 	}
 	if persisted.Status != "succeeded" || persisted.TotalTokens.Int64 != 10 || persisted.UpstreamRequestID.String != "req_integration" {
+		t.Fatalf("persisted request = %+v", persisted)
+	}
+	if !persisted.FirstChunkAt.Valid || persisted.TtftMs.Int64 != 25 {
 		t.Fatalf("persisted request = %+v", persisted)
 	}
 

@@ -119,10 +119,10 @@ func (s *Store) FinalizeGatewayRequest(ctx context.Context, params dataplane.Fin
 	_, err = s.queries.FinalizeGatewayRequest(ctx, FinalizeGatewayRequestParams{
 		ID:                   id,
 		Status:               params.Status,
-		FirstChunkAt:         pgtype.Timestamptz{},
+		FirstChunkAt:         optionalTimestamptz(params.FirstChunkAt),
 		CompletedAt:          timestamptz(params.CompletedAt),
 		LatencyMs:            optionalInt8(params.LatencyMS),
-		TtftMs:               pgtype.Int8{},
+		TtftMs:               optionalInt8(params.TTFTMS),
 		UpstreamHttpStatus:   optionalInt4(params.UpstreamHTTPStatus),
 		ErrorCategory:        optionalErrorCategory(params.ErrorCategory),
 		RetryCount:           params.RetryCount,
@@ -168,6 +168,13 @@ func optionalInt4(value *int32) pgtype.Int4 {
 		return pgtype.Int4{}
 	}
 	return pgtype.Int4{Int32: *value, Valid: true}
+}
+
+func optionalTimestamptz(value *time.Time) pgtype.Timestamptz {
+	if value == nil {
+		return pgtype.Timestamptz{}
+	}
+	return timestamptz(*value)
 }
 
 func optionalString(value *string) pgtype.Text {

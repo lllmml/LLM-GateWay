@@ -87,6 +87,28 @@ type Client interface {
 	CompleteChat(context.Context, ChatRequest, Credential) (Result, error)
 }
 
+type StreamResult struct {
+	Stream            ChatStream
+	UpstreamStatus    int
+	UpstreamRequestID string
+}
+
+type StreamEvent struct {
+	Event string
+	Data  []byte
+	Done  bool
+}
+
+type ChatStream interface {
+	Next() (StreamEvent, error)
+	Close() error
+	Usage() *Usage
+}
+
+type StreamingClient interface {
+	StreamChat(context.Context, ChatRequest, Credential) (StreamResult, error)
+}
+
 // Registry manages configured provider clients.
 type Registry struct {
 	clients map[Name]Client

@@ -4,10 +4,10 @@ Update this after major decisions, completed phases, or bugs that future agents 
 
 ## Current State
 
-- Current task: Week 3 OpenAI non-streaming Data Plane foundation is implemented and verified with virtual-key auth, explicit provider credential selection, durable request create/finalize, a direct adapter, and a deterministic mock provider.
-- Current phase: Week 3 First Provider, Non-Streaming is complete.
+- Current task: Week 4 Streaming Core foundation is implemented and under final verification with OpenAI SSE parsing, synchronous Data Plane streaming, TTFT persistence, and deterministic mock streaming cases.
+- Current phase: Week 4 Streaming Core implementation complete; ready for final verification/commit.
 - Week 3 PR2 review fix: provider registry now supports dynamic provider namespaces, X-Request-ID/UUID trace propagation is preserved, and the stream flag reaches the service while SSE handling remains deferred to Week 4.
-- Next step: Propose the bounded Week 4 Streaming Core plan before changing SSE, flushing, cancellation, or downstream response-commit behavior.
+- Next step: Run the full Makefile verification gate, then plan the next milestone after streaming evidence is reviewed.
 - Blocked by: None. Real-provider smoke tests remain opt-in and require explicit cost-bearing approval.
 
 ## Decisions
@@ -37,6 +37,7 @@ Update this after major decisions, completed phases, or bugs that future agents 
 - 2026-09-01: The OpenAI adapter owns wire translation, upstream authentication, bounded response decoding, usage extraction, request-ID extraction, and error classification. The Data Plane service owns deadlines, lifecycle ordering, stable client errors, and the Week 3 no-retry policy.
 - 2026-09-01: One long-lived explicit `http.Transport` is reused by the OpenAI client; the deterministic mock provider supplies non-stream success, error, delay, and malformed-response tests without real provider calls.
 - 2026-09-01: Provider lookup is registry-backed and no longer limited by a hardcoded `ParseModel` namespace whitelist; unknown provider namespaces can parse and then fail later through explicit registry lookup/configuration.
+- 2026-09-03: Week 4 streaming uses a bounded SSE decoder and OpenAI adapter-owned stream validation. The Data Plane owns the synchronous `Next -> write -> flush` loop, records TTFT after the first non-DONE event flush, treats `[DONE]` as the only success marker, and finalizes interrupted streams as `failed/stream_interrupted` with nullable usage.
 
 ## AI / Tooling Decisions
 
@@ -59,5 +60,6 @@ Update this after major decisions, completed phases, or bugs that future agents 
 - [x] Minimal React/Vite control-plane shell
 - [x] Core data model
 - [x] Auth
+- [x] OpenAI streaming core
 - [ ] Core MVP flow
 - [ ] Launch checks

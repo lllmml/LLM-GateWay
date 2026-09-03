@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -55,6 +56,14 @@ func (h *Handler) chatCompletions(response http.ResponseWriter, request *http.Re
 	traceID, err := requestTraceID(request)
 	if err != nil {
 		writeError(response, http.StatusInternalServerError, provider.InternalError, "internal_error", "request could not be completed")
+		return
+	}
+	if chat.Stream {
+		sink := newHTTPStreamSink(response)
+		record, err := h.service.StreamChat(request.Context(), auth, traceID, chat, sink)
+		if err != nil && !sink.Committed() {
+			writeGatewayError(response, record, err)
+		}
 		return
 	}
 	result, record, err := h.service.CompleteChat(request.Context(), auth, traceID, chat)
@@ -175,6 +184,8 @@ func writeGatewayError(response http.ResponseWriter, record GatewayRequest, err 
 		status = http.StatusBadGateway
 	case provider.ProviderInvalidReq:
 		status = http.StatusBadRequest
+	case provider.StreamInterrupted:
+		status = http.StatusBadGateway
 	case provider.UsagePersistenceFail:
 		status = http.StatusInternalServerError
 	}
@@ -221,4 +232,74 @@ func writeJSON(response http.ResponseWriter, status int, value any) {
 	response.Header().Set("Cache-Control", "no-store")
 	response.WriteHeader(status)
 	_ = json.NewEncoder(response).Encode(value)
+}
+
+type httpStreamSink struct {
+	response   http.ResponseWriter
+	controller *http.ResponseController
+	committed  bool
+}
+
+func newHTTPStreamSink(response http.ResponseWriter) *httpStreamSink {
+	return &httpStreamSink{
+		response:   response,
+		controller: http.NewResponseController(response),
+	}
+}
+
+func (s *httpStreamSink) Prepare(record GatewayRequest) error {
+	header := s.response.Header()
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-cache, no-store")
+	header.Set("X-Gateway-Request-ID", record.ID)
+	header.Set("X-Gateway-Provider", string(record.Provider))
+	header.Set("X-Gateway-Retry-Count", "0")
+	return nil
+}
+
+func (s *httpStreamSink) WriteEvent(event provider.StreamEvent) error {
+	if !s.committed {
+		s.response.WriteHeader(http.StatusOK)
+		s.committed = true
+	}
+	if name := cleanSSEEventName(event.Event); name != "" {
+		if _, err := fmt.Fprintf(s.response, "event: %s\n", name); err != nil {
+			return err
+		}
+	}
+	if err := writeSSEData(s.response, event.Data); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(s.response, "\n"); err != nil {
+		return err
+	}
+	return s.controller.Flush()
+}
+
+func (s *httpStreamSink) Committed() bool {
+	return s.committed
+}
+
+func cleanSSEEventName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || name == "message" || strings.ContainsAny(name, "\r\n") {
+		return ""
+	}
+	return name
+}
+
+func writeSSEData(writer io.Writer, data []byte) error {
+	lines := bytes.Split(data, []byte{'\n'})
+	for _, line := range lines {
+		if _, err := io.WriteString(writer, "data: "); err != nil {
+			return err
+		}
+		if _, err := writer.Write(line); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(writer, "\n"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
