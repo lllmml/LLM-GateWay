@@ -64,8 +64,8 @@ For each valid upstream-bound request:
 3. create `gateway_requests(status = 'in_progress')`;
 4. only after creation succeeds, decrypt the credential and call the provider;
 5. decode and validate the bounded provider response or stream events;
-6. finalize the same durable row before returning a successful response, or at
-   stream completion for `stream:true`.
+6. finalize the same durable row before returning a successful non-streaming
+   response, or after the terminal `[DONE]` event is forwarded for `stream:true`.
 
 Finalization uses a separate bounded context so downstream cancellation does not
 erase lifecycle evidence. If finalization fails, the row remains `in_progress`,
@@ -92,6 +92,11 @@ stable JSON error envelope. After the first SSE bytes are committed, it never
 rewrites the HTTP status, retries, emits a fake provider error event, or marks
 the request successful.
 
+Because the downstream stream and PostgreSQL update cannot be committed
+atomically, a finalization failure after `[DONE]` may leave the client with a
+complete stream while the durable row remains `in_progress`. The gateway logs
+that failure with safe metadata and does not append a fabricated SSE error.
+
 ## Consequences
 
 - The supported API is intentionally smaller than OpenAI's full API.
@@ -99,7 +104,9 @@ the request successful.
   provider extensions fail explicitly until their cross-provider semantics are
   designed and tested.
 - Existing clients may need to remove unsupported options for the Week 3 slice.
-- A successful gateway response has a finalized, attributable request row.
+- A successful non-streaming response has a finalized, attributable request
+  row; streaming finalization has the post-`[DONE]` failure window documented
+  above.
 - PostgreSQL unavailability before record creation prevents upstream cost.
 - PostgreSQL failure after upstream work can leave an `in_progress` evidence row;
   a durable recovery mechanism remains a later evidence-driven enhancement.
@@ -108,7 +115,7 @@ the request successful.
 - The adapter keeps provider-specific behavior out of the central executor,
   preparing for DeepSeek and Anthropic without prematurely implementing them.
 
-## Explicit non-goals for Week 3
+## Explicit non-goals for Week 4
 
 - retries, backoff, rate limiting, Redis, circuit breaking, or fallback;
 - real-provider smoke tests or cost-bearing calls;

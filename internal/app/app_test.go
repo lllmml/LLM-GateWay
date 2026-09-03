@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -153,6 +154,70 @@ func TestRunDrainsActiveDataPlaneRequest(t *testing.T) {
 	close(releaseRequest)
 	if err := <-requestResult; err != nil {
 		t.Fatalf("active request failed: %v", err)
+	}
+	if err := <-runResult; err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}
+
+func TestRunDrainsActiveFlushedDataPlaneStream(t *testing.T) {
+	database := &fakeDatabase{}
+	options := testOptions(t)
+	streamFlushed := make(chan struct{})
+	releaseStream := make(chan struct{})
+	var streamFlushedOnce sync.Once
+	options.DataPlaneHandler = http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		response.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(response, "data: first\n\n")
+		if err := http.NewResponseController(response).Flush(); err != nil {
+			t.Errorf("flush first event: %v", err)
+			return
+		}
+		streamFlushedOnce.Do(func() { close(streamFlushed) })
+		<-releaseStream
+		_, _ = io.WriteString(response, "data: [DONE]\n\n")
+		_ = http.NewResponseController(response).Flush()
+	})
+	application := newTestApp(t, database, options)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- application.Run(ctx)
+	}()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	waitForStatus(t, client, "http://"+options.OpsAddr+"/health/live", http.StatusOK)
+
+	response, err := client.Get("http://" + options.DataPlaneAddr + "/stream")
+	if err != nil {
+		t.Fatalf("start stream: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d", response.StatusCode)
+	}
+	reader := bufio.NewReader(response.Body)
+	if event := readAppSSEEvent(t, reader); event != "data: first\n\n" {
+		t.Fatalf("first event = %q", event)
+	}
+	select {
+	case <-streamFlushed:
+	case <-time.After(time.Second):
+		t.Fatal("stream did not flush first event")
+	}
+
+	cancel()
+	select {
+	case err := <-runResult:
+		t.Fatalf("Run returned before active stream drained: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseStream)
+	if event := readAppSSEEvent(t, reader); event != "data: [DONE]\n\n" {
+		t.Fatalf("done event = %q", event)
 	}
 	if err := <-runResult; err != nil {
 		t.Fatalf("Run returned error: %v", err)
@@ -405,4 +470,19 @@ func waitForStatus(t *testing.T, client *http.Client, url string, want int) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("%s did not return status %d", url, want)
+}
+
+func readAppSSEEvent(t *testing.T, reader *bufio.Reader) string {
+	t.Helper()
+	var builder strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read SSE event: %v", err)
+		}
+		builder.WriteString(line)
+		if line == "\n" || line == "\r\n" {
+			return builder.String()
+		}
+	}
 }

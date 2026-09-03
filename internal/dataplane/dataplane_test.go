@@ -1,8 +1,10 @@
 package dataplane
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/lllmml/production-go-llm-gateway/internal/apikey"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
+	"github.com/lllmml/production-go-llm-gateway/internal/provider/openai"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
 )
 
@@ -666,6 +669,256 @@ func TestHandlerDoesNotWriteJSONErrorAfterCommittedStreamFailure(t *testing.T) {
 	}
 }
 
+func TestHandlerStreamsThroughOpenAIClientOverHTTP(t *testing.T) {
+	firstChunkFlushed := make(chan struct{})
+	releaseRest := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("upstream path = %q", request.URL.Path)
+		}
+		if got := request.Header.Get("Accept"); got != "text/event-stream" {
+			t.Fatalf("upstream Accept = %q", got)
+		}
+		var body struct {
+			Model         string `json:"model"`
+			Stream        bool   `json:"stream"`
+			StreamOptions struct {
+				IncludeUsage bool `json:"include_usage"`
+			} `json:"stream_options"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		if body.Model != "gpt-test" || !body.Stream || !body.StreamOptions.IncludeUsage {
+			t.Fatalf("upstream body = %+v", body)
+		}
+		response.Header().Set("Content-Type", "text/event-stream")
+		response.Header().Set("X-Request-ID", "req_http_stream")
+
+		_, _ = io.WriteString(response, `data: {"id":"chunk_1","object":"chat.completion.chunk","created":123,"model":"gpt-test","choices":[{"index":0,"delta":{"role":"assistant"}}]}`+"\n\n")
+		response.(http.Flusher).Flush()
+		close(firstChunkFlushed)
+
+		<-releaseRest
+		_, _ = io.WriteString(response, `data: {"id":"chunk_2","object":"chat.completion.chunk","created":123,"model":"gpt-test","choices":[{"index":0,"delta":{"content":"hello"}}]}`+"\n\n")
+		_, _ = io.WriteString(response, `data: {"id":"chunk_usage","object":"chat.completion.chunk","created":123,"model":"gpt-test","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`+"\n\n")
+		_, _ = io.WriteString(response, "data: [DONE]\n\n")
+		response.(http.Flusher).Flush()
+	}))
+	defer upstream.Close()
+
+	baseStore, rawKey := newAuthorizedStore(t)
+	baseStore.credential.BaseURLOverride = upstream.URL
+	store := newNotifyingStore(baseStore)
+	service := newServiceForStore(t, store, openai.New(upstream.Client()), nil)
+	handler := NewHandler(service)
+	mux := http.NewServeMux()
+	handler.Register(mux)
+	gateway := httptest.NewServer(mux)
+	defer gateway.Close()
+
+	request, err := http.NewRequest(http.MethodPost, gateway.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model":"openai/gpt-test",
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response, err := gateway.Client().Do(request)
+	if err != nil {
+		t.Fatalf("gateway request: %v", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status = %d; body=%s", response.StatusCode, body)
+	}
+	if got := response.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	reader := bufio.NewReader(response.Body)
+	firstEvent := readSSEEvent(t, reader)
+	if !strings.Contains(firstEvent, `data: {"id":"chunk_1"`) {
+		t.Fatalf("first event = %q", firstEvent)
+	}
+	select {
+	case <-firstChunkFlushed:
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not flush first chunk")
+	}
+
+	close(releaseRest)
+	events := firstEvent
+	for !strings.Contains(events, "data: [DONE]\n\n") {
+		events += readSSEEvent(t, reader)
+	}
+	if !strings.Contains(events, `"usage":{"prompt_tokens":7`) {
+		t.Fatalf("stream did not include usage chunk: %s", events)
+	}
+	finalize := store.waitFinalize(t)
+	if finalize.params.Status != "succeeded" || finalize.params.ErrorCategory != nil {
+		t.Fatalf("finalize = %+v", finalize.params)
+	}
+	if finalize.params.TTFTMS == nil || finalize.params.FirstChunkAt == nil {
+		t.Fatalf("missing stream timing: %+v", finalize.params)
+	}
+	if finalize.params.TotalTokens == nil || *finalize.params.TotalTokens != 10 {
+		t.Fatalf("usage not finalized: %+v", finalize.params)
+	}
+	if finalize.params.UpstreamRequestID == nil || *finalize.params.UpstreamRequestID != "req_http_stream" {
+		t.Fatalf("upstream request ID not finalized: %+v", finalize.params)
+	}
+}
+
+func TestHandlerClientDisconnectCancelsOpenAIUpstreamAndFinalizes(t *testing.T) {
+	upstreamCanceled := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		response.Header().Set("X-Request-ID", "req_cancel")
+		_, _ = io.WriteString(response, `data: {"id":"chunk_1","object":"chat.completion.chunk","created":123,"model":"gpt-test","choices":[{"index":0,"delta":{"content":"hello"}}]}`+"\n\n")
+		response.(http.Flusher).Flush()
+		<-request.Context().Done()
+		close(upstreamCanceled)
+	}))
+	defer upstream.Close()
+
+	baseStore, rawKey := newAuthorizedStore(t)
+	baseStore.credential.BaseURLOverride = upstream.URL
+	store := newNotifyingStore(baseStore)
+	service := newServiceForStore(t, store, openai.New(upstream.Client()), nil)
+	handler := NewHandler(service)
+	mux := http.NewServeMux()
+	handler.Register(mux)
+	gateway := httptest.NewServer(mux)
+	defer gateway.Close()
+
+	request, err := http.NewRequest(http.MethodPost, gateway.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model":"openai/gpt-test",
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response, err := gateway.Client().Do(request)
+	if err != nil {
+		t.Fatalf("gateway request: %v", err)
+	}
+	reader := bufio.NewReader(response.Body)
+	firstEvent := readSSEEvent(t, reader)
+	if !strings.Contains(firstEvent, `data: {"id":"chunk_1"`) {
+		t.Fatalf("first event = %q", firstEvent)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatalf("close response body: %v", err)
+	}
+
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("upstream request context was not canceled")
+	}
+	finalize := store.waitFinalize(t)
+	if finalize.params.Status != "failed" || finalize.params.ErrorCategory == nil || *finalize.params.ErrorCategory != provider.StreamInterrupted {
+		t.Fatalf("finalize = %+v", finalize.params)
+	}
+	if finalize.ctxErr != nil || !finalize.hadDeadline {
+		t.Fatalf("finalize context err=%v deadline=%v", finalize.ctxErr, finalize.hadDeadline)
+	}
+	if finalize.params.TotalTokens != nil {
+		t.Fatalf("canceled stream persisted usage: %+v", finalize.params)
+	}
+}
+
+func TestHandlerNoFlushSupportInterruptsCommittedStreamWithoutJSON(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	client := &fakeProviderClient{streamResult: provider.StreamResult{
+		Stream: &fakeChatStream{events: []provider.StreamEvent{
+			{Data: []byte(`{"id":"chunk_1"}`)},
+			{Data: []byte("[DONE]"), Done: true},
+		}},
+		UpstreamStatus: http.StatusOK,
+	}}
+	service := newTestService(t, store, client)
+	handler := NewHandler(service)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{
+		"model":"openai/gpt-test",
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response := &noFlushResponseWriter{header: make(http.Header)}
+
+	handler.chatCompletions(response, request)
+
+	if response.status != http.StatusOK {
+		t.Fatalf("status = %d, want committed OK; body=%s", response.status, response.body.String())
+	}
+	body := response.body.String()
+	if !strings.Contains(body, `data: {"id":"chunk_1"}`) {
+		t.Fatalf("body missing committed chunk: %s", body)
+	}
+	if strings.Contains(body, `"error"`) || strings.Contains(body, "stream interrupted") {
+		t.Fatalf("no-flush failure appended JSON/error text: %s", body)
+	}
+	if store.lastFinalize.Status != "failed" || store.lastFinalize.ErrorCategory == nil || *store.lastFinalize.ErrorCategory != provider.StreamInterrupted {
+		t.Fatalf("finalize = %+v", store.lastFinalize)
+	}
+}
+
+func TestHandlerFinalizeFailureAfterCommittedStreamLogsSafeMetadataOnly(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	store.finalizeErr = errors.New("postgres finalize failed")
+	client := &fakeProviderClient{streamResult: provider.StreamResult{
+		Stream: &fakeChatStream{events: []provider.StreamEvent{
+			{Data: []byte(`{"id":"chunk_1"}`)},
+			{Data: []byte("[DONE]"), Done: true},
+		}},
+		UpstreamStatus:    http.StatusOK,
+		UpstreamRequestID: "req_log",
+	}}
+	var logs bytes.Buffer
+	service := newTestService(t, store, client, slog.New(slog.NewTextHandler(&logs, nil)))
+	handler := NewHandler(service)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{
+		"model":"openai/gpt-test",
+		"messages":[{"role":"user","content":"secret prompt"}],
+		"stream":true
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response := httptest.NewRecorder()
+
+	handler.chatCompletions(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `data: {"id":"chunk_1"}`) || !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("body missing committed stream output: %s", body)
+	}
+	if strings.Contains(body, `"error"`) || strings.Contains(body, "usage persistence failed") || strings.Contains(body, "postgres finalize failed") {
+		t.Fatalf("finalize failure leaked into stream body: %s", body)
+	}
+	logText := logs.String()
+	for _, want := range []string{"gateway request finalization failed", testRequestID, testProjectID, string(provider.OpenAI), "postgres finalize failed"} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("log missing %q: %s", want, logText)
+		}
+	}
+	if strings.Contains(logText, "secret prompt") || strings.Contains(logText, "sk-test") {
+		t.Fatalf("log leaked sensitive data: %s", logText)
+	}
+}
+
 func TestHandlerRequiresJSONContentTypeBeforeStoreOrUpstream(t *testing.T) {
 	store, rawKey := newAuthorizedStore(t)
 	client := &fakeProviderClient{}
@@ -899,6 +1152,11 @@ func newTestService(t *testing.T, store *fakeStore, clientsAndLogger ...any) *Se
 			t.Fatalf("unsupported test dependency %T", current)
 		}
 	}
+	return newServiceForStore(t, store, client, logger)
+}
+
+func newServiceForStore(t *testing.T, store Store, client provider.Client, logger *slog.Logger) *Service {
+	t.Helper()
 	cipher, err := security.NewCredentialCipher(bytes.Repeat([]byte{8}, 32))
 	if err != nil {
 		t.Fatalf("new cipher: %v", err)
@@ -978,6 +1236,55 @@ type fakeStore struct {
 	lastFinalize        FinalizeParams
 	finalizeCtxErr      error
 	finalizeHadDeadline bool
+}
+
+type finalizeCall struct {
+	params      FinalizeParams
+	ctxErr      error
+	hadDeadline bool
+	err         error
+}
+
+type notifyingStore struct {
+	base      *fakeStore
+	finalized chan finalizeCall
+}
+
+func newNotifyingStore(base *fakeStore) *notifyingStore {
+	return &notifyingStore{
+		base:      base,
+		finalized: make(chan finalizeCall, 1),
+	}
+}
+
+func (s *notifyingStore) AuthenticateVirtualKey(ctx context.Context, prefix string, keyHash []byte) (AuthContext, error) {
+	return s.base.AuthenticateVirtualKey(ctx, prefix, keyHash)
+}
+
+func (s *notifyingStore) ResolveProviderCredential(ctx context.Context, projectID string, name provider.Name) (ProviderCredential, error) {
+	return s.base.ResolveProviderCredential(ctx, projectID, name)
+}
+
+func (s *notifyingStore) CreateGatewayRequest(ctx context.Context, params CreateRequestParams) (GatewayRequest, error) {
+	return s.base.CreateGatewayRequest(ctx, params)
+}
+
+func (s *notifyingStore) FinalizeGatewayRequest(ctx context.Context, params FinalizeParams) error {
+	err := s.base.FinalizeGatewayRequest(ctx, params)
+	_, hadDeadline := ctx.Deadline()
+	s.finalized <- finalizeCall{params: params, ctxErr: ctx.Err(), hadDeadline: hadDeadline, err: err}
+	return err
+}
+
+func (s *notifyingStore) waitFinalize(t *testing.T) finalizeCall {
+	t.Helper()
+	select {
+	case call := <-s.finalized:
+		return call
+	case <-time.After(time.Second):
+		t.Fatal("gateway request was not finalized")
+		return finalizeCall{}
+	}
 }
 
 func (s *fakeStore) AuthenticateVirtualKey(_ context.Context, prefix string, keyHash []byte) (AuthContext, error) {
@@ -1169,4 +1476,42 @@ func (s *blockingStreamSink) WriteEvent(provider.StreamEvent) error {
 
 func (s *blockingStreamSink) Committed() bool {
 	return s.committed
+}
+
+type noFlushResponseWriter struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func (w *noFlushResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *noFlushResponseWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(data)
+}
+
+func (w *noFlushResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+
+func readSSEEvent(t *testing.T, reader *bufio.Reader) string {
+	t.Helper()
+	var builder strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read SSE event: %v", err)
+		}
+		builder.WriteString(line)
+		if line == "\n" || line == "\r\n" {
+			return builder.String()
+		}
+	}
 }

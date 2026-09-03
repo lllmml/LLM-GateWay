@@ -4,10 +4,10 @@ Update this after major decisions, completed phases, or bugs that future agents 
 
 ## Current State
 
-- Current task: Week 4 Streaming Core foundation is implemented and under final verification with OpenAI SSE parsing, synchronous Data Plane streaming, TTFT persistence, and deterministic mock streaming cases.
-- Current phase: Week 4 Streaming Core implementation complete; ready for final verification/commit.
+- Current task: Week 4 Streaming Core is implemented and verified with bounded OpenAI SSE parsing, synchronous Data Plane streaming, TTFT persistence, deterministic mock streaming cases, and real HTTP streaming/cancellation/shutdown tests.
+- Current phase: Week 4 Streaming Core is complete.
 - Week 3 PR2 review fix: provider registry now supports dynamic provider namespaces, X-Request-ID/UUID trace propagation is preserved, and the stream flag reaches the service while SSE handling remains deferred to Week 4.
-- Next step: Run the full Makefile verification gate, then plan the next milestone after streaming evidence is reviewed.
+- Next step: Propose the bounded Week 5 Provider Abstraction + DeepSeek plan before changing provider interfaces or adding a second provider execution path.
 - Blocked by: None. Real-provider smoke tests remain opt-in and require explicit cost-bearing approval.
 
 ## Decisions
