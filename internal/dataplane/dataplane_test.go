@@ -2110,3 +2110,81 @@ func TestHandlerCompleteChatThroughDeepSeekClientOverHTTP(t *testing.T) {
 		t.Fatalf("usage not finalized: %+v", finalize.params)
 	}
 }
+
+// DeepSeek 401/402 mean the configured upstream provider access is not usable
+// (invalid credential / insufficient balance). The gateway must surface these
+// as provider_unavailable (HTTP 502), not provider_invalid_request (HTTP 400):
+// the client request itself is valid; the upstream cannot be called right now.
+// A 422 control case pins that real client-side provider errors still map to
+// HTTP 400 provider_invalid_request.
+func TestHandlerDeepSeekServerSideUpstreamStatusesAreNotClientErrors(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		upstreamStatus int
+		stream         bool
+		wantStatus     int
+		wantType       string
+	}{
+		{"401 complete", http.StatusUnauthorized, false, http.StatusBadGateway, string(provider.ProviderUnavailable)},
+		{"402 complete", http.StatusPaymentRequired, false, http.StatusBadGateway, string(provider.ProviderUnavailable)},
+		{"402 stream", http.StatusPaymentRequired, true, http.StatusBadGateway, string(provider.ProviderUnavailable)},
+		{"422 complete control", http.StatusUnprocessableEntity, false, http.StatusBadRequest, string(provider.ProviderInvalidReq)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				response.WriteHeader(tt.upstreamStatus)
+				_, _ = response.Write([]byte(`{"error":{"message":"upstream said no","code":"upstream"},"extra":"secret-raw-upstream-body-xyz"}`))
+			}))
+			defer upstream.Close()
+
+			baseStore, rawKey := newAuthorizedStoreForProvider(t, provider.DeepSeek, testCredentialID)
+			baseStore.credential.BaseURLOverride = upstream.URL
+			store := newNotifyingStore(baseStore)
+			service := newServiceForStoreWithClientsAndTimeouts(t, store, map[provider.Name]provider.Client{
+				provider.DeepSeek: deepseek.New(upstream.Client()),
+			}, nil, time.Second, time.Second)
+			handler := NewHandler(service)
+			mux := http.NewServeMux()
+			handler.Register(mux)
+			gateway := httptest.NewServer(mux)
+			defer gateway.Close()
+
+			body := `{"model":"deepseek/deepseek-chat","messages":[{"role":"user","content":"hello"}]}`
+			if tt.stream {
+				body = `{"model":"deepseek/deepseek-chat","messages":[{"role":"user","content":"hello"}],"stream":true}`
+			}
+			request, err := http.NewRequest(http.MethodPost, gateway.URL+"/v1/chat/completions", strings.NewReader(body))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+rawKey)
+			response, err := gateway.Client().Do(request)
+			if err != nil {
+				t.Fatalf("gateway request: %v", err)
+			}
+			defer response.Body.Close()
+			responseBody, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatalf("read gateway response: %v", err)
+			}
+
+			if response.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", response.StatusCode, tt.wantStatus, responseBody)
+			}
+			if !strings.Contains(string(responseBody), `"type":"`+tt.wantType+`"`) {
+				t.Fatalf("error type = %s, want %q", responseBody, tt.wantType)
+			}
+			if strings.Contains(string(responseBody), "secret-raw-upstream-body-xyz") || strings.Contains(string(responseBody), "upstream said no") {
+				t.Fatalf("raw upstream error leaked to client: %s", responseBody)
+			}
+			finalize := store.waitFinalize(t)
+			if finalize.params.Status != "failed" || finalize.params.ErrorCategory == nil {
+				t.Fatalf("finalize = %+v", finalize.params)
+			}
+			if *finalize.params.ErrorCategory != provider.ErrorCategory(tt.wantType) {
+				t.Fatalf("finalized category = %q, want %q", *finalize.params.ErrorCategory, tt.wantType)
+			}
+		})
+	}
+}

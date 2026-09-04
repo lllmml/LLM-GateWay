@@ -219,8 +219,43 @@ func upstreamRequestID(response *http.Response) string {
 	return id
 }
 
+// classifyResponseError maps a non-2xx OpenAI response onto a stable provider
+// error. The adapter owns this HTTP-status -> category policy: a 401 (bad
+// upstream credential) or 402 (billing) means the gateway's configured
+// provider access is not usable - a server-side condition - not that the
+// client request is malformed, so it must not surface as provider_invalid_request.
 func classifyResponseError(response *http.Response, upstreamRequestID string) error {
-	return oaiwire.ClassifyResponseError(response, upstreamRequestID)
+	message := "provider request failed"
+	bodyBytes, tooLarge := oaiwire.ReadBoundedErrorBody(response.Body)
+	if tooLarge {
+		message = "provider error body exceeded limit"
+	} else if extracted := oaiwire.ErrorMessage(bodyBytes); extracted != "" {
+		message = extracted
+	}
+	return &provider.Error{
+		Category:          openAIErrorCategory(response.StatusCode),
+		StatusCode:        response.StatusCode,
+		UpstreamRequestID: upstreamRequestID,
+		Message:           message,
+	}
+}
+
+func openAIErrorCategory(statusCode int) provider.ErrorCategory {
+	switch statusCode {
+	case http.StatusTooManyRequests:
+		return provider.ProviderRateLimited
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+		return provider.ProviderTimeout
+	case http.StatusUnauthorized, http.StatusPaymentRequired:
+		return provider.ProviderUnavailable
+	}
+	if statusCode >= 500 {
+		return provider.ProviderUnavailable
+	}
+	if statusCode >= 400 {
+		return provider.ProviderInvalidReq
+	}
+	return provider.ProviderUnavailable
 }
 
 func responseFromWire(decoded oaiwire.Response) provider.Result {

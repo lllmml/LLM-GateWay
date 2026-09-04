@@ -141,51 +141,139 @@ func TestCompleteChatNormalizesReasoningResponseToContentOnly(t *testing.T) {
 }
 
 func TestCompleteChatClassifiesProviderError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		response.Header().Set("X-Request-ID", "req_429")
-		response.WriteHeader(http.StatusTooManyRequests)
-		_, _ = response.Write([]byte(`{"error":{"message":"rate limit reached","type":"rate_limit_error","code":"rate_limit"}}`))
-	}))
-	defer server.Close()
+	for _, tt := range []struct {
+		name         string
+		status       int
+		wantCategory provider.ErrorCategory
+		body         string
+	}{
+		{
+			name:         "429 rate limit",
+			status:       http.StatusTooManyRequests,
+			wantCategory: provider.ProviderRateLimited,
+			body:         `{"error":{"message":"rate limit reached","type":"rate_limit_error","code":"rate_limit"}}`,
+		},
+		{
+			name:         "422 invalid parameters",
+			status:       http.StatusUnprocessableEntity,
+			wantCategory: provider.ProviderInvalidReq,
+			body:         `{"error":{"message":"invalid parameters","code":"invalid_parameters"}}`,
+		},
+		{
+			name:         "400 invalid format",
+			status:       http.StatusBadRequest,
+			wantCategory: provider.ProviderInvalidReq,
+			body:         `{"error":{"message":"invalid format","code":"invalid_format"}}`,
+		},
+		{
+			name:         "408 timeout",
+			status:       http.StatusRequestTimeout,
+			wantCategory: provider.ProviderTimeout,
+			body:         `{"error":{"message":"request timed out"}}`,
+		},
+		{
+			name:         "504 gateway timeout",
+			status:       http.StatusGatewayTimeout,
+			wantCategory: provider.ProviderTimeout,
+			body:         `{"error":{"message":"upstream timeout"}}`,
+		},
+		{
+			name:         "500 server error",
+			status:       http.StatusInternalServerError,
+			wantCategory: provider.ProviderUnavailable,
+			body:         `{"error":{"message":"server error"}}`,
+		},
+		{
+			name:         "503 overloaded",
+			status:       http.StatusServiceUnavailable,
+			wantCategory: provider.ProviderUnavailable,
+			body:         `{"error":{"message":"server overloaded"}}`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				response.Header().Set("X-Request-ID", "req_"+tt.name)
+				response.WriteHeader(tt.status)
+				_, _ = response.Write([]byte(tt.body))
+			}))
+			defer server.Close()
 
-	result, err := New(server.Client()).CompleteChat(
-		context.Background(),
-		provider.ChatRequest{Model: "deepseek/deepseek-chat"},
-		provider.Credential{APIKey: []byte("sk-test"), BaseURLOverride: server.URL},
-	)
-	if err == nil {
-		t.Fatal("CompleteChat returned nil error")
-	}
-	providerErr, ok := provider.AsError(err)
-	if !ok {
-		t.Fatalf("error type = %T", err)
-	}
-	if providerErr.Category != provider.ProviderRateLimited || providerErr.Message != "rate limit reached" {
-		t.Fatalf("provider error = %+v", providerErr)
-	}
-	if result.UpstreamStatus != http.StatusTooManyRequests || result.UpstreamRequestID != "req_429" {
-		t.Fatalf("result = %+v", result)
+			result, err := New(server.Client()).CompleteChat(
+				context.Background(),
+				provider.ChatRequest{Model: "deepseek/deepseek-chat"},
+				provider.Credential{APIKey: []byte("sk-test"), BaseURLOverride: server.URL},
+			)
+			if err == nil {
+				t.Fatal("CompleteChat returned nil error")
+			}
+			providerErr, ok := provider.AsError(err)
+			if !ok {
+				t.Fatalf("error type = %T", err)
+			}
+			if providerErr.Category != tt.wantCategory {
+				t.Fatalf("category = %q, want %q (error=%+v)", providerErr.Category, tt.wantCategory, providerErr)
+			}
+			if providerErr.StatusCode != tt.status {
+				t.Fatalf("status = %d, want %d", providerErr.StatusCode, tt.status)
+			}
+			if result.UpstreamStatus != tt.status || result.UpstreamRequestID != "req_"+tt.name {
+				t.Fatalf("result = %+v", result)
+			}
+		})
 	}
 }
 
-func TestCompleteChatClassifiesInsufficientBalanceAsInvalidRequest(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		response.WriteHeader(http.StatusPaymentRequired)
-		_, _ = response.Write([]byte(`{"error":{"message":"insufficient balance","code":"insufficient_balance"}}`))
-	}))
-	defer server.Close()
+// DeepSeek 401 (invalid upstream credential) and 402 (insufficient balance) are
+// server-side conditions of the configured provider access, not client request
+// defects. They must stay provider_unavailable and must never be classified as
+// provider_invalid_request (which surfaces as a client HTTP 400).
+func TestCompleteChatClassifiesServerSideStatusesAsProviderUnavailable(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		status  int
+		message string
+	}{
+		{"401 authentication failure", http.StatusUnauthorized, "authentication failed"},
+		{"402 insufficient balance", http.StatusPaymentRequired, "insufficient balance"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				response.Header().Set("X-Request-ID", "req_"+tt.name)
+				response.WriteHeader(tt.status)
+				_, _ = response.Write([]byte(`{"error":{"message":"` + tt.message + `","code":"upstream"},"extra":"secret-raw-provider-body-xyz"}`))
+			}))
+			defer server.Close()
 
-	_, err := New(server.Client()).CompleteChat(
-		context.Background(),
-		provider.ChatRequest{Model: "deepseek/deepseek-chat"},
-		provider.Credential{APIKey: []byte("sk-test"), BaseURLOverride: server.URL},
-	)
-	if err == nil {
-		t.Fatal("CompleteChat returned nil error")
-	}
-	providerErr, ok := provider.AsError(err)
-	if !ok || providerErr.Category != provider.ProviderInvalidReq || providerErr.Message != "insufficient balance" {
-		t.Fatalf("provider error = %+v", err)
+			result, err := New(server.Client()).CompleteChat(
+				context.Background(),
+				provider.ChatRequest{Model: "deepseek/deepseek-chat"},
+				provider.Credential{APIKey: []byte("sk-test"), BaseURLOverride: server.URL},
+			)
+			if err == nil {
+				t.Fatal("CompleteChat returned nil error")
+			}
+			providerErr, ok := provider.AsError(err)
+			if !ok {
+				t.Fatalf("error type = %T", err)
+			}
+			if providerErr.Category != provider.ProviderUnavailable {
+				t.Fatalf("category = %q, want %q; error=%+v", providerErr.Category, provider.ProviderUnavailable, providerErr)
+			}
+			if providerErr.StatusCode != tt.status {
+				t.Fatalf("status = %d, want %d", providerErr.StatusCode, tt.status)
+			}
+			if providerErr.Message != tt.message {
+				t.Fatalf("message = %q, want %q", providerErr.Message, tt.message)
+			}
+			// The error carries the redacted envelope message only; the raw
+			// provider body must never leak into errors.
+			if strings.Contains(err.Error(), "secret-raw-provider-body-xyz") {
+				t.Fatalf("raw provider body leaked through error: %v", err)
+			}
+			if result.UpstreamStatus != tt.status || result.UpstreamRequestID != "req_"+tt.name {
+				t.Fatalf("result = %+v", result)
+			}
+		})
 	}
 }
 
@@ -439,6 +527,47 @@ func TestStreamChatClassifiesProviderErrorBeforeStream(t *testing.T) {
 	}
 	if result.UpstreamStatus != http.StatusTooManyRequests || result.UpstreamRequestID != "req_429" {
 		t.Fatalf("result = %+v", result)
+	}
+}
+
+// The same provider-owned classification applies when a stream cannot be
+// opened: 401/402 are upstream server-side conditions and must not become
+// provider_invalid_request.
+func TestStreamChatClassifiesServerSideStatusesBeforeStream(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		status int
+	}{
+		{"401", http.StatusUnauthorized},
+		{"402", http.StatusPaymentRequired},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				response.Header().Set("X-Request-ID", "req_"+tt.name)
+				response.WriteHeader(tt.status)
+				_, _ = response.Write([]byte(`{"error":{"message":"upstream access not usable"}}`))
+			}))
+			defer server.Close()
+
+			result, err := New(server.Client()).StreamChat(
+				context.Background(),
+				provider.ChatRequest{Model: "deepseek/deepseek-chat", Stream: true},
+				provider.Credential{APIKey: []byte("sk-test"), BaseURLOverride: server.URL},
+			)
+			if err == nil {
+				t.Fatal("StreamChat returned nil error")
+			}
+			providerErr, ok := provider.AsError(err)
+			if !ok {
+				t.Fatalf("error type = %T", err)
+			}
+			if providerErr.Category != provider.ProviderUnavailable {
+				t.Fatalf("category = %q, want %q; error=%+v", providerErr.Category, provider.ProviderUnavailable, providerErr)
+			}
+			if result.UpstreamStatus != tt.status || result.UpstreamRequestID != "req_"+tt.name {
+				t.Fatalf("result = %+v", result)
+			}
+		})
 	}
 }
 

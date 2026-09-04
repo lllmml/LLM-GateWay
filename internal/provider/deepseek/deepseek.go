@@ -219,8 +219,51 @@ func upstreamRequestID(response *http.Response) string {
 	return response.Header.Get("X-Request-ID")
 }
 
+// classifyResponseError maps a non-2xx DeepSeek response onto a stable
+// provider error. The adapter owns this HTTP-status -> category policy, and
+// DeepSeek's documented statuses (400/401/402/422/429/500/503) are mapped
+// explicitly:
+//   - 400/422: malformed/invalid request parameters -> provider_invalid_request
+//   - 429: rate limit -> provider_rate_limited
+//   - 408/504: request timeout -> provider_timeout
+//   - 401 (bad upstream credential) and 402 (insufficient balance): the
+//     gateway's configured provider access is unusable, which is a server-side
+//     condition, not a client request defect. They must NOT become
+//     provider_invalid_request (client HTTP 400); they stay provider_unavailable
+//     until a dedicated category is justified.
+//   - other 5xx: provider_unavailable
 func classifyResponseError(response *http.Response, upstreamRequestID string) error {
-	return oaiwire.ClassifyResponseError(response, upstreamRequestID)
+	message := "provider request failed"
+	bodyBytes, tooLarge := oaiwire.ReadBoundedErrorBody(response.Body)
+	if tooLarge {
+		message = "provider error body exceeded limit"
+	} else if extracted := oaiwire.ErrorMessage(bodyBytes); extracted != "" {
+		message = extracted
+	}
+	return &provider.Error{
+		Category:          deepSeekErrorCategory(response.StatusCode),
+		StatusCode:        response.StatusCode,
+		UpstreamRequestID: upstreamRequestID,
+		Message:           message,
+	}
+}
+
+func deepSeekErrorCategory(statusCode int) provider.ErrorCategory {
+	switch statusCode {
+	case http.StatusTooManyRequests:
+		return provider.ProviderRateLimited
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+		return provider.ProviderTimeout
+	case http.StatusUnauthorized, http.StatusPaymentRequired:
+		return provider.ProviderUnavailable
+	}
+	if statusCode >= 500 {
+		return provider.ProviderUnavailable
+	}
+	if statusCode >= 400 {
+		return provider.ProviderInvalidReq
+	}
+	return provider.ProviderUnavailable
 }
 
 func responseFromWire(decoded oaiwire.Response) provider.Result {

@@ -3,12 +3,15 @@
 // (currently OpenAI and DeepSeek).
 //
 // The package deliberately contains only stateless protocol mechanics: endpoint
-// construction, transport tuning, bounded decoding, status/error
-// classification, and wire-type validation. It contains no provider policy.
+// construction, transport tuning, bounded decoding, bounded error-body
+// reading, generic error-envelope message extraction, and wire-type
+// validation. It contains no provider error policy: mapping an upstream HTTP
+// status onto a gateway error category belongs to each adapter, because the
+// meaning of a status (for example 401 or 402) is a provider-scoped decision.
 // Each adapter owns its base URL and path constants, request-ID header policy,
-// stream terminal semantics, and any provider-specific validation, so genuine
-// provider differences (see docs/provider-capabilities.md) stay visible in the
-// adapter that owns them.
+// HTTP status classification, stream terminal semantics, and any
+// provider-specific validation, so genuine provider differences (see
+// docs/provider-capabilities.md) stay visible in the adapter that owns them.
 package oaiwire
 
 import (
@@ -102,42 +105,20 @@ func ReadBoundedErrorBody(body io.Reader) ([]byte, bool) {
 	return bodyBytes, false
 }
 
-// ClassifyResponseError maps a non-2xx upstream response onto a stable
-// provider error, extracting the provider message from a generic
-// {"error":{"message":...}} envelope when present. The response body is read
-// and (when bounded) drained here.
-func ClassifyResponseError(response *http.Response, upstreamRequestID string) error {
-	category := provider.ProviderUnavailable
-	message := "provider request failed"
-	switch {
-	case response.StatusCode == http.StatusTooManyRequests:
-		category = provider.ProviderRateLimited
-	case response.StatusCode == http.StatusRequestTimeout || response.StatusCode == http.StatusGatewayTimeout:
-		category = provider.ProviderTimeout
-	case response.StatusCode >= 400 && response.StatusCode < 500:
-		category = provider.ProviderInvalidReq
-	case response.StatusCode >= 500:
-		category = provider.ProviderUnavailable
-	}
+// ErrorMessage extracts the provider message from a generic
+// {"error":{"message":...}} envelope. It returns "" when the payload does not
+// decode or carries no message, so adapters can fall back to their own stable
+// message. Callers must not forward raw payloads anywhere.
+func ErrorMessage(bodyBytes []byte) string {
 	var decoded struct {
 		Error struct {
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	bodyBytes, tooLarge := ReadBoundedErrorBody(response.Body)
-	if tooLarge {
-		message = "provider error body exceeded limit"
-	} else if len(bodyBytes) > 0 {
-		if err := json.NewDecoder(bytes.NewReader(bodyBytes)).Decode(&decoded); err == nil && strings.TrimSpace(decoded.Error.Message) != "" {
-			message = decoded.Error.Message
-		}
+	if err := json.NewDecoder(bytes.NewReader(bodyBytes)).Decode(&decoded); err != nil {
+		return ""
 	}
-	return &provider.Error{
-		Category:          category,
-		StatusCode:        response.StatusCode,
-		UpstreamRequestID: upstreamRequestID,
-		Message:           message,
-	}
+	return strings.TrimSpace(decoded.Error.Message)
 }
 
 // DecodeSingle decodes exactly one JSON value from data into destination and
