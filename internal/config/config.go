@@ -1,33 +1,47 @@
 package config
 
 import (
+	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 )
 
 const (
-	defaultDataPlaneAddr       = ":8080"
-	defaultControlPlaneAddr    = ":8081"
-	defaultOpsAddr             = ":9090"
-	defaultDatabaseConnectTime = 5 * time.Second
-	defaultReadinessTimeout    = 2 * time.Second
-	defaultShutdownTimeout     = 10 * time.Second
+	defaultDataPlaneAddr             = ":8080"
+	defaultControlPlaneAddr          = ":8081"
+	defaultOpsAddr                   = ":9090"
+	defaultDatabaseConnectTime       = 5 * time.Second
+	defaultReadinessTimeout          = 2 * time.Second
+	defaultShutdownTimeout           = 10 * time.Second
+	defaultUpstreamRequestTimeout    = time.Minute
+	defaultUpstreamStreamMaxDuration = 10 * time.Minute
 )
 
 type Config struct {
-	DataPlaneAddr       string
-	ControlPlaneAddr    string
-	OpsAddr             string
-	DatabaseURL         string
-	CredentialMasterKey string
-	LogLevel            slog.Level
-	DatabaseConnectTime time.Duration
-	ReadinessTimeout    time.Duration
-	ShutdownTimeout     time.Duration
+	DataPlaneAddr             string
+	ControlPlaneAddr          string
+	OpsAddr                   string
+	DatabaseURL               string
+	CredentialMasterKey       []byte
+	PublicConsoleURL          string
+	GitHubClientID            string
+	GitHubClientSecret        string
+	SessionTokenPepper        []byte
+	VirtualKeyPepper          []byte
+	SecureCookies             bool
+	LogLevel                  slog.Level
+	DatabaseConnectTime       time.Duration
+	ReadinessTimeout          time.Duration
+	ShutdownTimeout           time.Duration
+	UpstreamRequestTimeout    time.Duration
+	UpstreamStreamMaxDuration time.Duration
 }
 
 func Load() (Config, error) {
@@ -48,8 +62,35 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		return Config{}, err
 	}
 
-	credentialMasterKey, err := required(lookup, "CREDENTIAL_MASTER_KEY")
+	credentialMasterKey, err := base64Key(lookup, "CREDENTIAL_MASTER_KEY", 32)
 	if err != nil {
+		return Config{}, err
+	}
+
+	publicConsoleURL, secureCookies, err := parsePublicConsoleURL(lookup)
+	if err != nil {
+		return Config{}, err
+	}
+
+	githubClientID, err := required(lookup, "GITHUB_CLIENT_ID")
+	if err != nil {
+		return Config{}, err
+	}
+
+	githubClientSecret, err := required(lookup, "GITHUB_CLIENT_SECRET")
+	if err != nil {
+		return Config{}, err
+	}
+
+	sessionTokenPepper, err := base64Key(lookup, "SESSION_TOKEN_PEPPER", 32)
+	if err != nil {
+		return Config{}, err
+	}
+	virtualKeyPepper, err := base64Key(lookup, "VIRTUAL_KEY_PEPPER", 32)
+	if err != nil {
+		return Config{}, err
+	}
+	if err := validateDistinctSecurityKeys(credentialMasterKey, sessionTokenPepper, virtualKeyPepper); err != nil {
 		return Config{}, err
 	}
 
@@ -73,17 +114,87 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		return Config{}, err
 	}
 
+	upstreamRequestTimeout, err := positiveDuration(lookup, "UPSTREAM_REQUEST_TIMEOUT", defaultUpstreamRequestTimeout)
+	if err != nil {
+		return Config{}, err
+	}
+
+	upstreamStreamMaxDuration, err := positiveDuration(lookup, "UPSTREAM_STREAM_MAX_DURATION", defaultUpstreamStreamMaxDuration)
+	if err != nil {
+		return Config{}, err
+	}
+
 	return Config{
-		DataPlaneAddr:       dataPlaneAddr,
-		ControlPlaneAddr:    controlPlaneAddr,
-		OpsAddr:             opsAddr,
-		DatabaseURL:         databaseURL,
-		CredentialMasterKey: credentialMasterKey,
-		LogLevel:            logLevel,
-		DatabaseConnectTime: databaseConnectTime,
-		ReadinessTimeout:    readinessTimeout,
-		ShutdownTimeout:     shutdownTimeout,
+		DataPlaneAddr:             dataPlaneAddr,
+		ControlPlaneAddr:          controlPlaneAddr,
+		OpsAddr:                   opsAddr,
+		DatabaseURL:               databaseURL,
+		CredentialMasterKey:       credentialMasterKey,
+		PublicConsoleURL:          publicConsoleURL,
+		GitHubClientID:            githubClientID,
+		GitHubClientSecret:        githubClientSecret,
+		SessionTokenPepper:        sessionTokenPepper,
+		VirtualKeyPepper:          virtualKeyPepper,
+		SecureCookies:             secureCookies,
+		LogLevel:                  logLevel,
+		DatabaseConnectTime:       databaseConnectTime,
+		ReadinessTimeout:          readinessTimeout,
+		ShutdownTimeout:           shutdownTimeout,
+		UpstreamRequestTimeout:    upstreamRequestTimeout,
+		UpstreamStreamMaxDuration: upstreamStreamMaxDuration,
 	}, nil
+}
+
+func validateDistinctSecurityKeys(credentialMasterKey, sessionTokenPepper, virtualKeyPepper []byte) error {
+	if bytes.Equal(credentialMasterKey, sessionTokenPepper) {
+		return errors.New("CREDENTIAL_MASTER_KEY and SESSION_TOKEN_PEPPER must use different key material")
+	}
+	if bytes.Equal(credentialMasterKey, virtualKeyPepper) {
+		return errors.New("CREDENTIAL_MASTER_KEY and VIRTUAL_KEY_PEPPER must use different key material")
+	}
+	if bytes.Equal(sessionTokenPepper, virtualKeyPepper) {
+		return errors.New("SESSION_TOKEN_PEPPER and VIRTUAL_KEY_PEPPER must use different key material")
+	}
+	return nil
+}
+
+func parsePublicConsoleURL(lookup func(string) (string, bool)) (string, bool, error) {
+	rawURL, err := required(lookup, "PUBLIC_CONSOLE_URL")
+	if err != nil {
+		return "", false, err
+	}
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", false, errors.New("PUBLIC_CONSOLE_URL must be an origin URL without credentials, path, query, or fragment")
+	}
+	if parsed.Scheme == "https" {
+		return strings.TrimRight(parsed.String(), "/"), true, nil
+	}
+	if parsed.Scheme != "http" || !isLoopbackHost(parsed.Hostname()) {
+		return "", false, errors.New("PUBLIC_CONSOLE_URL must use https except for loopback development")
+	}
+	return strings.TrimRight(parsed.String(), "/"), false, nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func base64Key(lookup func(string) (string, bool), name string, size int) ([]byte, error) {
+	encoded, err := required(lookup, name)
+	if err != nil {
+		return nil, err
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(decoded) != size {
+		return nil, fmt.Errorf("%s must be standard base64 encoding of exactly %d bytes", name, size)
+	}
+	return decoded, nil
 }
 
 func valueOrDefault(lookup func(string) (string, bool), key, fallback string) string {
