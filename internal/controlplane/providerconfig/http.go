@@ -1,6 +1,7 @@
 package providerconfig
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -23,9 +24,22 @@ func NewHandler(service *Service, currentUserID CurrentUserID) *Handler {
 
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/v1/projects/{projectID}/provider-configs/openai", h.upsertOpenAI)
+	mux.HandleFunc("PUT /api/v1/projects/{projectID}/provider-configs/deepseek", h.upsertDeepSeek)
 }
 
 func (h *Handler) upsertOpenAI(response http.ResponseWriter, request *http.Request) {
+	h.upsert(response, request, func(ctx context.Context, ownerUserID, projectID, credentialID string, enabled bool) (Config, error) {
+		return h.service.UpsertOpenAI(ctx, ownerUserID, projectID, credentialID, enabled)
+	})
+}
+
+func (h *Handler) upsertDeepSeek(response http.ResponseWriter, request *http.Request) {
+	h.upsert(response, request, func(ctx context.Context, ownerUserID, projectID, credentialID string, enabled bool) (Config, error) {
+		return h.service.UpsertDeepSeek(ctx, ownerUserID, projectID, credentialID, enabled)
+	})
+}
+
+func (h *Handler) upsert(response http.ResponseWriter, request *http.Request, apply func(context.Context, string, string, string, bool) (Config, error)) {
 	ownerUserID, ok := h.requireUser(response, request)
 	if !ok {
 		return
@@ -42,7 +56,7 @@ func (h *Handler) upsertOpenAI(response http.ResponseWriter, request *http.Reque
 	if body.Enabled != nil {
 		enabled = *body.Enabled
 	}
-	config, err := h.service.UpsertOpenAI(
+	config, err := apply(
 		request.Context(),
 		ownerUserID,
 		request.PathValue("projectID"),
