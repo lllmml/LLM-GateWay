@@ -2635,10 +2635,11 @@ func TestHandlerRejectsNonPositiveMaxTokensBeforeUpstream(t *testing.T) {
 	}
 }
 
-// A mid-conversation system message cannot be expressed by the Anthropic
-// Messages API without silently reordering the prompt. The adapter rejects it
-// before any upstream HTTP work; the gateway surfaces a stable 400
-// unsupported_feature and still records the failed attempt for attribution.
+// A mid-conversation system message is not translated by the Week 6 gateway
+// subset (Anthropic supports it on some models only and the gateway does not
+// detect per-model capability). The adapter rejects it before any upstream
+// HTTP work; the gateway surfaces a stable 400 unsupported_feature and still
+// records the failed attempt for attribution.
 func TestHandlerRejectsAnthropicMidConversationSystemBeforeUpstream(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		name := "non-stream"
@@ -2694,7 +2695,7 @@ func TestHandlerRejectsAnthropicMidConversationSystemBeforeUpstream(t *testing.T
 				t.Fatalf("read response body: %v", err)
 			}
 			if !strings.Contains(string(body), `"code":"unsupported_feature"`) ||
-				!strings.Contains(string(body), "request includes a feature not supported by the selected provider") {
+				!strings.Contains(string(body), "request includes a feature not supported by the gateway for the selected provider") {
 				t.Fatalf("response body = %s", body)
 			}
 			if upstreamCalls != 0 {

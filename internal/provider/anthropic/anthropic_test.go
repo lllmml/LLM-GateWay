@@ -209,10 +209,11 @@ func TestCompleteChatTranslatesLeadingSystemMessages(t *testing.T) {
 	}
 }
 
-// A system message after the first user/assistant turn cannot be expressed by
-// the Messages API without silently moving it to the front of the prompt. The
-// adapter must reject it before any upstream HTTP work instead of changing
-// conversation semantics.
+// A system message after the first user/assistant turn is not translated by
+// the Week 6 gateway subset (Anthropic supports mid-conversation system
+// messages only on some models and the gateway does not detect per-model
+// capability). The adapter must reject it before any upstream HTTP work so
+// behavior stays predictable across Anthropic models.
 func TestCompleteChatRejectsMidConversationSystemMessage(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
@@ -631,6 +632,55 @@ func TestStreamChatAccumulatesCumulativeOutputUsage(t *testing.T) {
 	}
 }
 
+// Zero usage is valid only when input_tokens/output_tokens are explicitly
+// present; a missing counter must never be accepted as an implicit zero.
+func TestStreamChatAcceptsExplicitZeroUsageTokens(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		_, _ = response.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_z\",\"model\":\"claude-sonnet-x\",\"usage\":{\"input_tokens\":0}}}\n\n"))
+		_, _ = response.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"))
+		_, _ = response.Write([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n"))
+		_, _ = response.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer server.Close()
+
+	result, err := New(server.Client()).StreamChat(
+		context.Background(),
+		provider.ChatRequest{Model: "claude-sonnet-x", Stream: true},
+		provider.Credential{APIKey: []byte("sk-ant-test"), BaseURLOverride: server.URL},
+	)
+	if err != nil {
+		t.Fatalf("stream chat: %v", err)
+	}
+	defer result.Stream.Close()
+
+	event, err := result.Stream.Next()
+	if err != nil {
+		t.Fatalf("content next: %v", err)
+	}
+	if !strings.Contains(string(event.Data), `"content":"ok"`) {
+		t.Fatalf("content event data = %s", event.Data)
+	}
+	event, err = result.Stream.Next()
+	if err != nil {
+		t.Fatalf("finish next: %v", err)
+	}
+	if event.Done || !strings.Contains(string(event.Data), `"finish_reason":"stop"`) {
+		t.Fatalf("finish event = %+v", event)
+	}
+	event, err = result.Stream.Next()
+	if err != nil {
+		t.Fatalf("done next: %v", err)
+	}
+	if !event.Done || string(event.Data) != "[DONE]" {
+		t.Fatalf("done event = %+v", event)
+	}
+	usage := result.Stream.Usage()
+	if usage == nil || usage.PromptTokens != 0 || usage.CompletionTokens != 0 || usage.TotalTokens != 0 {
+		t.Fatalf("usage = %+v", usage)
+	}
+}
+
 // refusal is a documented, normal successful stop reason; the stream must emit
 // an explicit content_filter finish chunk before [DONE] so clients observe a
 // terminal state instead of an open-ended stop.
@@ -831,6 +881,56 @@ func TestStreamChatFailsOnSequenceViolations(t *testing.T) {
 				"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"model\":\"claude-sonnet-x\",\"usage\":{\"input_tokens\":1}}}\n\n",
 				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null},\"usage\":{\"output_tokens\":8}}\n\n",
 				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+			},
+		},
+		{
+			name: "message_start missing usage",
+			events: []string{
+				"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"model\":\"claude-sonnet-x\"}}\n\n",
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+			},
+		},
+		{
+			name: "message_start usage missing input_tokens",
+			events: []string{
+				"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"model\":\"claude-sonnet-x\",\"usage\":{}}}\n\n",
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+			},
+		},
+		{
+			name: "message_delta missing usage",
+			events: []string{
+				"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"model\":\"claude-sonnet-x\",\"usage\":{\"input_tokens\":1}}}\n\n",
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+			},
+		},
+		{
+			name: "message_delta usage missing output_tokens",
+			events: []string{
+				"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"model\":\"claude-sonnet-x\",\"usage\":{\"input_tokens\":1}}}\n\n",
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n",
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+			},
+		},
+		{
+			name: "content_block_start before message_start",
+			events: []string{
+				"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+				"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"model\":\"claude-sonnet-x\",\"usage\":{\"input_tokens\":1}}}\n\n",
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+			},
+		},
+		{
+			name: "content_block_stop before message_start",
+			events: []string{
+				"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+				"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"model\":\"claude-sonnet-x\",\"usage\":{\"input_tokens\":1}}}\n\n",
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
 			},
 		},
 		{

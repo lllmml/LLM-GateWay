@@ -21,11 +21,14 @@
 //     silently inventing per-request behavior;
 //   - only LEADING system messages (before the first user/assistant message)
 //     are translated into the top-level Anthropic system field (joined with
-//     "\n\n"). The Messages API can only express system context in that
-//     top-level field, so a system message that appears after the conversation
-//     has started cannot be represented without silently reordering it; the
-//     adapter rejects such a request (unsupported_feature) before any upstream
-//     HTTP work instead of changing conversation semantics;
+//     "\n\n"). Anthropic supports mid-conversation role:"system" messages on
+//     some models but not all, and the Week 6 gateway subset intentionally
+//     does not implement per-model mid-conversation system capability
+//     detection. The adapter therefore conservatively rejects a system message
+//     after the first user/assistant turn (unsupported_feature) before any
+//     upstream HTTP work, keeping behavior predictable across Anthropic
+//     models; this may be revisited when provider/model capability
+//     negotiation is introduced;
 //   - responses carry content blocks and a stop_reason instead of
 //     choices[].message; the adapter joins text blocks into the OpenAI-
 //     compatible content channel, maps stop reasons onto OpenAI finish
@@ -274,11 +277,12 @@ func (c *Client) buildRequest(chat provider.ChatRequest, credential provider.Cre
 	for _, current := range chat.Messages {
 		if current.Role == "system" {
 			if seenConversationTurn {
-				// The Messages API can only carry system context in its top-level
-				// system field, so a system message that arrives after the first
-				// user/assistant turn cannot be expressed without silently moving
-				// it to the front and changing conversation semantics. Reject the
-				// request before any upstream HTTP work.
+				// Anthropic supports mid-conversation role:"system" messages on
+				// some models but not all. The Week 6 gateway subset intentionally
+				// does not implement per-model capability detection, so a system
+				// message after the first user/assistant turn is rejected
+				// conservatively before any upstream HTTP work to keep behavior
+				// predictable across Anthropic models.
 				return nil, "", &provider.Error{
 					Category: provider.UnsupportedFeature,
 					Message:  "system messages must appear before the first user or assistant message",
@@ -570,12 +574,17 @@ func finishReason(stopReason *string) string {
 // Anthropic versioning policy.
 //
 // The sequence contract is enforced with explicit phase state: message_start
-// must be the first event and occur exactly once; content deltas may only
-// appear between message_start and the first message_delta; message_stop is a
-// valid terminal only after at least one message_delta has been observed. Any
-// violation fails the stream (StreamInterrupted) without synthesizing [DONE]
-// or exposing usage. Usage counters must be non-negative, and message_delta
-// output_tokens is cumulative and must never decrease.
+// must be the first structural event and occur exactly once (content block
+// boundaries before message_start are rejected, while ping and unknown named
+// events remain tolerated); content deltas may only appear between
+// message_start and the first message_delta; message_stop is a valid terminal
+// only after at least one message_delta has been observed. Any violation fails
+// the stream (StreamInterrupted) without synthesizing [DONE] or exposing
+// usage. message_start requires a usage object with input_tokens and every
+// message_delta requires a usage object with output_tokens; a missing counter
+// is rejected rather than silently treated as zero, counters must be
+// non-negative, and message_delta output_tokens is cumulative and must never
+// decrease.
 type streamPhase int
 
 const (
@@ -637,8 +646,10 @@ func (s *chatStream) Next() (provider.StreamEvent, error) {
 				Message struct {
 					ID    string `json:"id"`
 					Model string `json:"model"`
-					Usage struct {
-						InputTokens int64 `json:"input_tokens"`
+					// Pointer usage so a missing usage object or a missing
+					// input_tokens field is distinguishable from an explicit zero.
+					Usage *struct {
+						InputTokens *int64 `json:"input_tokens"`
 					} `json:"usage"`
 				} `json:"message"`
 			}
@@ -648,14 +659,25 @@ func (s *chatStream) Next() (provider.StreamEvent, error) {
 			if strings.TrimSpace(payload.Message.ID) == "" || strings.TrimSpace(payload.Message.Model) == "" {
 				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream message_start missing required fields"))
 			}
-			if payload.Message.Usage.InputTokens < 0 {
+			if payload.Message.Usage == nil || payload.Message.Usage.InputTokens == nil {
+				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream message_start missing usage.input_tokens"))
+			}
+			if *payload.Message.Usage.InputTokens < 0 {
 				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream reported negative input_tokens"))
 			}
 			s.phase = phaseStarted
 			s.messageID = payload.Message.ID
 			s.model = payload.Message.Model
 			s.created = time.Now().Unix()
-			s.inputTokens = payload.Message.Usage.InputTokens
+			s.inputTokens = *payload.Message.Usage.InputTokens
+			continue
+		case "content_block_start", "content_block_stop":
+			// Content block boundaries are known structural events and must not
+			// precede message_start. After the stream has started they carry no
+			// text and are tolerated (no per-block lifecycle is tracked).
+			if s.phase == phaseInitial {
+				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream sent content block event before message_start"))
+			}
 			continue
 		case "content_block_delta":
 			if s.phase == phaseInitial {
@@ -697,21 +719,26 @@ func (s *chatStream) Next() (provider.StreamEvent, error) {
 				Delta struct {
 					StopReason *string `json:"stop_reason"`
 				} `json:"delta"`
-				Usage struct {
-					OutputTokens int64 `json:"output_tokens"`
+				// Pointer usage so a missing usage object or a missing
+				// output_tokens field is distinguishable from an explicit zero.
+				Usage *struct {
+					OutputTokens *int64 `json:"output_tokens"`
 				} `json:"usage"`
 			}
 			if err := decodeSingle(event.Data, &payload); err != nil {
 				return provider.StreamEvent{}, s.fail(s.decodeError(err))
 			}
-			if payload.Usage.OutputTokens < 0 {
+			if payload.Usage == nil || payload.Usage.OutputTokens == nil {
+				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream message_delta missing usage.output_tokens"))
+			}
+			if *payload.Usage.OutputTokens < 0 {
 				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream reported negative output_tokens"))
 			}
-			if payload.Usage.OutputTokens < s.outputTokens {
+			if *payload.Usage.OutputTokens < s.outputTokens {
 				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream output_tokens decreased"))
 			}
 			s.phase = phaseFinalized
-			s.outputTokens = payload.Usage.OutputTokens
+			s.outputTokens = *payload.Usage.OutputTokens
 			if reason := finishReason(payload.Delta.StopReason); reason != "" && !s.stopSent {
 				s.stopSent = true
 				encoded, err := json.Marshal(s.finishChunk(reason))
@@ -750,8 +777,6 @@ func (s *chatStream) Next() (provider.StreamEvent, error) {
 				Message:           "provider stream error",
 			})
 		case "ping":
-			continue
-		case "content_block_start", "content_block_stop":
 			continue
 		case "":
 			// The Anthropic stream contract names every event. A bare data
