@@ -32,6 +32,12 @@ func TestLoadUsesDefaults(t *testing.T) {
 	if cfg.DatabaseConnectTime != defaultDatabaseConnectTime {
 		t.Fatalf("DatabaseConnectTime = %v, want %v", cfg.DatabaseConnectTime, defaultDatabaseConnectTime)
 	}
+	if cfg.UpstreamRequestTimeout != defaultUpstreamRequestTimeout {
+		t.Fatalf("UpstreamRequestTimeout = %v, want %v", cfg.UpstreamRequestTimeout, defaultUpstreamRequestTimeout)
+	}
+	if cfg.UpstreamStreamMaxDuration != defaultUpstreamStreamMaxDuration {
+		t.Fatalf("UpstreamStreamMaxDuration = %v, want %v", cfg.UpstreamStreamMaxDuration, defaultUpstreamStreamMaxDuration)
+	}
 	if len(cfg.CredentialMasterKey) != 32 {
 		t.Fatalf("CredentialMasterKey length = %d, want 32", len(cfg.CredentialMasterKey))
 	}
@@ -97,6 +103,8 @@ func TestLoadParsesOverrides(t *testing.T) {
 	values["DATABASE_CONNECT_TIMEOUT"] = "7s"
 	values["READINESS_TIMEOUT"] = "3s"
 	values["SHUTDOWN_TIMEOUT"] = "11s"
+	values["UPSTREAM_REQUEST_TIMEOUT"] = "13s"
+	values["UPSTREAM_STREAM_MAX_DURATION"] = "17m"
 
 	cfg, err := load(mapLookup(values))
 	if err != nil {
@@ -114,6 +122,32 @@ func TestLoadParsesOverrides(t *testing.T) {
 	}
 	if cfg.ShutdownTimeout != 11*time.Second {
 		t.Fatalf("ShutdownTimeout = %v, want 11s", cfg.ShutdownTimeout)
+	}
+	if cfg.UpstreamRequestTimeout != 13*time.Second {
+		t.Fatalf("UpstreamRequestTimeout = %v, want 13s", cfg.UpstreamRequestTimeout)
+	}
+	if cfg.UpstreamStreamMaxDuration != 17*time.Minute {
+		t.Fatalf("UpstreamStreamMaxDuration = %v, want 17m", cfg.UpstreamStreamMaxDuration)
+	}
+}
+
+func TestLoadRejectsInvalidTimeoutOverrides(t *testing.T) {
+	for _, key := range []string{
+		"DATABASE_CONNECT_TIMEOUT",
+		"READINESS_TIMEOUT",
+		"SHUTDOWN_TIMEOUT",
+		"UPSTREAM_REQUEST_TIMEOUT",
+		"UPSTREAM_STREAM_MAX_DURATION",
+	} {
+		t.Run(key, func(t *testing.T) {
+			values := requiredTestValues()
+			values[key] = "0s"
+
+			_, err := load(mapLookup(values))
+			if err == nil || !strings.Contains(err.Error(), key+" must be positive") {
+				t.Fatalf("load error = %v, want positive-duration error for %s", err, key)
+			}
+		})
 	}
 }
 

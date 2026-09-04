@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"golang.org/x/oauth2"
 
@@ -88,12 +87,13 @@ func run() error {
 		return fmt.Errorf("configure provider registry: %w", err)
 	}
 	dataPlaneService, err := dataplane.NewService(dataplane.Options{
-		Store:            database,
-		VirtualKeyPepper: cfg.VirtualKeyPepper,
-		CredentialCipher: credentialCipher,
-		UpstreamTimeout:  time.Minute,
-		ProviderRegistry: providerRegistry,
-		Logger:           logger,
+		Store:                     database,
+		VirtualKeyPepper:          cfg.VirtualKeyPepper,
+		CredentialCipher:          credentialCipher,
+		UpstreamRequestTimeout:    cfg.UpstreamRequestTimeout,
+		UpstreamStreamMaxDuration: cfg.UpstreamStreamMaxDuration,
+		ProviderRegistry:          providerRegistry,
+		Logger:                    logger,
 	})
 	if err != nil {
 		database.Close()

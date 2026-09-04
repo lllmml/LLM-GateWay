@@ -14,30 +14,34 @@ import (
 )
 
 const (
-	defaultDataPlaneAddr       = ":8080"
-	defaultControlPlaneAddr    = ":8081"
-	defaultOpsAddr             = ":9090"
-	defaultDatabaseConnectTime = 5 * time.Second
-	defaultReadinessTimeout    = 2 * time.Second
-	defaultShutdownTimeout     = 10 * time.Second
+	defaultDataPlaneAddr             = ":8080"
+	defaultControlPlaneAddr          = ":8081"
+	defaultOpsAddr                   = ":9090"
+	defaultDatabaseConnectTime       = 5 * time.Second
+	defaultReadinessTimeout          = 2 * time.Second
+	defaultShutdownTimeout           = 10 * time.Second
+	defaultUpstreamRequestTimeout    = time.Minute
+	defaultUpstreamStreamMaxDuration = 10 * time.Minute
 )
 
 type Config struct {
-	DataPlaneAddr       string
-	ControlPlaneAddr    string
-	OpsAddr             string
-	DatabaseURL         string
-	CredentialMasterKey []byte
-	PublicConsoleURL    string
-	GitHubClientID      string
-	GitHubClientSecret  string
-	SessionTokenPepper  []byte
-	VirtualKeyPepper    []byte
-	SecureCookies       bool
-	LogLevel            slog.Level
-	DatabaseConnectTime time.Duration
-	ReadinessTimeout    time.Duration
-	ShutdownTimeout     time.Duration
+	DataPlaneAddr             string
+	ControlPlaneAddr          string
+	OpsAddr                   string
+	DatabaseURL               string
+	CredentialMasterKey       []byte
+	PublicConsoleURL          string
+	GitHubClientID            string
+	GitHubClientSecret        string
+	SessionTokenPepper        []byte
+	VirtualKeyPepper          []byte
+	SecureCookies             bool
+	LogLevel                  slog.Level
+	DatabaseConnectTime       time.Duration
+	ReadinessTimeout          time.Duration
+	ShutdownTimeout           time.Duration
+	UpstreamRequestTimeout    time.Duration
+	UpstreamStreamMaxDuration time.Duration
 }
 
 func Load() (Config, error) {
@@ -110,22 +114,34 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		return Config{}, err
 	}
 
+	upstreamRequestTimeout, err := positiveDuration(lookup, "UPSTREAM_REQUEST_TIMEOUT", defaultUpstreamRequestTimeout)
+	if err != nil {
+		return Config{}, err
+	}
+
+	upstreamStreamMaxDuration, err := positiveDuration(lookup, "UPSTREAM_STREAM_MAX_DURATION", defaultUpstreamStreamMaxDuration)
+	if err != nil {
+		return Config{}, err
+	}
+
 	return Config{
-		DataPlaneAddr:       dataPlaneAddr,
-		ControlPlaneAddr:    controlPlaneAddr,
-		OpsAddr:             opsAddr,
-		DatabaseURL:         databaseURL,
-		CredentialMasterKey: credentialMasterKey,
-		PublicConsoleURL:    publicConsoleURL,
-		GitHubClientID:      githubClientID,
-		GitHubClientSecret:  githubClientSecret,
-		SessionTokenPepper:  sessionTokenPepper,
-		VirtualKeyPepper:    virtualKeyPepper,
-		SecureCookies:       secureCookies,
-		LogLevel:            logLevel,
-		DatabaseConnectTime: databaseConnectTime,
-		ReadinessTimeout:    readinessTimeout,
-		ShutdownTimeout:     shutdownTimeout,
+		DataPlaneAddr:             dataPlaneAddr,
+		ControlPlaneAddr:          controlPlaneAddr,
+		OpsAddr:                   opsAddr,
+		DatabaseURL:               databaseURL,
+		CredentialMasterKey:       credentialMasterKey,
+		PublicConsoleURL:          publicConsoleURL,
+		GitHubClientID:            githubClientID,
+		GitHubClientSecret:        githubClientSecret,
+		SessionTokenPepper:        sessionTokenPepper,
+		VirtualKeyPepper:          virtualKeyPepper,
+		SecureCookies:             secureCookies,
+		LogLevel:                  logLevel,
+		DatabaseConnectTime:       databaseConnectTime,
+		ReadinessTimeout:          readinessTimeout,
+		ShutdownTimeout:           shutdownTimeout,
+		UpstreamRequestTimeout:    upstreamRequestTimeout,
+		UpstreamStreamMaxDuration: upstreamStreamMaxDuration,
 	}, nil
 }
 

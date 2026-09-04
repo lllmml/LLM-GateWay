@@ -79,13 +79,30 @@ errors, stream commit state, and the no-retry Week 3/4 policy. One long-lived
 `http.Transport` is created at process startup and reused across requests.
 
 For streaming, the provider adapter sends `stream_options.include_usage=true`.
-Usage is persisted only when the stream reaches `[DONE]` and the provider
-supplied a final usage chunk. `first_chunk_at` and `ttft_ms` are recorded only
-after the first non-`[DONE]` event is successfully written and flushed to the
-downstream client. If provider parsing, upstream EOF, client cancellation, write,
-or flush fails before `[DONE]`, the gateway finalizes the request as
-`status = 'failed'` with `error_category = 'stream_interrupted'` and nullable
-usage.
+Usage is accepted only from the optional final provider usage chunk with
+`choices=[]`, and that usage becomes observable to the Data Plane only after the
+subsequent `[DONE]`. A usage-bearing chunk with ordinary choices, a second usage
+chunk, or any ordinary content chunk after final usage is malformed and causes a
+`stream_interrupted` failure without persisting usage. `first_chunk_at` and
+`ttft_ms` are recorded only after the first non-`[DONE]` event is successfully
+written and flushed to the downstream client. `gateway_requests.started_at` uses
+the HTTP handler ingress timestamp for requests that reach durable request
+creation, so authentication, request parsing, model/provider resolution, and
+credential lookup are included in latency and TTFT. If provider parsing,
+upstream EOF, client cancellation, write, or flush fails before `[DONE]`, the
+gateway finalizes the request as `status = 'failed'` with
+`error_category = 'stream_interrupted'` and nullable usage.
+
+The Data Plane uses separate deadline semantics for ordinary provider requests
+and streams. `UPSTREAM_REQUEST_TIMEOUT` bounds non-streaming provider execution
+and defaults to 1 minute. `UPSTREAM_STREAM_MAX_DURATION` bounds the total stream
+lifetime and defaults to 10 minutes. The OpenAI transport still keeps bounded
+connect, TLS, and response-header timeouts, and the Data Plane HTTP server keeps
+`WriteTimeout == 0` so valid SSE streams are not cut off by a server-wide write
+deadline. The Week 4 policy still has no separate stream-idle or per-write
+deadline, so a stream can consume resources until its total maximum duration
+when neither side makes progress; add those controls only with explicit,
+provider-aware semantics in a later reliability milestone.
 
 Before the downstream response is committed, the gateway can still return the
 stable JSON error envelope. After the first SSE bytes are committed, it never

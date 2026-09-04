@@ -38,6 +38,7 @@ Update this after major decisions, completed phases, or bugs that future agents 
 - 2026-09-01: One long-lived explicit `http.Transport` is reused by the OpenAI client; the deterministic mock provider supplies non-stream success, error, delay, and malformed-response tests without real provider calls.
 - 2026-09-01: Provider lookup is registry-backed and no longer limited by a hardcoded `ParseModel` namespace whitelist; unknown provider namespaces can parse and then fail later through explicit registry lookup/configuration.
 - 2026-09-03: Week 4 streaming uses a bounded SSE decoder and OpenAI adapter-owned stream validation. The Data Plane owns the synchronous `Next -> write -> flush` loop, records TTFT after the first non-DONE event flush, treats `[DONE]` as the only success marker, and finalizes interrupted streams as `failed/stream_interrupted` with nullable usage.
+- 2026-09-04: Week 4 review fixes tightened streaming lifecycle semantics: handler ingress time is persisted as `gateway_requests.started_at`, downstream cancellation before stream establishment is finalized as `stream_interrupted`, OpenAI final usage is accepted only from `choices=[]` followed by `[DONE]`, and ordinary upstream request timeout is split from stream max duration (`UPSTREAM_REQUEST_TIMEOUT` vs `UPSTREAM_STREAM_MAX_DURATION`).
 
 ## AI / Tooling Decisions
 

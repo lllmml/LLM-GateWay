@@ -372,12 +372,14 @@ type chatStream struct {
 	decoder           *sse.Decoder
 	upstreamStatus    int
 	upstreamRequestID string
+	pendingUsage      *provider.Usage
 	usage             *provider.Usage
 	done              bool
+	failed            bool
 }
 
 func (s *chatStream) Next() (provider.StreamEvent, error) {
-	if s.done {
+	if s.done || s.failed {
 		return provider.StreamEvent{}, io.EOF
 	}
 	for {
@@ -387,48 +389,70 @@ func (s *chatStream) Next() (provider.StreamEvent, error) {
 			if errors.Is(err, sse.ErrEventTooLarge) {
 				category = provider.ProviderUnavailable
 			}
-			return provider.StreamEvent{}, &provider.Error{
+			return provider.StreamEvent{}, s.fail(&provider.Error{
 				Category:          category,
 				StatusCode:        s.upstreamStatus,
 				UpstreamRequestID: s.upstreamRequestID,
 				Err:               err,
-			}
+			})
 		}
 		data := bytes.TrimSpace(event.Data)
 		if bytes.Equal(data, []byte("[DONE]")) {
 			s.done = true
+			if s.pendingUsage != nil {
+				s.usage = s.pendingUsage
+				s.pendingUsage = nil
+			}
 			return provider.StreamEvent{Event: event.Name, Data: []byte("[DONE]"), Done: true}, nil
+		}
+		if s.pendingUsage != nil {
+			return provider.StreamEvent{}, s.fail(s.streamSequenceError("provider stream event followed final usage before done"))
 		}
 		var decoded streamChunk
 		decoder := json.NewDecoder(bytes.NewReader(event.Data))
 		if err := decoder.Decode(&decoded); err != nil {
-			return provider.StreamEvent{}, &provider.Error{
+			return provider.StreamEvent{}, s.fail(&provider.Error{
 				Category:          provider.StreamInterrupted,
 				StatusCode:        s.upstreamStatus,
 				UpstreamRequestID: s.upstreamRequestID,
 				Err:               fmt.Errorf("decode provider stream event: %w", err),
-			}
+			})
 		}
 		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-			return provider.StreamEvent{}, &provider.Error{
+			return provider.StreamEvent{}, s.fail(&provider.Error{
 				Category:          provider.StreamInterrupted,
 				StatusCode:        s.upstreamStatus,
 				UpstreamRequestID: s.upstreamRequestID,
 				Err:               fmt.Errorf("provider stream event contained multiple JSON values: %w", err),
-			}
+			})
 		}
 		if err := validateStreamChunk(decoded); err != nil {
-			return provider.StreamEvent{}, &provider.Error{
+			return provider.StreamEvent{}, s.fail(&provider.Error{
 				Category:          provider.StreamInterrupted,
 				StatusCode:        s.upstreamStatus,
 				UpstreamRequestID: s.upstreamRequestID,
 				Err:               err,
-			}
+			})
 		}
 		if decoded.Usage != nil {
-			s.usage = usageFromResponse(decoded.Usage)
+			s.pendingUsage = usageFromResponse(decoded.Usage)
 		}
 		return provider.StreamEvent{Event: event.Name, Data: append([]byte(nil), event.Data...)}, nil
+	}
+}
+
+func (s *chatStream) fail(err error) error {
+	s.pendingUsage = nil
+	s.failed = true
+	return err
+}
+
+func (s *chatStream) streamSequenceError(message string) error {
+	return &provider.Error{
+		Category:          provider.StreamInterrupted,
+		StatusCode:        s.upstreamStatus,
+		UpstreamRequestID: s.upstreamRequestID,
+		Err:               errors.New(message),
 	}
 }
 
@@ -451,10 +475,16 @@ func validateStreamChunk(decoded streamChunk) error {
 	if strings.TrimSpace(decoded.ID) == "" || strings.TrimSpace(decoded.Object) == "" || strings.TrimSpace(decoded.Model) == "" {
 		return errors.New("provider stream event missing required fields")
 	}
-	if len(decoded.Choices) == 0 && decoded.Usage == nil {
+	if decoded.Usage != nil {
+		if decoded.Choices == nil || len(*decoded.Choices) != 0 {
+			return errors.New("provider stream final usage event must have empty choices")
+		}
+		return nil
+	}
+	if decoded.Choices == nil || len(*decoded.Choices) == 0 {
 		return errors.New("provider stream event missing choices")
 	}
-	for _, choice := range decoded.Choices {
+	for _, choice := range *decoded.Choices {
 		if choice.Delta != nil && strings.TrimSpace(choice.Delta.Role) == "" && choice.Delta.Content == nil && choice.FinishReason == nil {
 			return errors.New("provider stream event delta is empty")
 		}
@@ -505,12 +535,12 @@ type responseUsage struct {
 }
 
 type streamChunk struct {
-	ID      string         `json:"id"`
-	Object  string         `json:"object"`
-	Created int64          `json:"created"`
-	Model   string         `json:"model"`
-	Choices []streamChoice `json:"choices"`
-	Usage   *responseUsage `json:"usage"`
+	ID      string          `json:"id"`
+	Object  string          `json:"object"`
+	Created int64           `json:"created"`
+	Model   string          `json:"model"`
+	Choices *[]streamChoice `json:"choices"`
+	Usage   *responseUsage  `json:"usage"`
 }
 
 type streamChoice struct {

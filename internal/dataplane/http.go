@@ -10,6 +10,7 @@ import (
 	"mime"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
 )
@@ -29,6 +30,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 }
 
 func (h *Handler) chatCompletions(response http.ResponseWriter, request *http.Request) {
+	requestStartedAt := time.Now().UTC()
 	if !isJSONContentType(request.Header.Get("Content-Type")) {
 		writeError(response, http.StatusUnsupportedMediaType, provider.InvalidRequest, "invalid_request", "content type must be application/json")
 		return
@@ -60,13 +62,13 @@ func (h *Handler) chatCompletions(response http.ResponseWriter, request *http.Re
 	}
 	if chat.Stream {
 		sink := newHTTPStreamSink(response)
-		record, err := h.service.StreamChat(request.Context(), auth, traceID, chat, sink)
+		record, err := h.service.StreamChatStartedAt(request.Context(), auth, traceID, requestStartedAt, chat, sink)
 		if err != nil && !sink.Committed() {
 			writeGatewayError(response, record, err)
 		}
 		return
 	}
-	result, record, err := h.service.CompleteChat(request.Context(), auth, traceID, chat)
+	result, record, err := h.service.CompleteChatStartedAt(request.Context(), auth, traceID, requestStartedAt, chat)
 	if err != nil {
 		writeGatewayError(response, record, err)
 		return

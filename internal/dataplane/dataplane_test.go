@@ -120,6 +120,41 @@ func TestCompleteChatPropagatesTraceIDToGatewayRequest(t *testing.T) {
 	}
 }
 
+func TestHandlerUsesIngressTimeForGatewayRequestStart(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	var authObservedAt time.Time
+	store.onAuth = func() {
+		authObservedAt = time.Now().UTC()
+	}
+	client := &fakeProviderClient{
+		result: provider.Result{
+			Response:       provider.ChatResponse{ID: "chatcmpl_test", Object: "chat.completion", Created: 123, Model: "gpt-test", Choices: []provider.Choice{{Index: 0, Message: provider.ResponseMessage{Role: "assistant", Content: "ok"}}}},
+			UpstreamStatus: http.StatusOK,
+		},
+	}
+	service := newTestService(t, store, client)
+	handler := NewHandler(service)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{
+		"model":"openai/gpt-test",
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response := httptest.NewRecorder()
+
+	handler.chatCompletions(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+	if authObservedAt.IsZero() {
+		t.Fatal("auth hook did not run")
+	}
+	if store.lastCreate.StartedAt.After(authObservedAt) {
+		t.Fatalf("started_at = %v, want no later than auth lookup at %v", store.lastCreate.StartedAt, authObservedAt)
+	}
+}
+
 func TestCreateFailureDoesNotCallProvider(t *testing.T) {
 	store, rawKey := newAuthorizedStore(t)
 	store.createErr = errors.New("database unavailable")
@@ -384,6 +419,86 @@ func TestStreamChatWritesChunksAndFinalizesUsageAndTTFT(t *testing.T) {
 	}
 }
 
+func TestHandlerUsesIngressTimestampForStreamTTFT(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	client := &fakeProviderClient{streamResult: provider.StreamResult{
+		Stream: &fakeChatStream{events: []provider.StreamEvent{
+			{Data: []byte(`{"id":"chunk_1","choices":[{"delta":{"content":"hello"}}]}`)},
+			{Data: []byte("[DONE]"), Done: true},
+		}},
+		UpstreamStatus: http.StatusOK,
+	}}
+	service := newTestService(t, store, client)
+	handler := NewHandler(service)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{
+		"model":"openai/gpt-test",
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response := httptest.NewRecorder()
+
+	handler.chatCompletions(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+	if store.authStartedAt.IsZero() || store.resolveStartedAt.IsZero() {
+		t.Fatalf("missing auth/resolve timestamps: auth=%v resolve=%v", store.authStartedAt, store.resolveStartedAt)
+	}
+	if store.lastCreate.StartedAt.After(store.authStartedAt) {
+		t.Fatalf("started_at = %v, want no later than auth start %v", store.lastCreate.StartedAt, store.authStartedAt)
+	}
+	if store.lastCreate.StartedAt.After(store.resolveStartedAt) {
+		t.Fatalf("started_at = %v, want no later than provider config lookup start %v", store.lastCreate.StartedAt, store.resolveStartedAt)
+	}
+	if store.lastFinalize.FirstChunkAt == nil || store.lastFinalize.TTFTMS == nil {
+		t.Fatalf("stream timing not finalized: %+v", store.lastFinalize)
+	}
+	wantTTFT := store.lastFinalize.FirstChunkAt.Sub(store.lastCreate.StartedAt).Milliseconds()
+	if *store.lastFinalize.TTFTMS != wantTTFT {
+		t.Fatalf("TTFTMS = %d, want %d from first_chunk_at-started_at", *store.lastFinalize.TTFTMS, wantTTFT)
+	}
+}
+
+func TestHandlerUsesIngressTimestampForNonStreamingLatency(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	client := &fakeProviderClient{
+		result: provider.Result{
+			Response: provider.ChatResponse{
+				ID:      "chatcmpl_test",
+				Object:  "chat.completion",
+				Created: 123,
+				Model:   "gpt-test",
+				Choices: []provider.Choice{{Index: 0, Message: provider.ResponseMessage{Role: "assistant", Content: "ok"}}},
+			},
+			UpstreamStatus: http.StatusOK,
+		},
+	}
+	service := newTestService(t, store, client)
+	handler := NewHandler(service)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{
+		"model":"openai/gpt-test",
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response := httptest.NewRecorder()
+
+	handler.chatCompletions(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+	if store.lastCreate.StartedAt.After(store.authStartedAt) {
+		t.Fatalf("started_at = %v, want no later than auth start %v", store.lastCreate.StartedAt, store.authStartedAt)
+	}
+	if store.lastCreate.StartedAt.After(store.resolveStartedAt) {
+		t.Fatalf("started_at = %v, want no later than provider config lookup start %v", store.lastCreate.StartedAt, store.resolveStartedAt)
+	}
+}
+
 func TestStreamChatProviderErrorBeforeCommitReturnsJSONCapableError(t *testing.T) {
 	store, rawKey := newAuthorizedStore(t)
 	client := &fakeProviderClient{
@@ -536,6 +651,93 @@ func TestStreamChatCancellationClosesUpstreamStreamAndFinalizes(t *testing.T) {
 	}
 	if store.finalizeCalls != 1 || store.finalizeCtxErr != nil || !store.finalizeHadDeadline {
 		t.Fatalf("finalize calls=%d ctx err=%v deadline=%v", store.finalizeCalls, store.finalizeCtxErr, store.finalizeHadDeadline)
+	}
+}
+
+func TestStreamChatClientCancelBeforeUpstreamHeadersFinalizesInterrupted(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	upstreamCtxSeen := make(chan context.Context, 1)
+	client := &fakeProviderClient{
+		streamFactory: func(ctx context.Context) (provider.StreamResult, error) {
+			upstreamCtxSeen <- ctx
+			<-ctx.Done()
+			return provider.StreamResult{UpstreamStatus: http.StatusBadGateway}, &provider.Error{Category: provider.ProviderUnavailable, Message: "raw canceled provider request"}
+		},
+	}
+	service := newServiceForStore(t, store, client, nil)
+	sink := &recordingStreamSink{}
+
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.StreamChat(ctx, auth, "", provider.ChatRequest{
+			Model:    "openai/gpt-test",
+			Messages: []provider.Message{{Role: "user", Content: "hello"}},
+			Stream:   true,
+		}, sink)
+		done <- err
+	}()
+
+	var upstreamCtx context.Context
+	select {
+	case upstreamCtx = <-upstreamCtxSeen:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not receive upstream context")
+	}
+	cancel()
+	select {
+	case <-upstreamCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("upstream request context was not canceled")
+	}
+
+	err = <-done
+	var gatewayErr *GatewayError
+	if !errors.As(err, &gatewayErr) || gatewayErr.Category != provider.StreamInterrupted || strings.Contains(gatewayErr.Message, "raw canceled") {
+		t.Fatalf("error = %#v", err)
+	}
+	if store.lastFinalize.Status != "failed" || store.lastFinalize.ErrorCategory == nil || *store.lastFinalize.ErrorCategory != provider.StreamInterrupted {
+		t.Fatalf("finalize = %+v", store.lastFinalize)
+	}
+	if sink.Committed() {
+		t.Fatal("sink committed before upstream stream opened")
+	}
+	if store.lastFinalize.TotalTokens != nil || store.lastFinalize.FirstChunkAt != nil {
+		t.Fatalf("pre-headers cancel persisted stream timing/usage: %+v", store.lastFinalize)
+	}
+}
+
+func TestStreamChatUpstreamDeadlineBeforeHeadersRemainsProviderTimeout(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	client := &fakeProviderClient{
+		streamFactory: func(ctx context.Context) (provider.StreamResult, error) {
+			<-ctx.Done()
+			return provider.StreamResult{UpstreamStatus: http.StatusGatewayTimeout}, &provider.Error{Category: provider.ProviderTimeout, Message: "raw timeout"}
+		},
+	}
+	service := newServiceForStoreWithTimeouts(t, store, client, nil, time.Nanosecond, time.Nanosecond)
+	sink := &recordingStreamSink{}
+
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	_, err = service.StreamChat(context.Background(), auth, "", provider.ChatRequest{
+		Model:    "openai/gpt-test",
+		Messages: []provider.Message{{Role: "user", Content: "hello"}},
+		Stream:   true,
+	}, sink)
+
+	var gatewayErr *GatewayError
+	if !errors.As(err, &gatewayErr) || gatewayErr.Category != provider.ProviderTimeout {
+		t.Fatalf("error = %#v", err)
+	}
+	if store.lastFinalize.Status != "failed" || store.lastFinalize.ErrorCategory == nil || *store.lastFinalize.ErrorCategory != provider.ProviderTimeout {
+		t.Fatalf("finalize = %+v", store.lastFinalize)
 	}
 }
 
@@ -771,6 +973,64 @@ func TestHandlerStreamsThroughOpenAIClientOverHTTP(t *testing.T) {
 	}
 	if finalize.params.UpstreamRequestID == nil || *finalize.params.UpstreamRequestID != "req_http_stream" {
 		t.Fatalf("upstream request ID not finalized: %+v", finalize.params)
+	}
+}
+
+func TestHandlerMalformedFinalUsageSequenceFinalizesInterruptedWithoutUsage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(response, `data: {"id":"chunk_1","object":"chat.completion.chunk","created":123,"model":"gpt-test","choices":[{"index":0,"delta":{"content":"hello"}}],"usage":null}`+"\n\n")
+		_, _ = io.WriteString(response, `data: {"id":"chunk_usage","object":"chat.completion.chunk","created":123,"model":"gpt-test","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`+"\n\n")
+		_, _ = io.WriteString(response, `data: {"id":"chunk_after_usage","object":"chat.completion.chunk","created":123,"model":"gpt-test","choices":[{"index":0,"delta":{"content":"late"}}],"usage":null}`+"\n\n")
+		_, _ = io.WriteString(response, "data: [DONE]\n\n")
+		response.(http.Flusher).Flush()
+	}))
+	defer upstream.Close()
+
+	baseStore, rawKey := newAuthorizedStore(t)
+	baseStore.credential.BaseURLOverride = upstream.URL
+	store := newNotifyingStore(baseStore)
+	service := newServiceForStore(t, store, openai.New(upstream.Client()), nil)
+	handler := NewHandler(service)
+	mux := http.NewServeMux()
+	handler.Register(mux)
+	gateway := httptest.NewServer(mux)
+	defer gateway.Close()
+
+	request, err := http.NewRequest(http.MethodPost, gateway.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model":"openai/gpt-test",
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response, err := gateway.Client().Do(request)
+	if err != nil {
+		t.Fatalf("gateway request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", response.StatusCode, body)
+	}
+	if !strings.Contains(string(body), `"chunk_usage"`) {
+		t.Fatalf("committed body missing usage chunk: %s", body)
+	}
+	if strings.Contains(string(body), `"chunk_after_usage"`) || strings.Contains(string(body), `"error"`) {
+		t.Fatalf("malformed usage sequence leaked forbidden body content: %s", body)
+	}
+	finalize := store.waitFinalize(t)
+	if finalize.params.Status != "failed" || finalize.params.ErrorCategory == nil || *finalize.params.ErrorCategory != provider.StreamInterrupted {
+		t.Fatalf("finalize = %+v", finalize.params)
+	}
+	if finalize.params.TotalTokens != nil {
+		t.Fatalf("malformed interrupted stream persisted usage: %+v", finalize.params)
 	}
 }
 
@@ -1156,18 +1416,23 @@ func newTestService(t *testing.T, store *fakeStore, clientsAndLogger ...any) *Se
 }
 
 func newServiceForStore(t *testing.T, store Store, client provider.Client, logger *slog.Logger) *Service {
+	return newServiceForStoreWithTimeouts(t, store, client, logger, time.Second, time.Second)
+}
+
+func newServiceForStoreWithTimeouts(t *testing.T, store Store, client provider.Client, logger *slog.Logger, upstreamTimeout, streamMaxDuration time.Duration) *Service {
 	t.Helper()
 	cipher, err := security.NewCredentialCipher(bytes.Repeat([]byte{8}, 32))
 	if err != nil {
 		t.Fatalf("new cipher: %v", err)
 	}
 	service, err := NewService(Options{
-		Store:            store,
-		VirtualKeyPepper: bytes.Repeat([]byte{9}, 32),
-		CredentialCipher: cipher,
-		UpstreamTimeout:  time.Second,
-		ProviderRegistry: newTestProviderRegistry(t, map[provider.Name]provider.Client{provider.OpenAI: client}),
-		Logger:           logger,
+		Store:                     store,
+		VirtualKeyPepper:          bytes.Repeat([]byte{9}, 32),
+		CredentialCipher:          cipher,
+		UpstreamRequestTimeout:    upstreamTimeout,
+		UpstreamStreamMaxDuration: streamMaxDuration,
+		ProviderRegistry:          newTestProviderRegistry(t, map[provider.Name]provider.Client{provider.OpenAI: client}),
+		Logger:                    logger,
 	})
 	if err != nil {
 		t.Fatalf("new service: %v", err)
@@ -1232,6 +1497,9 @@ type fakeStore struct {
 	finalizeCalls       int
 	createErr           error
 	finalizeErr         error
+	onAuth              func()
+	authStartedAt       time.Time
+	resolveStartedAt    time.Time
 	lastCreate          CreateRequestParams
 	lastFinalize        FinalizeParams
 	finalizeCtxErr      error
@@ -1288,7 +1556,11 @@ func (s *notifyingStore) waitFinalize(t *testing.T) finalizeCall {
 }
 
 func (s *fakeStore) AuthenticateVirtualKey(_ context.Context, prefix string, keyHash []byte) (AuthContext, error) {
+	s.authStartedAt = time.Now().UTC()
 	s.authCalls++
+	if s.onAuth != nil {
+		s.onAuth()
+	}
 	if prefix != s.prefix || !bytes.Equal(keyHash, s.keyHash) {
 		return AuthContext{}, ErrNotFound
 	}
@@ -1296,6 +1568,7 @@ func (s *fakeStore) AuthenticateVirtualKey(_ context.Context, prefix string, key
 }
 
 func (s *fakeStore) ResolveProviderCredential(context.Context, string, provider.Name) (ProviderCredential, error) {
+	s.resolveStartedAt = time.Now().UTC()
 	s.resolveCalls++
 	if s.credential.ID == "" {
 		return ProviderCredential{}, ErrNotFound

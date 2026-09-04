@@ -97,21 +97,23 @@ type StreamSink interface {
 }
 
 type Options struct {
-	Store            Store
-	VirtualKeyPepper []byte
-	CredentialCipher *security.CredentialCipher
-	UpstreamTimeout  time.Duration
-	ProviderRegistry *provider.Registry
-	Logger           *slog.Logger
+	Store                     Store
+	VirtualKeyPepper          []byte
+	CredentialCipher          *security.CredentialCipher
+	UpstreamRequestTimeout    time.Duration
+	UpstreamStreamMaxDuration time.Duration
+	ProviderRegistry          *provider.Registry
+	Logger                    *slog.Logger
 }
 
 type Service struct {
-	store            Store
-	virtualKeyPepper []byte
-	credentialCipher *security.CredentialCipher
-	upstreamTimeout  time.Duration
-	providers        *provider.Registry
-	logger           *slog.Logger
+	store                     Store
+	virtualKeyPepper          []byte
+	credentialCipher          *security.CredentialCipher
+	upstreamRequestTimeout    time.Duration
+	upstreamStreamMaxDuration time.Duration
+	providers                 *provider.Registry
+	logger                    *slog.Logger
 }
 
 func NewService(options Options) (*Service, error) {
@@ -124,8 +126,11 @@ func NewService(options Options) (*Service, error) {
 	if options.CredentialCipher == nil {
 		return nil, errors.New("credential cipher is required")
 	}
-	if options.UpstreamTimeout <= 0 {
-		return nil, errors.New("upstream timeout must be positive")
+	if options.UpstreamRequestTimeout <= 0 {
+		return nil, errors.New("upstream request timeout must be positive")
+	}
+	if options.UpstreamStreamMaxDuration <= 0 {
+		return nil, errors.New("upstream stream max duration must be positive")
 	}
 	if options.ProviderRegistry == nil {
 		return nil, errors.New("provider registry is required")
@@ -135,12 +140,13 @@ func NewService(options Options) (*Service, error) {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return &Service{
-		store:            options.Store,
-		virtualKeyPepper: append([]byte(nil), options.VirtualKeyPepper...),
-		credentialCipher: options.CredentialCipher,
-		upstreamTimeout:  options.UpstreamTimeout,
-		providers:        options.ProviderRegistry,
-		logger:           logger,
+		store:                     options.Store,
+		virtualKeyPepper:          append([]byte(nil), options.VirtualKeyPepper...),
+		credentialCipher:          options.CredentialCipher,
+		upstreamRequestTimeout:    options.UpstreamRequestTimeout,
+		upstreamStreamMaxDuration: options.UpstreamStreamMaxDuration,
+		providers:                 options.ProviderRegistry,
+		logger:                    logger,
 	}, nil
 }
 
@@ -164,6 +170,14 @@ func (s *Service) Authenticate(ctx context.Context, rawKey string) (AuthContext,
 }
 
 func (s *Service) CompleteChat(ctx context.Context, auth AuthContext, traceID string, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
+	return s.CompleteChatStartedAt(ctx, auth, traceID, time.Now().UTC(), chat)
+}
+
+func (s *Service) CompleteChatStartedAt(ctx context.Context, auth AuthContext, traceID string, requestStartedAt time.Time, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
+	return s.completeChat(ctx, auth, traceID, normalizedStartedAt(requestStartedAt), chat)
+}
+
+func (s *Service) completeChat(ctx context.Context, auth AuthContext, traceID string, requestStartedAt time.Time, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
 	modelRef, err := provider.ParseModel(chat.Model)
 	if err != nil {
 		return provider.Result{}, GatewayRequest{}, NewError(provider.ModelNotSupported, "model must use provider/model-id format")
@@ -183,7 +197,6 @@ func (s *Service) CompleteChat(ctx context.Context, auth AuthContext, traceID st
 		return provider.Result{}, GatewayRequest{}, err
 	}
 
-	now := time.Now().UTC()
 	record, err := s.store.CreateGatewayRequest(ctx, CreateRequestParams{
 		ProjectID:            auth.ProjectID,
 		VirtualKeyID:         auth.VirtualKeyID,
@@ -191,7 +204,7 @@ func (s *Service) CompleteChat(ctx context.Context, auth AuthContext, traceID st
 		Provider:             modelRef.Provider,
 		Model:                modelRef.Model,
 		IsStream:             chat.Stream,
-		StartedAt:            now,
+		StartedAt:            requestStartedAt,
 		TraceID:              traceID,
 	})
 	if err != nil {
@@ -209,7 +222,7 @@ func (s *Service) CompleteChat(ctx context.Context, auth AuthContext, traceID st
 	}
 	defer clear(apiKey)
 
-	upstreamCtx, cancel := context.WithTimeout(ctx, s.upstreamTimeout)
+	upstreamCtx, cancel := context.WithTimeout(ctx, s.upstreamRequestTimeout)
 	defer cancel()
 	upstreamChat := chat
 	upstreamChat.Model = modelRef.Model
@@ -235,6 +248,14 @@ func (s *Service) CompleteChat(ctx context.Context, auth AuthContext, traceID st
 }
 
 func (s *Service) StreamChat(ctx context.Context, auth AuthContext, traceID string, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
+	return s.StreamChatStartedAt(ctx, auth, traceID, time.Now().UTC(), chat, sink)
+}
+
+func (s *Service) StreamChatStartedAt(ctx context.Context, auth AuthContext, traceID string, requestStartedAt time.Time, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
+	return s.streamChat(ctx, auth, traceID, normalizedStartedAt(requestStartedAt), chat, sink)
+}
+
+func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID string, requestStartedAt time.Time, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
 	if sink == nil {
 		return GatewayRequest{}, NewError(provider.InternalError, "request could not be completed")
 	}
@@ -258,7 +279,6 @@ func (s *Service) StreamChat(ctx context.Context, auth AuthContext, traceID stri
 		return GatewayRequest{}, err
 	}
 
-	now := time.Now().UTC()
 	record, err := s.store.CreateGatewayRequest(ctx, CreateRequestParams{
 		ProjectID:            auth.ProjectID,
 		VirtualKeyID:         auth.VirtualKeyID,
@@ -266,7 +286,7 @@ func (s *Service) StreamChat(ctx context.Context, auth AuthContext, traceID stri
 		Provider:             modelRef.Provider,
 		Model:                modelRef.Model,
 		IsStream:             true,
-		StartedAt:            now,
+		StartedAt:            requestStartedAt,
 		TraceID:              traceID,
 	})
 	if err != nil {
@@ -284,7 +304,7 @@ func (s *Service) StreamChat(ctx context.Context, auth AuthContext, traceID stri
 	}
 	defer clear(apiKey)
 
-	upstreamCtx, cancel := context.WithTimeout(ctx, s.upstreamTimeout)
+	upstreamCtx, cancel := context.WithTimeout(ctx, s.upstreamStreamMaxDuration)
 	defer cancel()
 	upstreamChat := chat
 	upstreamChat.Model = modelRef.Model
@@ -298,6 +318,7 @@ func (s *Service) StreamChat(ctx context.Context, auth AuthContext, traceID stri
 		if gatewayErr == nil {
 			gatewayErr = NewError(provider.ProviderUnavailable, "provider request failed")
 		}
+		gatewayErr = classifyStreamOpenError(ctx, gatewayErr)
 		if finalizeErr := s.finalizeStream(ctx, record, &result, &gatewayErr.Category, nil, nil, nil); finalizeErr != nil {
 			return record, s.persistenceError(record, gatewayErr.Category, finalizeErr)
 		}
@@ -351,6 +372,20 @@ func (s *Service) StreamChat(ctx context.Context, auth AuthContext, traceID stri
 			return record, nil
 		}
 	}
+}
+
+func classifyStreamOpenError(ctx context.Context, gatewayErr *GatewayError) *GatewayError {
+	if gatewayErr == nil || ctx.Err() == nil {
+		return gatewayErr
+	}
+	return NewError(provider.StreamInterrupted, "stream interrupted")
+}
+
+func normalizedStartedAt(startedAt time.Time) time.Time {
+	if startedAt.IsZero() {
+		return time.Now().UTC()
+	}
+	return startedAt.UTC()
 }
 
 func (s *Service) decryptCredential(credential ProviderCredential) ([]byte, error) {

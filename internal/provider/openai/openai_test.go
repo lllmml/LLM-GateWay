@@ -299,9 +299,8 @@ func TestStreamChatTranslatesRequestAndExtractsUsage(t *testing.T) {
 	if event.Done || !strings.Contains(string(event.Data), `"usage":{"prompt_tokens":7`) {
 		t.Fatalf("usage event = %+v", event)
 	}
-	usage := result.Stream.Usage()
-	if usage == nil || usage.TotalTokens != 10 {
-		t.Fatalf("usage = %+v", usage)
+	if usage := result.Stream.Usage(); usage != nil {
+		t.Fatalf("usage before DONE = %+v, want nil", usage)
 	}
 	event, err = result.Stream.Next()
 	if err != nil {
@@ -310,8 +309,129 @@ func TestStreamChatTranslatesRequestAndExtractsUsage(t *testing.T) {
 	if !event.Done || string(event.Data) != "[DONE]" {
 		t.Fatalf("done event = %+v", event)
 	}
+	usage := result.Stream.Usage()
+	if usage == nil || usage.TotalTokens != 10 {
+		t.Fatalf("usage = %+v", usage)
+	}
 	if _, err := result.Stream.Next(); !errors.Is(err, io.EOF) {
 		t.Fatalf("post done err = %v, want EOF", err)
+	}
+}
+
+func TestStreamChatRejectsMalformedFinalUsageSequences(t *testing.T) {
+	tests := []struct {
+		name   string
+		events []string
+	}{
+		{
+			name: "usage with choices",
+			events: []string{
+				`data: {"id":"secret_usage_choices","object":"chat.completion.chunk","created":123,"model":"gpt-test","choices":[{"index":0,"delta":{"content":"bad"}}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}` + "\n\n",
+			},
+		},
+		{
+			name: "usage without choices",
+			events: []string{
+				`data: {"id":"secret_usage_without_choices","object":"chat.completion.chunk","created":123,"model":"gpt-test","usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}` + "\n\n",
+			},
+		},
+		{
+			name: "content after usage",
+			events: []string{
+				`data: {"id":"chunk_usage","object":"chat.completion.chunk","created":123,"model":"gpt-test","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}` + "\n\n",
+				`data: {"id":"secret_after_usage","object":"chat.completion.chunk","created":123,"model":"gpt-test","choices":[{"index":0,"delta":{"content":"late"}}],"usage":null}` + "\n\n",
+			},
+		},
+		{
+			name: "conflicting duplicate usage",
+			events: []string{
+				`data: {"id":"chunk_usage","object":"chat.completion.chunk","created":123,"model":"gpt-test","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}` + "\n\n",
+				`data: {"id":"secret_second_usage","object":"chat.completion.chunk","created":123,"model":"gpt-test","choices":[],"usage":{"prompt_tokens":8,"completion_tokens":3,"total_tokens":11}}` + "\n\n",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				response.Header().Set("Content-Type", "text/event-stream")
+				for _, event := range tt.events {
+					_, _ = response.Write([]byte(event))
+				}
+				_, _ = response.Write([]byte("data: [DONE]\n\n"))
+			}))
+			defer server.Close()
+
+			result, err := New(server.Client()).StreamChat(
+				context.Background(),
+				provider.ChatRequest{Model: "openai/gpt-test", Stream: true},
+				provider.Credential{APIKey: []byte("sk-test"), BaseURLOverride: server.URL},
+			)
+			if err != nil {
+				t.Fatalf("stream chat: %v", err)
+			}
+			defer result.Stream.Close()
+
+			_, err = result.Stream.Next()
+			if err == nil {
+				_, err = result.Stream.Next()
+			}
+			providerErr, ok := provider.AsError(err)
+			if !ok || providerErr.Category != provider.StreamInterrupted {
+				t.Fatalf("error = %#v", err)
+			}
+			for _, forbidden := range []string{"secret_usage_choices", "secret_usage_without_choices", "secret_after_usage", "secret_second_usage"} {
+				if strings.Contains(err.Error(), forbidden) {
+					t.Fatalf("raw provider body leaked through error: %v", err)
+				}
+			}
+			if usage := result.Stream.Usage(); usage != nil {
+				t.Fatalf("malformed stream exposed usage: %+v", usage)
+			}
+			next, nextErr := result.Stream.Next()
+			if !errors.Is(nextErr, io.EOF) || next.Done {
+				t.Fatalf("post-failure next = %+v, %v; want no DONE and EOF", next, nextErr)
+			}
+			if usage := result.Stream.Usage(); usage != nil {
+				t.Fatalf("post-failure stream exposed usage: %+v", usage)
+			}
+		})
+	}
+}
+
+func TestStreamChatDoesNotExposeUsageWhenFinalUsageIsInterrupted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		_, _ = response.Write([]byte(`data: {"id":"chunk_usage","object":"chat.completion.chunk","created":123,"model":"gpt-test","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	result, err := New(server.Client()).StreamChat(
+		context.Background(),
+		provider.ChatRequest{Model: "openai/gpt-test", Stream: true},
+		provider.Credential{APIKey: []byte("sk-test"), BaseURLOverride: server.URL},
+	)
+	if err != nil {
+		t.Fatalf("stream chat: %v", err)
+	}
+	defer result.Stream.Close()
+
+	if _, err := result.Stream.Next(); err != nil {
+		t.Fatalf("usage next: %v", err)
+	}
+	if usage := result.Stream.Usage(); usage != nil {
+		t.Fatalf("usage before interruption = %+v, want nil", usage)
+	}
+	_, err = result.Stream.Next()
+	providerErr, ok := provider.AsError(err)
+	if !ok || providerErr.Category != provider.StreamInterrupted {
+		t.Fatalf("error = %#v", err)
+	}
+	if usage := result.Stream.Usage(); usage != nil {
+		t.Fatalf("usage after interruption = %+v, want nil", usage)
+	}
+	if _, err := result.Stream.Next(); !errors.Is(err, io.EOF) {
+		t.Fatalf("post-interruption next err = %v, want EOF", err)
 	}
 }
 
