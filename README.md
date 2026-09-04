@@ -31,12 +31,19 @@ Required development config:
 
 - `DATABASE_URL`
 - `CREDENTIAL_MASTER_KEY`
+- `PUBLIC_CONSOLE_URL`
+- `GITHUB_CLIENT_ID`
+- `GITHUB_CLIENT_SECRET`
+- `SESSION_TOKEN_PEPPER`
+- `VIRTUAL_KEY_PEPPER`
 
-Generate a development `CREDENTIAL_MASTER_KEY` value with:
+Generate separate development values for each 32-byte key or pepper with:
 
 ```bash
 openssl rand -base64 32
 ```
+
+Do not reuse the session pepper as the virtual-key pepper.
 
 Then run:
 

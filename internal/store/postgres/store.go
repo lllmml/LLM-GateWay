@@ -30,7 +30,8 @@ func (e *ConnectionError) SafeCause() string {
 }
 
 type Store struct {
-	pool *pgxpool.Pool
+	pool    *pgxpool.Pool
+	queries *Queries
 }
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
@@ -44,7 +45,7 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 		return nil, &ConnectionError{Operation: "connection", Err: err}
 	}
 
-	return &Store{pool: pool}, nil
+	return &Store{pool: pool, queries: New(pool)}, nil
 }
 
 func (s *Store) Ping(ctx context.Context) error {

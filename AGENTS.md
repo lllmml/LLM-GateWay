@@ -4,7 +4,7 @@
 
 - **What this is:** A production-oriented Go LLM gateway and Web management console that centralizes multi-provider access, virtual keys, usage/cost attribution, streaming, and operational visibility.
 - **Who it is for:** Developers, small engineering teams, and backend/AI infrastructure engineers using OpenAI, Anthropic, and DeepSeek.
-- **Current phase:** Week 1 Foundation complete; next is Week 2 Control Plane Core
+- **Current phase:** Week 3 first-provider/non-streaming foundation complete; ready to plan Week 4 Streaming Core
 - **Working style:** The user is learning while building. AI leads bounded implementation; the user reviews decisions, verifies behavior, and must be able to explain every core mechanism.
 
 ## Commands
