@@ -1531,12 +1531,14 @@ type fakeStore struct {
 	auth                AuthContext
 	credential          ProviderCredential
 	credentials         map[provider.Name]ProviderCredential
+	prices              map[priceKey]ModelPrice
 	authCalls           int
 	resolveCalls        int
 	createCalls         int
 	finalizeCalls       int
 	createErr           error
 	finalizeErr         error
+	priceLookupErr      error
 	onAuth              func()
 	authStartedAt       time.Time
 	resolveStartedAt    time.Time
@@ -1544,6 +1546,11 @@ type fakeStore struct {
 	lastFinalize        FinalizeParams
 	finalizeCtxErr      error
 	finalizeHadDeadline bool
+}
+
+type priceKey struct {
+	provider provider.Name
+	model    string
 }
 
 type finalizeCall struct {
@@ -1575,6 +1582,10 @@ func (s *notifyingStore) ResolveProviderCredential(ctx context.Context, projectI
 
 func (s *notifyingStore) CreateGatewayRequest(ctx context.Context, params CreateRequestParams) (GatewayRequest, error) {
 	return s.base.CreateGatewayRequest(ctx, params)
+}
+
+func (s *notifyingStore) FindModelPrice(ctx context.Context, name provider.Name, model string, at time.Time) (ModelPrice, error) {
+	return s.base.FindModelPrice(ctx, name, model, at)
 }
 
 func (s *notifyingStore) FinalizeGatewayRequest(ctx context.Context, params FinalizeParams) error {
@@ -1640,6 +1651,17 @@ func (s *fakeStore) CreateGatewayRequest(_ context.Context, params CreateRequest
 		Status:               "in_progress",
 		StartedAt:            params.StartedAt,
 	}, nil
+}
+
+func (s *fakeStore) FindModelPrice(_ context.Context, name provider.Name, model string, _ time.Time) (ModelPrice, error) {
+	if s.priceLookupErr != nil {
+		return ModelPrice{}, s.priceLookupErr
+	}
+	price, ok := s.prices[priceKey{provider: name, model: model}]
+	if !ok {
+		return ModelPrice{}, ErrNotFound
+	}
+	return price, nil
 }
 
 func (s *fakeStore) FinalizeGatewayRequest(ctx context.Context, params FinalizeParams) error {
@@ -2707,5 +2729,189 @@ func TestHandlerRejectsAnthropicMidConversationSystemBeforeUpstream(t *testing.T
 				t.Fatalf("finalize = %+v", finalize.params)
 			}
 		})
+	}
+}
+
+func pricedOpenAIResult() provider.Result {
+	usage := &provider.Usage{PromptTokens: 1_000, CompletionTokens: 2_000, TotalTokens: 3_000}
+	return provider.Result{
+		Response: provider.ChatResponse{
+			ID:      "chatcmpl_price",
+			Object:  "chat.completion",
+			Created: 123,
+			Model:   "gpt-test",
+			Choices: []provider.Choice{{Index: 0, Message: provider.ResponseMessage{Role: "assistant", Content: "ok"}, FinishReason: "stop"}},
+			Usage:   usage,
+		},
+		Usage:             usage,
+		UpstreamStatus:    http.StatusOK,
+		UpstreamRequestID: "req_price",
+	}
+}
+
+// terraEquivalent is 2e9/12e9 nano-USD per million, matching the real
+// openai/gpt-5.6-terra seed so the assertion doubles as a documented example.
+const (
+	terraInputNanoPerMillion  = int64(2_000_000_000)
+	terraOutputNanoPerMillion = int64(12_000_000_000)
+	terraPriceID              = "price-terra"
+)
+
+func addTerraPrice(store *fakeStore) {
+	if store.prices == nil {
+		store.prices = make(map[priceKey]ModelPrice)
+	}
+	store.prices[priceKey{provider: provider.OpenAI, model: "gpt-test"}] = ModelPrice{
+		ID:                      terraPriceID,
+		InputNanoUSDPerMillion:  terraInputNanoPerMillion,
+		OutputNanoUSDPerMillion: terraOutputNanoPerMillion,
+	}
+}
+
+func runSuccessChat(t *testing.T, store *fakeStore, rawKey string, client *fakeProviderClient) {
+	t.Helper()
+	service := newTestService(t, store, client)
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if _, _, err := service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+		Model:    "openai/gpt-test",
+		Messages: []provider.Message{{Role: "user", Content: "hello"}},
+	}); err != nil {
+		t.Fatalf("complete chat: %v", err)
+	}
+}
+
+func TestCompleteChatRecordsPricingIDAndEstimatedCost(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	addTerraPrice(store)
+	runSuccessChat(t, store, rawKey, &fakeProviderClient{result: pricedOpenAIResult()})
+
+	if store.lastFinalize.Status != "succeeded" {
+		t.Fatalf("finalize status = %q", store.lastFinalize.Status)
+	}
+	if store.lastFinalize.PricingID == nil || *store.lastFinalize.PricingID != terraPriceID {
+		t.Fatalf("pricing id = %v, want %s", store.lastFinalize.PricingID, terraPriceID)
+	}
+	if store.lastFinalize.EstimatedCostNanoUSD == nil {
+		t.Fatalf("estimated cost is nil, want calculated value")
+	}
+	// 1000*2e9/1e6 + 2000*12e9/1e6 = 2_000_000 + 24_000_000 nano-USD.
+	if got := *store.lastFinalize.EstimatedCostNanoUSD; got != 26_000_000 {
+		t.Fatalf("estimated cost = %d, want 26000000", got)
+	}
+}
+
+func TestCompleteChatWithoutPriceVersionLeavesCostAttributionNull(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	runSuccessChat(t, store, rawKey, &fakeProviderClient{result: pricedOpenAIResult()})
+
+	if store.lastFinalize.PricingID != nil {
+		t.Fatalf("pricing id = %v, want nil when no price version is effective", store.lastFinalize.PricingID)
+	}
+	if store.lastFinalize.EstimatedCostNanoUSD != nil {
+		t.Fatalf("estimated cost = %v, want nil", store.lastFinalize.EstimatedCostNanoUSD)
+	}
+}
+
+func TestCompleteChatKeepsPricingIDWhenUsageMissing(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	addTerraPrice(store)
+	client := &fakeProviderClient{result: pricedOpenAIResult()}
+	client.result.Usage = nil
+	client.result.Response.Usage = nil
+	runSuccessChat(t, store, rawKey, client)
+
+	if store.lastFinalize.PricingID == nil || *store.lastFinalize.PricingID != terraPriceID {
+		t.Fatalf("pricing id = %v, want %s (provenance survives missing usage)", store.lastFinalize.PricingID, terraPriceID)
+	}
+	if store.lastFinalize.EstimatedCostNanoUSD != nil {
+		t.Fatalf("estimated cost = %v, want nil when usage is missing", store.lastFinalize.EstimatedCostNanoUSD)
+	}
+}
+
+func TestCompleteChatKeepsPricingIDWhenCalculationOverflows(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	addTerraPrice(store)
+	client := &fakeProviderClient{result: pricedOpenAIResult()}
+	overflowUsage := &provider.Usage{PromptTokens: 1 << 62, CompletionTokens: 0, TotalTokens: 1 << 62}
+	client.result.Usage = overflowUsage
+	client.result.Response.Usage = overflowUsage
+	runSuccessChat(t, store, rawKey, client)
+
+	if store.lastFinalize.PricingID == nil || *store.lastFinalize.PricingID != terraPriceID {
+		t.Fatalf("pricing id = %v, want %s", store.lastFinalize.PricingID, terraPriceID)
+	}
+	if store.lastFinalize.EstimatedCostNanoUSD != nil {
+		t.Fatalf("estimated cost = %v, want nil on calculation failure", store.lastFinalize.EstimatedCostNanoUSD)
+	}
+}
+
+func TestFailedRequestNeverLooksUpPrice(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	addTerraPrice(store)
+	client := &fakeProviderClient{err: &provider.Error{Category: provider.ProviderUnavailable, StatusCode: http.StatusServiceUnavailable, Message: "boom"}}
+	service := newTestService(t, store, client)
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if _, _, err := service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+		Model:    "openai/gpt-test",
+		Messages: []provider.Message{{Role: "user", Content: "hello"}},
+	}); err == nil {
+		t.Fatalf("complete chat succeeded, want provider error")
+	}
+	if store.lastFinalize.Status != "failed" {
+		t.Fatalf("finalize status = %q, want failed", store.lastFinalize.Status)
+	}
+	if store.lastFinalize.PricingID != nil || store.lastFinalize.EstimatedCostNanoUSD != nil {
+		t.Fatalf("failed request recorded cost attribution: %+v", store.lastFinalize)
+	}
+}
+
+func TestPriceLookupErrorStillFinalizesSuccessfullyWithoutCost(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	addTerraPrice(store)
+	store.priceLookupErr = errors.New("db unavailable")
+	runSuccessChat(t, store, rawKey, &fakeProviderClient{result: pricedOpenAIResult()})
+
+	if store.lastFinalize.Status != "succeeded" {
+		t.Fatalf("finalize status = %q, want succeeded (pricing must never fail the request)", store.lastFinalize.Status)
+	}
+	if store.lastFinalize.PricingID != nil || store.lastFinalize.EstimatedCostNanoUSD != nil {
+		t.Fatalf("cost attribution recorded despite price lookup error: %+v", store.lastFinalize)
+	}
+}
+
+func TestStreamChatRecordsPricingIDAndEstimatedCostAtDone(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	addTerraPrice(store)
+	usage := &provider.Usage{PromptTokens: 500, CompletionTokens: 250, TotalTokens: 750}
+	client := &fakeProviderClient{streamFactory: func(ctx context.Context) (provider.StreamResult, error) {
+		return provider.StreamResult{Stream: &fakeChatStream{
+			events: []provider.StreamEvent{{Data: []byte(`chunk`), Event: "chat.completion.chunk"}, {Done: true}},
+			usage:  usage,
+		}, UpstreamStatus: http.StatusOK}, nil
+	}}
+	service := newTestService(t, store, client)
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	_, err = service.StreamChat(context.Background(), auth, "", provider.ChatRequest{
+		Model:    "openai/gpt-test",
+		Messages: []provider.Message{{Role: "user", Content: "hello"}},
+	}, &recordingStreamSink{})
+	if err != nil {
+		t.Fatalf("stream chat: %v", err)
+	}
+	if store.lastFinalize.PricingID == nil || *store.lastFinalize.PricingID != terraPriceID {
+		t.Fatalf("pricing id = %v, want %s", store.lastFinalize.PricingID, terraPriceID)
+	}
+	// 500*2e9/1e6 + 250*12e9/1e6 = 1_000_000 + 3_000_000 nano-USD.
+	if got := *store.lastFinalize.EstimatedCostNanoUSD; got != 4_000_000 {
+		t.Fatalf("estimated cost = %d, want 4000000", got)
 	}
 }
