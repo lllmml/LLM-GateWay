@@ -606,7 +606,7 @@ func (q *Queries) UsageSummaryForOwner(ctx context.Context, arg UsageSummaryForO
 
 const usageTimeseriesForOwnerDay = `-- name: UsageTimeseriesForOwnerDay :many
 SELECT
-    buckets.ts::timestamptz AS ts,
+    (buckets.ts AT TIME ZONE 'UTC')::timestamptz AS ts,
     COALESCE(a.requests_total, 0)::bigint AS requests_total,
     COALESCE(a.requests_succeeded, 0)::bigint AS requests_succeeded,
     COALESCE(a.requests_failed, 0)::bigint AS requests_failed,
@@ -617,13 +617,13 @@ SELECT
     COALESCE(a.total_tokens, 0)::bigint AS total_tokens,
     COALESCE(a.estimated_cost_nano_usd, 0)::bigint AS estimated_cost_nano_usd
 FROM generate_series(
-    date_trunc('day', ($1::timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
-    date_trunc('day', (($2::timestamptz) - interval '1 microsecond') AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+    date_trunc('day', ($1::timestamptz) AT TIME ZONE 'UTC'),
+    date_trunc('day', (($2::timestamptz) - interval '1 microsecond') AT TIME ZONE 'UTC'),
     interval '1 day'
 ) AS buckets(ts)
 LEFT JOIN (
     SELECT
-        date_trunc('day', (r.started_at AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC' AS ts,
+        date_trunc('day', (r.started_at AT TIME ZONE 'UTC')) AS ts,
         count(*)::bigint AS requests_total,
         count(*) FILTER (WHERE r.status = 'succeeded')::bigint AS requests_succeeded,
         count(*) FILTER (WHERE r.status = 'failed')::bigint AS requests_failed,
@@ -665,6 +665,15 @@ type UsageTimeseriesForOwnerDayRow struct {
 	EstimatedCostNanoUsd int64
 }
 
+// Bucket alignment is computed on timestamp-without-time-zone values that are
+// the UTC wall-clock of each instant (x AT TIME ZONE 'UTC'). Stepping a
+// timezone-less timestamp series is pure arithmetic, so it can never be
+// affected by the session TimeZone or DST (unlike the timestamptz
+// generate_series overload, whose interval steps follow the session zone and
+// would drift to 01:00Z/23:00Z across a transition such as the 2026-11-01
+// America/Los_Angeles fall-back). The series and the aggregation use the same
+// UTC expressions and join on equal timestamps; the emitted ts is converted
+// back to timestamptz by interpreting the UTC wall-clock as UTC.
 func (q *Queries) UsageTimeseriesForOwnerDay(ctx context.Context, arg UsageTimeseriesForOwnerDayParams) ([]UsageTimeseriesForOwnerDayRow, error) {
 	rows, err := q.db.Query(ctx, usageTimeseriesForOwnerDay,
 		arg.From,
@@ -703,7 +712,7 @@ func (q *Queries) UsageTimeseriesForOwnerDay(ctx context.Context, arg UsageTimes
 
 const usageTimeseriesForOwnerHour = `-- name: UsageTimeseriesForOwnerHour :many
 SELECT
-    buckets.ts::timestamptz AS ts,
+    (buckets.ts AT TIME ZONE 'UTC')::timestamptz AS ts,
     COALESCE(a.requests_total, 0)::bigint AS requests_total,
     COALESCE(a.requests_succeeded, 0)::bigint AS requests_succeeded,
     COALESCE(a.requests_failed, 0)::bigint AS requests_failed,
@@ -714,13 +723,13 @@ SELECT
     COALESCE(a.total_tokens, 0)::bigint AS total_tokens,
     COALESCE(a.estimated_cost_nano_usd, 0)::bigint AS estimated_cost_nano_usd
 FROM generate_series(
-    date_trunc('hour', ($1::timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
-    date_trunc('hour', (($2::timestamptz) - interval '1 microsecond') AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+    date_trunc('hour', ($1::timestamptz) AT TIME ZONE 'UTC'),
+    date_trunc('hour', (($2::timestamptz) - interval '1 microsecond') AT TIME ZONE 'UTC'),
     interval '1 hour'
 ) AS buckets(ts)
 LEFT JOIN (
     SELECT
-        date_trunc('hour', (r.started_at AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC' AS ts,
+        date_trunc('hour', (r.started_at AT TIME ZONE 'UTC')) AS ts,
         count(*)::bigint AS requests_total,
         count(*) FILTER (WHERE r.status = 'succeeded')::bigint AS requests_succeeded,
         count(*) FILTER (WHERE r.status = 'failed')::bigint AS requests_failed,

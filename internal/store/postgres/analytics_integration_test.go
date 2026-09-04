@@ -771,3 +771,76 @@ func TestUnpricedRequestsKeepTokensButNoCostAndCoverage(t *testing.T) {
 		t.Fatalf("deepseek group tokens = %+v, want reported usage aggregated", deepSeekGroup)
 	}
 }
+
+func TestDayBucketsStayUTCAlignedAcrossDSTTransition(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	pool, _, cleanupPool := newIsolatedPool(t, ctx)
+	defer cleanupPool()
+	applyMigration(t, ctx, pool, "000001_control_plane_foundation.up.sql")
+	applyMigration(t, ctx, pool, "000002_virtual_api_keys.up.sql")
+	applyMigration(t, ctx, pool, "000003_provider_credentials.up.sql")
+	applyMigration(t, ctx, pool, "000004_data_plane_foundation.up.sql")
+	applyMigration(t, ctx, pool, "000005_seed_model_prices.up.sql")
+
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire conn: %v", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, "SET TIME ZONE 'America/Los_Angeles'"); err != nil {
+		t.Fatalf("set session timezone: %v", err)
+	}
+	var zone string
+	if err := conn.QueryRow(ctx, "SHOW TIME ZONE").Scan(&zone); err != nil {
+		t.Fatalf("read session timezone: %v", err)
+	}
+	if zone != "America/Los_Angeles" {
+		t.Fatalf("session timezone = %q, want America/Los_Angeles", zone)
+	}
+	store := &Store{queries: New(conn)}
+	fixture := newAnalyticsFixture(t, ctx, store)
+
+	// US DST ends 2026-11-01 02:00 local (09:00Z): the America/Los_Angeles day
+	// is 25 hours. A timestamptz generate_series stepped in the session zone
+	// drifts after that day (e.g. 2026-11-02T01:00Z); an explicitly UTC series
+	// must keep every bucket at 00:00:00Z.
+	from := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	// One request per UTC day: before, on, and after the transition. The
+	// Nov 2 00:30Z request is the canary for series drift: if the series
+	// missteps to Nov 2 01:00Z the aggregate bucket Nov 2 00:00Z stops joining
+	// and the request would silently vanish (false zero-fill).
+	fixture.insertRequest(t, ctx, time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC), "succeeded", &analyticsTerraPrice, &provider.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}, 0, nil)
+	fixture.insertRequest(t, ctx, time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC), "succeeded", &analyticsTerraPrice, &provider.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}, 0, nil)
+	fixture.insertRequest(t, ctx, time.Date(2026, 11, 2, 0, 30, 0, 0, time.UTC), "succeeded", &analyticsTerraPrice, &provider.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}, 0, nil)
+
+	points, err := usage.NewService(store).Timeseries(ctx, fixture.ownerID, "", "day", &from, &to)
+	if err != nil {
+		t.Fatalf("day timeseries across DST: %v", err)
+	}
+	if len(points) != 3 {
+		t.Fatalf("day points = %d, want 3", len(points))
+	}
+	wantUTC := []time.Time{
+		time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC),
+	}
+	var total int64
+	for i, want := range wantUTC {
+		if !points[i].TS.Equal(want) {
+			t.Fatalf("day bucket %d = %v, want UTC %v (no 23/25-hour drift across DST)", i, points[i].TS, want)
+		}
+		if points[i].TS.Hour() != 0 || points[i].TS.Minute() != 0 {
+			t.Fatalf("day bucket %d = %v, want exactly 00:00Z", i, points[i].TS)
+		}
+		if points[i].RequestsTotal != 1 {
+			t.Fatalf("day bucket %d requests_total = %d, want 1 (requests must join, not be false zero-filled)", i, points[i].RequestsTotal)
+		}
+		total += points[i].RequestsTotal
+	}
+	if total != 3 {
+		t.Fatalf("total requests across buckets = %d, want 3 (no request may be lost)", total)
+	}
+}

@@ -131,7 +131,7 @@ WHERE r.started_at >= sqlc.arg('from')::timestamptz
 
 -- name: UsageTimeseriesForOwnerDay :many
 SELECT
-    buckets.ts::timestamptz AS ts,
+    (buckets.ts AT TIME ZONE 'UTC')::timestamptz AS ts,
     COALESCE(a.requests_total, 0)::bigint AS requests_total,
     COALESCE(a.requests_succeeded, 0)::bigint AS requests_succeeded,
     COALESCE(a.requests_failed, 0)::bigint AS requests_failed,
@@ -141,14 +141,23 @@ SELECT
     COALESCE(a.completion_tokens, 0)::bigint AS completion_tokens,
     COALESCE(a.total_tokens, 0)::bigint AS total_tokens,
     COALESCE(a.estimated_cost_nano_usd, 0)::bigint AS estimated_cost_nano_usd
+-- Bucket alignment is computed on timestamp-without-time-zone values that are
+-- the UTC wall-clock of each instant (x AT TIME ZONE 'UTC'). Stepping a
+-- timezone-less timestamp series is pure arithmetic, so it can never be
+-- affected by the session TimeZone or DST (unlike the timestamptz
+-- generate_series overload, whose interval steps follow the session zone and
+-- would drift to 01:00Z/23:00Z across a transition such as the 2026-11-01
+-- America/Los_Angeles fall-back). The series and the aggregation use the same
+-- UTC expressions and join on equal timestamps; the emitted ts is converted
+-- back to timestamptz by interpreting the UTC wall-clock as UTC.
 FROM generate_series(
-    date_trunc('day', (sqlc.arg('from')::timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
-    date_trunc('day', ((sqlc.arg('to')::timestamptz) - interval '1 microsecond') AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+    date_trunc('day', (sqlc.arg('from')::timestamptz) AT TIME ZONE 'UTC'),
+    date_trunc('day', ((sqlc.arg('to')::timestamptz) - interval '1 microsecond') AT TIME ZONE 'UTC'),
     interval '1 day'
 ) AS buckets(ts)
 LEFT JOIN (
     SELECT
-        date_trunc('day', (r.started_at AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC' AS ts,
+        date_trunc('day', (r.started_at AT TIME ZONE 'UTC')) AS ts,
         count(*)::bigint AS requests_total,
         count(*) FILTER (WHERE r.status = 'succeeded')::bigint AS requests_succeeded,
         count(*) FILTER (WHERE r.status = 'failed')::bigint AS requests_failed,
@@ -171,7 +180,7 @@ ORDER BY buckets.ts ASC;
 
 -- name: UsageTimeseriesForOwnerHour :many
 SELECT
-    buckets.ts::timestamptz AS ts,
+    (buckets.ts AT TIME ZONE 'UTC')::timestamptz AS ts,
     COALESCE(a.requests_total, 0)::bigint AS requests_total,
     COALESCE(a.requests_succeeded, 0)::bigint AS requests_succeeded,
     COALESCE(a.requests_failed, 0)::bigint AS requests_failed,
@@ -182,13 +191,13 @@ SELECT
     COALESCE(a.total_tokens, 0)::bigint AS total_tokens,
     COALESCE(a.estimated_cost_nano_usd, 0)::bigint AS estimated_cost_nano_usd
 FROM generate_series(
-    date_trunc('hour', (sqlc.arg('from')::timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
-    date_trunc('hour', ((sqlc.arg('to')::timestamptz) - interval '1 microsecond') AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+    date_trunc('hour', (sqlc.arg('from')::timestamptz) AT TIME ZONE 'UTC'),
+    date_trunc('hour', ((sqlc.arg('to')::timestamptz) - interval '1 microsecond') AT TIME ZONE 'UTC'),
     interval '1 hour'
 ) AS buckets(ts)
 LEFT JOIN (
     SELECT
-        date_trunc('hour', (r.started_at AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC' AS ts,
+        date_trunc('hour', (r.started_at AT TIME ZONE 'UTC')) AS ts,
         count(*)::bigint AS requests_total,
         count(*) FILTER (WHERE r.status = 'succeeded')::bigint AS requests_succeeded,
         count(*) FILTER (WHERE r.status = 'failed')::bigint AS requests_failed,
