@@ -39,7 +39,7 @@ export function costCoverageDetail(state: CostCoverageState, priced: number, unp
     case "partial":
       return `partial — ${priced} priced · ${unpriced} unpriced`;
     case "unpriced":
-      return "unpriced — no attributed cost (Week 7 has no DeepSeek price versions)";
+      return "unpriced — no attributed base-rate cost";
     case "not_estimated":
       return "not estimated — failed-only requests are not priced";
     default:
