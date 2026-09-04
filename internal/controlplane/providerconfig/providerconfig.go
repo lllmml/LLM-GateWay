@@ -48,10 +48,14 @@ func (s *Service) UpsertDeepSeek(ctx context.Context, ownerUserID, projectID, cr
 	return s.upsert(ctx, ownerUserID, projectID, "deepseek", credentialID, enabled)
 }
 
+func (s *Service) UpsertAnthropic(ctx context.Context, ownerUserID, projectID, credentialID string, enabled bool) (Config, error) {
+	return s.upsert(ctx, ownerUserID, projectID, "anthropic", credentialID, enabled)
+}
+
 func (s *Service) upsert(ctx context.Context, ownerUserID, projectID, provider, credentialID string, enabled bool) (Config, error) {
 	cleanProvider := strings.TrimSpace(strings.ToLower(provider))
-	if cleanProvider != "openai" && cleanProvider != "deepseek" {
-		return Config{}, &ValidationError{Field: "provider", Message: "must be openai or deepseek in this milestone"}
+	if cleanProvider != "openai" && cleanProvider != "deepseek" && cleanProvider != "anthropic" {
+		return Config{}, &ValidationError{Field: "provider", Message: "must be openai, anthropic, or deepseek"}
 	}
 	cleanCredentialID := strings.TrimSpace(credentialID)
 	if cleanCredentialID == "" {

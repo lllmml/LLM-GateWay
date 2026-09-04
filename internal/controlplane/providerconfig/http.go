@@ -25,6 +25,7 @@ func NewHandler(service *Service, currentUserID CurrentUserID) *Handler {
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/v1/projects/{projectID}/provider-configs/openai", h.upsertOpenAI)
 	mux.HandleFunc("PUT /api/v1/projects/{projectID}/provider-configs/deepseek", h.upsertDeepSeek)
+	mux.HandleFunc("PUT /api/v1/projects/{projectID}/provider-configs/anthropic", h.upsertAnthropic)
 }
 
 func (h *Handler) upsertOpenAI(response http.ResponseWriter, request *http.Request) {
@@ -36,6 +37,12 @@ func (h *Handler) upsertOpenAI(response http.ResponseWriter, request *http.Reque
 func (h *Handler) upsertDeepSeek(response http.ResponseWriter, request *http.Request) {
 	h.upsert(response, request, func(ctx context.Context, ownerUserID, projectID, credentialID string, enabled bool) (Config, error) {
 		return h.service.UpsertDeepSeek(ctx, ownerUserID, projectID, credentialID, enabled)
+	})
+}
+
+func (h *Handler) upsertAnthropic(response http.ResponseWriter, request *http.Request) {
+	h.upsert(response, request, func(ctx context.Context, ownerUserID, projectID, credentialID string, enabled bool) (Config, error) {
+		return h.service.UpsertAnthropic(ctx, ownerUserID, projectID, credentialID, enabled)
 	})
 }
 

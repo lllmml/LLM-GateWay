@@ -190,9 +190,10 @@ func (c *Client) buildRequest(chat provider.ChatRequest, credential provider.Cre
 		model = parsed.Model
 	}
 	body := oaiwire.Request{
-		Model:    model,
-		Messages: make([]oaiwire.RequestMessage, 0, len(chat.Messages)),
-		Stream:   stream,
+		Model:     model,
+		Messages:  make([]oaiwire.RequestMessage, 0, len(chat.Messages)),
+		Stream:    stream,
+		MaxTokens: chat.MaxTokens,
 	}
 	if stream {
 		body.StreamOptions = &oaiwire.StreamOptions{IncludeUsage: true}
