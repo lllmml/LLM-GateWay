@@ -70,16 +70,20 @@ INSERT INTO model_prices (id, provider, model, input_nano_usd_per_million, outpu
     '2026-07-24T00:00:00Z', NULL,
     'Official: anthropic.com/news/claude-opus-5 (2026-07-24, "priced at $5 per million input tokens and $25 per million output tokens") and anthropic.com/pricing (snapshot 2026-09-05). Price effective from 2026-07-24 (00:00 UTC). Base-rate estimate only.'
 ),
--- Anthropic claude-sonnet-5: $2.00 / $10.00 per MTok INTRODUCTORY pricing per
--- anthropic.com/news/claude-sonnet-5 (2026-06-30). Intro end date is not
--- published; when it ends, insert a new row and close this window
--- (effective_to = new effective_from). API ID from docs.anthropic.com.
+-- Anthropic claude-sonnet-5: $2.00 / $10.00 per MTok. Priced at this level at
+-- launch (anthropic.com/news/claude-sonnet-5, 2026-06-30) and made PERMANENT on
+-- 2026-08-10 per the article changelog ("Sonnet 5's introductory pricing of $2
+-- per million input tokens and $10 per million output tokens is now permanent;
+-- the standard pricing of $3 input / $15 output previously set to take effect
+-- September 1 no longer applies"). No separate price version exists: the
+-- numeric price never changed, so this single row is still in force.
+-- API ID from docs.anthropic.com.
 (
     'd1b2e13c-0d50-4ff7-af55-d12de65b2a13',
     'anthropic', 'claude-sonnet-5',
     2000000000, 10000000000,
     '2026-06-30T00:00:00Z', NULL,
-    'Official: anthropic.com/news/claude-sonnet-5 (2026-06-30, "priced at $2 per million input tokens and $10 per million output tokens"; introductory) and anthropic.com/pricing (snapshot 2026-09-05). Price effective from 2026-06-30 (00:00 UTC). Base-rate estimate only.'
+    'Official: anthropic.com/news/claude-sonnet-5 (2026-06-30 launch price; article changelog 2026-08-10: $2/$10 made permanent, previously scheduled $3/$15 change cancelled) and anthropic.com/pricing (snapshot 2026-09-05). Price effective from 2026-06-30 (00:00 UTC). Base-rate estimate only.'
 ),
 -- Anthropic claude-haiku-4-5 (API ID claude-haiku-4-5-20251001): $1.00 / $5.00
 -- per MTok per anthropic.com/news/claude-haiku-4-5 (2025-10-15, "Pricing is

@@ -91,15 +91,20 @@ missing billing dimensions); no schema is changed for it this week.
 
 - Time is UTC. Windows are half-open `[from, to)`. Usage endpoints default to a
   30-day window and enforce a 90-day maximum span.
-- Timeseries buckets align to `date_trunc(bucket, from)` via `generate_series`;
-  first and last buckets may be partial; empty buckets are zero-filled
-  server-side. `from` need not sit on a bucket boundary.
+- Timeseries buckets align to `date_trunc(bucket, from)` via `generate_series`
+  and are computed in explicit UTC (`AT TIME ZONE 'UTC'` on both the series and
+  the aggregated `started_at`), so results never depend on the PostgreSQL
+  session TimeZone. First and last buckets may be partial; empty buckets are
+  zero-filled server-side. `from` need not sit on a bucket boundary.
 - Request history is ordered `started_at DESC, id DESC` with an opaque keyset
   cursor. On a static dataset pagination is deterministic with no duplicates or
   gaps; concurrent inserts keep reasonable keyset behavior but no database
   snapshot isolation is promised (no snapshot mechanism is introduced).
-- Summary exposes `priced_requests` / `unpriced_requests` so cost coverage is
-  visible; cost and token sums aggregate only attributed (priced) rows.
+- Aggregation semantics: request counts include every matching row; token sums
+  include every reported non-null usage regardless of pricing; estimated cost
+  sums only succeed rows with an attributed cost. `priced_requests` /
+  `unpriced_requests` coverage (summary, timeseries, and breakdown) explains
+  cost completeness so an unpriced bucket/group is never shown as $0.00.
 - Breakdown dimensions are an explicit allowlist: `provider`, `model`, `key`.
 - Every analytics query is ownership-scoped in SQL through
   `projects.owner_user_id`. Another owner's request and a nonexistent request
@@ -108,9 +113,10 @@ missing billing dimensions); no schema is changed for it this week.
   verified 2026-09-05 from official sources: OpenAI `gpt-6-astra` (2026-09-03),
   `gpt-5.6-terra`/`gpt-5.6-luna` (2026-07-30 price cut), Anthropic
   `claude-fable-5-1` (2026-09-01), `claude-opus-5` (2026-07-24),
-  `claude-sonnet-5` (2026-06-30, introductory), `claude-haiku-4-5-20251001`
-  (2025-10-15). Test fixtures (`gpt-test`, `deepseek-chat`, `claude-sonnet-x`)
-  are not in the seed.
+  `claude-sonnet-5` (2026-06-30; $2/$10 made permanent 2026-08-10 per the
+  official article changelog), `claude-haiku-4-5-20251001` (2025-10-15). Test
+  fixtures (`gpt-test`, `deepseek-chat`, `claude-sonnet-x`) are not in the
+  seed.
 
 ## Consequences
 
@@ -118,8 +124,10 @@ missing billing dimensions); no schema is changed for it this week.
 - DeepSeek requests show no cost until a later schema iteration lands.
 - Catalog price changes require a new migration that closes the old window and
   re-runs the overlap validator.
-- Sonnet 5 introductory pricing has no published end date; when it ends the
-  catalog must be updated (recorded as a maintenance point).
+- Sonnet 5's $2/$10 price is permanent: the official article changelog
+  (2026-08-10) cancelled the previously scheduled $3/$15 change, so no window
+  close is needed. A genuine future price change still requires a new row that
+  closes this window.
 - Requests whose model has no seed row still succeed; they are simply
   unpriced.
 
