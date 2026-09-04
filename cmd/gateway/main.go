@@ -7,8 +7,12 @@ import (
 	"os/signal"
 	"syscall"
 
+	"golang.org/x/oauth2"
+
 	"github.com/lllmml/production-go-llm-gateway/internal/app"
 	"github.com/lllmml/production-go-llm-gateway/internal/config"
+	"github.com/lllmml/production-go-llm-gateway/internal/controlplane"
+	"github.com/lllmml/production-go-llm-gateway/internal/security"
 	"github.com/lllmml/production-go-llm-gateway/internal/store/postgres"
 	"github.com/lllmml/production-go-llm-gateway/internal/telemetry"
 )
@@ -35,12 +39,46 @@ func run() error {
 		return err
 	}
 
+	authHandler, err := controlplane.NewAuthHandler(controlplane.AuthConfig{
+		OAuth: oauth2.Config{
+			ClientID:     cfg.GitHubClientID,
+			ClientSecret: cfg.GitHubClientSecret,
+			RedirectURL:  cfg.PublicConsoleURL + "/auth/github/callback",
+		},
+		PublicConsoleURL:   cfg.PublicConsoleURL,
+		SessionTokenPepper: cfg.SessionTokenPepper,
+		SecureCookies:      cfg.SecureCookies,
+	}, database, database)
+	if err != nil {
+		database.Close()
+		return fmt.Errorf("configure control-plane authentication: %w", err)
+	}
+	credentialCipher, err := security.NewCredentialCipher(cfg.CredentialMasterKey)
+	clear(cfg.CredentialMasterKey)
+	if err != nil {
+		database.Close()
+		return fmt.Errorf("configure provider credential encryption: %w", err)
+	}
+	controlPlaneHandler, err := controlplane.NewHandler(
+		authHandler,
+		database,
+		database,
+		cfg.VirtualKeyPepper,
+		database,
+		credentialCipher,
+	)
+	if err != nil {
+		database.Close()
+		return fmt.Errorf("configure control plane: %w", err)
+	}
+
 	application := app.New(app.Options{
-		DataPlaneAddr:    cfg.DataPlaneAddr,
-		ControlPlaneAddr: cfg.ControlPlaneAddr,
-		OpsAddr:          cfg.OpsAddr,
-		ReadinessTimeout: cfg.ReadinessTimeout,
-		ShutdownTimeout:  cfg.ShutdownTimeout,
+		DataPlaneAddr:       cfg.DataPlaneAddr,
+		ControlPlaneAddr:    cfg.ControlPlaneAddr,
+		OpsAddr:             cfg.OpsAddr,
+		ReadinessTimeout:    cfg.ReadinessTimeout,
+		ShutdownTimeout:     cfg.ShutdownTimeout,
+		ControlPlaneHandler: controlPlaneHandler,
 	}, database, logger)
 
 	runCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

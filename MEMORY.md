@@ -4,10 +4,10 @@ Update this after major decisions, completed phases, or bugs that future agents 
 
 ## Current State
 
-- Current task: Week 1 HTTP foundation is implemented and fully verified.
-- Current phase: Prepare Week 2 Control Plane Core.
-- Next step: Propose a bounded Week 2 plan covering the initial schema/migrations, GitHub auth/session boundary, project ownership, and their tests before implementation.
-- Blocked by: None. Default port `:8080` was occupied during local verification; use address overrides or identify the owner before using defaults.
+- Current task: PR #1 commit 7 review findings are fixed; credential identity binding, pairwise key separation, canonical Vite port enforcement, and dev child supervision pass automated/runtime checks.
+- Current phase: Week 2 Control Plane Core implementation is complete; its manual visual acceptance check remains.
+- Next step: Review the console at desktop and mobile widths, then propose the bounded Week 3 first-provider/non-streaming foundation plan.
+- Blocked by: This agent environment has no browser runtime, so the required visual desktop/mobile check could not be executed. Default port `:8080` remains occupied; use address overrides or identify its owner before using defaults.
 
 ## Decisions
 
@@ -19,6 +19,17 @@ Update this after major decisions, completed phases, or bugs that future agents 
 - 2026-08-28: Use Go 1.26 and module path `github.com/lllmml/production-go-llm-gateway` as explicitly approved by the project owner.
 - 2026-08-28: Pin local PostgreSQL to `postgres:18.6-alpine3.24`, `pgx/v5` to v5.10.0, and the PostgreSQL-only `golang-migrate` CLI to v4.19.1.
 - 2026-08-28: Require Go 1.26.7 and `golang.org/x/text` v0.39.0 to clear reachable standard-library and text-processing vulnerabilities; `x/sync` v0.21.0 is the required transitive update.
+- 2026-08-28: Pin `sqlc` to v1.31.1 for explicit PostgreSQL query generation and `golang.org/x/oauth2` to v0.36.0 for GitHub Authorization Code exchange.
+- 2026-08-28: GitHub login uses no requested scopes, validates one-time random state, and uses S256 PKCE; each login re-fetches `/user`, and the provider access token is not persisted.
+- 2026-08-28: Web sessions use random tokens stored only as HMAC-SHA256 digests with a 32-byte pepper; production cookies require HTTPS while loopback HTTP remains available for local development.
+- 2026-08-28: The MVP tenant boundary is enforced by ownership-scoped PostgreSQL queries using authenticated `owner_user_id`; cross-owner project lookup/update is indistinguishable from not found.
+- 2026-08-28: Virtual API keys use independent random 8-character display prefixes and 256-bit secrets, are shown once, and persist only HMAC-SHA256 digests under a dedicated 32-byte `VIRTUAL_KEY_PEPPER`; disable/revoke mutations remain ownership-scoped and atomic.
+- 2026-08-28: Shared virtual-key format, generation, parsing, and hashing primitives live in `internal/apikey`; Control Plane lifecycle code depends on that package, and future Data Plane authentication must do the same rather than importing Control Plane code.
+- 2026-08-30: Provider credentials use AES-256-GCM with a fresh nonce per encryption and persisted key version `1`; `CREDENTIAL_MASTER_KEY` must decode from standard Base64 to exactly 32 bytes, and metadata APIs never return the secret envelope.
+- 2026-08-30: Provider credential create/list/rotate/disable operations are ownership-scoped; rotation atomically replaces ciphertext/nonce/key-version metadata, while credential deletion, re-enable, live provider validation, and master-key re-encryption remain outside the Week 2 slice.
+- 2026-08-30: The minimal React/Vite console uses same-origin `/api` and `/auth` development proxies, server-side session discovery through `/api/v1/me`, CSRF-protected logout, and placeholder operational routes; full management screens remain later milestones.
+- 2026-08-30: Provider credential AES-GCM envelopes bind a versioned binary AAD context containing credential ID, project ID, provider, and key version; credential IDs are created before encryption, and rotation reloads immutable ownership-scoped metadata before resealing.
+- 2026-08-30: Credential, session, and virtual-key configuration keys must be pairwise distinct. Vite fails fast if canonical port `5173` is occupied, while a `/bin/sh` supervisor uses isolated Linux process groups to terminate and reap both dev process trees.
 
 ## AI / Tooling Decisions
 
@@ -35,6 +46,10 @@ Update this after major decisions, completed phases, or bugs that future agents 
 ## Completed
 
 - [x] Initial scaffold
+- [x] Control Plane users/sessions/projects foundation
+- [x] Virtual API key creation/list/disable/revoke lifecycle
+- [x] Provider credential encrypted create/list/rotate/disable lifecycle
+- [x] Minimal React/Vite control-plane shell
 - [ ] Core data model
 - [ ] Auth
 - [ ] Core MVP flow
