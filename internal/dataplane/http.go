@@ -89,7 +89,8 @@ func decodeChatRequest(response http.ResponseWriter, request *http.Request) (pro
 			Role    string `json:"role"`
 			Content string `json:"content"`
 		} `json:"messages"`
-		Stream *bool `json:"stream,omitempty"`
+		Stream    *bool  `json:"stream,omitempty"`
+		MaxTokens *int64 `json:"max_tokens,omitempty"`
 	}
 	if err := decoder.Decode(&body); err != nil {
 		if strings.HasPrefix(err.Error(), "json: unknown field ") {
@@ -122,7 +123,15 @@ func decodeChatRequest(response http.ResponseWriter, request *http.Request) (pro
 	if body.Stream != nil {
 		stream = *body.Stream
 	}
-	return provider.ChatRequest{Model: model, Messages: messages, Stream: stream}, nil
+	if body.MaxTokens != nil && *body.MaxTokens <= 0 {
+		return provider.ChatRequest{}, errors.New("max_tokens must be a positive integer")
+	}
+	return provider.ChatRequest{
+		Model:     model,
+		Messages:  messages,
+		Stream:    stream,
+		MaxTokens: body.MaxTokens,
+	}, nil
 }
 
 func requestTraceID(request *http.Request) (string, error) {

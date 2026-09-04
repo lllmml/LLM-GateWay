@@ -17,6 +17,7 @@ import (
 
 	"github.com/lllmml/production-go-llm-gateway/internal/apikey"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
+	"github.com/lllmml/production-go-llm-gateway/internal/provider/anthropic"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/deepseek"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/openai"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
@@ -2186,5 +2187,449 @@ func TestHandlerDeepSeekServerSideUpstreamStatusesAreNotClientErrors(t *testing.
 				t.Fatalf("finalized category = %q, want %q", *finalize.params.ErrorCategory, tt.wantType)
 			}
 		})
+	}
+}
+
+func TestAnthropicModelRequiresAnthropicCredentialBeforeUpstream(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t) // openai credential only
+	openAIClient := &fakeProviderClient{}
+	anthropicClient := &fakeProviderClient{}
+	service := newServiceForStoreWithClientsAndTimeouts(t, store, map[provider.Name]provider.Client{
+		provider.OpenAI:    openAIClient,
+		provider.Anthropic: anthropicClient,
+	}, nil, time.Second, time.Second)
+
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	_, _, err = service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+		Model:    "anthropic/claude-sonnet-x",
+		Messages: []provider.Message{{Role: "user", Content: "hello"}},
+	})
+	gatewayErr, ok := err.(*GatewayError)
+	if !ok || gatewayErr.Category != provider.ProviderNotConfigured {
+		t.Fatalf("error = %#v, want ProviderNotConfigured", err)
+	}
+	if store.createCalls != 0 {
+		t.Fatalf("create calls = %d, want 0 (no paid upstream work without credential)", store.createCalls)
+	}
+	if anthropicClient.calls != 0 || openAIClient.calls != 0 {
+		t.Fatalf("provider calls: anthropic=%d openai=%d, want 0", anthropicClient.calls, openAIClient.calls)
+	}
+}
+
+func TestCrossProviderServiceRoutesAnthropicToAnthropicAdapter(t *testing.T) {
+	store, rawKey := newMultiProviderAuthorizedStore(t, provider.OpenAI, provider.Anthropic)
+	openAIClient := &fakeProviderClient{
+		result: provider.Result{
+			Response: provider.ChatResponse{ID: "openai-result", Object: "chat.completion", Model: "gpt-test"},
+			Usage:    &provider.Usage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+		},
+	}
+	anthropicClient := &fakeProviderClient{
+		result: provider.Result{
+			Response: provider.ChatResponse{
+				ID:      "msg_anthropic_result",
+				Object:  "chat.completion",
+				Model:   "claude-sonnet-x",
+				Choices: []provider.Choice{{Index: 0, Message: provider.ResponseMessage{Role: "assistant", Content: "ok"}}},
+			},
+			Usage:             &provider.Usage{PromptTokens: 17, CompletionTokens: 9, TotalTokens: 26},
+			UpstreamStatus:    http.StatusOK,
+			UpstreamRequestID: "req_anthropic",
+		},
+	}
+	service := newServiceForStoreWithClientsAndTimeouts(t, store, map[provider.Name]provider.Client{
+		provider.OpenAI:    openAIClient,
+		provider.Anthropic: anthropicClient,
+	}, nil, time.Second, time.Second)
+
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	result, record, err := service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+		Model:    "anthropic/claude-sonnet-x",
+		Messages: []provider.Message{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("complete chat: %v", err)
+	}
+	if record.Provider != provider.Anthropic || record.Model != "claude-sonnet-x" || record.ID != testRequestID {
+		t.Fatalf("record = %+v", record)
+	}
+	if result.Response.ID != "msg_anthropic_result" {
+		t.Fatalf("result = %+v", result)
+	}
+	if openAIClient.calls != 0 {
+		t.Fatalf("openai provider calls = %d, want 0", openAIClient.calls)
+	}
+	if anthropicClient.calls != 1 {
+		t.Fatalf("anthropic provider calls = %d, want 1", anthropicClient.calls)
+	}
+	if anthropicClient.lastChat.Model != "claude-sonnet-x" {
+		t.Fatalf("anthropic upstream model = %q", anthropicClient.lastChat.Model)
+	}
+	if store.lastCreate.Provider != provider.Anthropic || store.lastCreate.Model != "claude-sonnet-x" {
+		t.Fatalf("create params = %+v", store.lastCreate)
+	}
+	if store.lastFinalize.Status != "succeeded" || store.lastFinalize.ErrorCategory != nil {
+		t.Fatalf("finalize = %+v", store.lastFinalize)
+	}
+	if store.lastFinalize.TotalTokens == nil || *store.lastFinalize.TotalTokens != 26 {
+		t.Fatalf("finalize usage = %+v", store.lastFinalize)
+	}
+}
+
+func TestHandlerCompleteChatThroughAnthropicClientOverHTTP(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/messages" {
+			t.Fatalf("upstream path = %q", request.URL.Path)
+		}
+		if got := request.Header.Get("x-api-key"); got != "sk-test" {
+			t.Fatalf("upstream x-api-key = %q", got)
+		}
+		if got := request.Header.Get("anthropic-version"); got != "2023-06-01" {
+			t.Fatalf("upstream anthropic-version = %q", got)
+		}
+		if got := request.Header.Get("Accept"); got != "application/json" {
+			t.Fatalf("upstream Accept = %q", got)
+		}
+		rawBody, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		var body struct {
+			Model     string `json:"model"`
+			MaxTokens int64  `json:"max_tokens"`
+			System    string `json:"system"`
+			Stream    bool   `json:"stream"`
+			Messages  []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal(rawBody, &body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		if body.Model != "claude-sonnet-x" || body.Stream {
+			t.Fatalf("upstream body = %+v", body)
+		}
+		if body.System != "You are helpful." {
+			t.Fatalf("upstream system = %q", body.System)
+		}
+		if len(body.Messages) != 1 || body.Messages[0].Role != "user" {
+			t.Fatalf("upstream messages = %+v", body.Messages)
+		}
+		response.Header().Set("Content-Type", "application/json")
+		response.Header().Set("request-id", "req_anthropic_complete")
+		_, _ = response.Write([]byte(`{
+			"id":"msg_01ABC",
+			"type":"message",
+			"role":"assistant",
+			"model":"claude-sonnet-x",
+			"content":[{"type":"text","text":"world"}],
+			"stop_reason":"end_turn",
+			"stop_sequence":null,
+			"usage":{"input_tokens":17,"output_tokens":9}
+		}`))
+	}))
+	defer upstream.Close()
+
+	baseStore, rawKey := newAuthorizedStoreForProvider(t, provider.Anthropic, testCredentialID)
+	baseStore.credential.BaseURLOverride = upstream.URL
+	store := newNotifyingStore(baseStore)
+	service := newServiceForStoreWithClientsAndTimeouts(t, store, map[provider.Name]provider.Client{
+		provider.Anthropic: anthropic.New(upstream.Client()),
+	}, nil, time.Second, time.Second)
+	handler := NewHandler(service)
+	mux := http.NewServeMux()
+	handler.Register(mux)
+	gateway := httptest.NewServer(mux)
+	defer gateway.Close()
+
+	request, err := http.NewRequest(http.MethodPost, gateway.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model":"anthropic/claude-sonnet-x",
+		"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"hello"}]
+	}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response, err := gateway.Client().Do(request)
+	if err != nil {
+		t.Fatalf("gateway request: %v", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status = %d; body=%s", response.StatusCode, body)
+	}
+	if got := response.Header.Get("X-Gateway-Provider"); got != "anthropic" {
+		t.Fatalf("X-Gateway-Provider = %q", got)
+	}
+	var decoded struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage *struct {
+			PromptTokens     int64 `json:"prompt_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+			TotalTokens      int64 `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
+		t.Fatalf("decode gateway response: %v", err)
+	}
+	// The gateway returns an OpenAI-compatible envelope regardless of the
+	// upstream Anthropic wire format.
+	if decoded.ID != "msg_01ABC" || decoded.Object != "chat.completion" || decoded.Model != "claude-sonnet-x" {
+		t.Fatalf("gateway response = %+v", decoded)
+	}
+	if len(decoded.Choices) != 1 || decoded.Choices[0].Message.Content != "world" {
+		t.Fatalf("gateway choices = %+v", decoded.Choices)
+	}
+	if decoded.Usage == nil || decoded.Usage.PromptTokens != 17 || decoded.Usage.CompletionTokens != 9 || decoded.Usage.TotalTokens != 26 {
+		t.Fatalf("gateway usage = %+v", decoded.Usage)
+	}
+	finalize := store.waitFinalize(t)
+	if finalize.params.Status != "succeeded" || finalize.params.ErrorCategory != nil {
+		t.Fatalf("finalize = %+v", finalize.params)
+	}
+	if finalize.params.TotalTokens == nil || *finalize.params.TotalTokens != 26 {
+		t.Fatalf("usage not finalized: %+v", finalize.params)
+	}
+	if finalize.params.UpstreamRequestID == nil || *finalize.params.UpstreamRequestID != "req_anthropic_complete" {
+		t.Fatalf("upstream request ID not finalized: %+v", finalize.params)
+	}
+}
+
+func TestHandlerStreamsThroughAnthropicClientOverHTTP(t *testing.T) {
+	firstContentFlushed := make(chan struct{})
+	releaseRest := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/messages" {
+			t.Fatalf("upstream path = %q", request.URL.Path)
+		}
+		if got := request.Header.Get("Accept"); got != "text/event-stream" {
+			t.Fatalf("upstream Accept = %q", got)
+		}
+		rawBody, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		var body struct {
+			Model  string `json:"model"`
+			Stream bool   `json:"stream"`
+		}
+		if err := json.Unmarshal(rawBody, &body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		if body.Model != "claude-sonnet-x" || !body.Stream {
+			t.Fatalf("upstream body = %+v", body)
+		}
+		response.Header().Set("Content-Type", "text/event-stream")
+		response.Header().Set("request-id", "req_anthropic_stream")
+
+		_, _ = io.WriteString(response, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-x\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":17,\"output_tokens\":1}}}\n\n")
+		_, _ = io.WriteString(response, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n")
+		response.(http.Flusher).Flush()
+		close(firstContentFlushed)
+
+		<-releaseRest
+		_, _ = io.WriteString(response, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":9}}\n\n")
+		_, _ = io.WriteString(response, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+		response.(http.Flusher).Flush()
+	}))
+	defer upstream.Close()
+
+	baseStore, rawKey := newAuthorizedStoreForProvider(t, provider.Anthropic, testCredentialID)
+	baseStore.credential.BaseURLOverride = upstream.URL
+	store := newNotifyingStore(baseStore)
+	service := newServiceForStoreWithClientsAndTimeouts(t, store, map[provider.Name]provider.Client{
+		provider.Anthropic: anthropic.New(upstream.Client()),
+	}, nil, time.Second, time.Second)
+	handler := NewHandler(service)
+	mux := http.NewServeMux()
+	handler.Register(mux)
+	gateway := httptest.NewServer(mux)
+	defer gateway.Close()
+
+	request, err := http.NewRequest(http.MethodPost, gateway.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model":"anthropic/claude-sonnet-x",
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response, err := gateway.Client().Do(request)
+	if err != nil {
+		t.Fatalf("gateway request: %v", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status = %d; body=%s", response.StatusCode, body)
+	}
+	if got := response.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if got := response.Header.Get("X-Gateway-Provider"); got != "anthropic" {
+		t.Fatalf("X-Gateway-Provider = %q", got)
+	}
+	reader := bufio.NewReader(response.Body)
+	firstEvent := readSSEEvent(t, reader)
+	if !strings.Contains(firstEvent, `data: {"id":"msg_stream"`) || !strings.Contains(firstEvent, `"content":"Hello"`) {
+		t.Fatalf("first event = %q", firstEvent)
+	}
+	select {
+	case <-firstContentFlushed:
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not flush first content delta")
+	}
+
+	close(releaseRest)
+	events := firstEvent
+	for !strings.Contains(events, "data: [DONE]\n\n") {
+		events += readSSEEvent(t, reader)
+	}
+	if !strings.Contains(events, `"finish_reason":"stop"`) {
+		t.Fatalf("stream did not include the synthesized finish chunk: %s", events)
+	}
+	finalize := store.waitFinalize(t)
+	if finalize.params.Status != "succeeded" || finalize.params.ErrorCategory != nil {
+		t.Fatalf("finalize = %+v", finalize.params)
+	}
+	if finalize.params.TotalTokens == nil || *finalize.params.TotalTokens != 26 {
+		t.Fatalf("usage not finalized: %+v", finalize.params)
+	}
+	if finalize.params.UpstreamRequestID == nil || *finalize.params.UpstreamRequestID != "req_anthropic_stream" {
+		t.Fatalf("upstream request ID not finalized: %+v", finalize.params)
+	}
+	if finalize.params.TTFTMS == nil {
+		t.Fatalf("TTFT not recorded for the anthropic stream: %+v", finalize.params)
+	}
+}
+
+// The Week 6 public subset gains an optional max_tokens. It is forwarded to
+// OpenAI-compatible providers as-is and omitted from the wire body when the
+// client did not send it.
+func TestHandlerForwardsMaxTokensToOpenAICompatibleProvider(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		request    string
+		wantBody   string
+		wantAbsent bool
+	}{
+		{
+			name:     "explicit max_tokens is forwarded",
+			request:  `{"model":"openai/gpt-test","messages":[{"role":"user","content":"hi"}],"max_tokens":128}`,
+			wantBody: `"max_tokens":128`,
+		},
+		{
+			name:       "absent max_tokens stays off the wire body",
+			request:    `{"model":"openai/gpt-test","messages":[{"role":"user","content":"hi"}]}`,
+			wantAbsent: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				rawBody, err := io.ReadAll(request.Body)
+				if err != nil {
+					t.Fatalf("read upstream body: %v", err)
+				}
+				if tt.wantAbsent {
+					if strings.Contains(string(rawBody), "max_tokens") {
+						t.Fatalf("upstream body contains max_tokens: %s", rawBody)
+					}
+				} else if !strings.Contains(string(rawBody), tt.wantBody) {
+					t.Fatalf("upstream body = %s, want %s", rawBody, tt.wantBody)
+				}
+				response.Header().Set("Content-Type", "application/json")
+				_, _ = response.Write([]byte(`{"id":"chat_1","object":"chat.completion","created":1,"model":"gpt-test","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+			}))
+			defer upstream.Close()
+
+			baseStore, rawKey := newAuthorizedStoreForProvider(t, provider.OpenAI, testCredentialID)
+			baseStore.credential.BaseURLOverride = upstream.URL
+			store := newNotifyingStore(baseStore)
+			service := newServiceForStoreWithClientsAndTimeouts(t, store, map[provider.Name]provider.Client{
+				provider.OpenAI: openai.New(upstream.Client()),
+			}, nil, time.Second, time.Second)
+			handler := NewHandler(service)
+			mux := http.NewServeMux()
+			handler.Register(mux)
+			gateway := httptest.NewServer(mux)
+			defer gateway.Close()
+
+			request, err := http.NewRequest(http.MethodPost, gateway.URL+"/v1/chat/completions", strings.NewReader(tt.request))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+rawKey)
+			response, err := gateway.Client().Do(request)
+			if err != nil {
+				t.Fatalf("gateway request: %v", err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(response.Body)
+				t.Fatalf("status = %d; body=%s", response.StatusCode, body)
+			}
+			store.waitFinalize(t)
+		})
+	}
+}
+
+func TestHandlerRejectsNonPositiveMaxTokensBeforeUpstream(t *testing.T) {
+	for _, raw := range []string{
+		`{"model":"openai/gpt-test","messages":[{"role":"user","content":"hi"}],"max_tokens":0}`,
+		`{"model":"openai/gpt-test","messages":[{"role":"user","content":"hi"}],"max_tokens":-1}`,
+	} {
+		store, rawKey := newAuthorizedStore(t)
+		client := &fakeProviderClient{}
+		service := newServiceForStoreWithClientsAndTimeouts(t, store, map[provider.Name]provider.Client{
+			provider.OpenAI: client,
+		}, nil, time.Second, time.Second)
+		handler := NewHandler(service)
+		mux := http.NewServeMux()
+		handler.Register(mux)
+		gateway := httptest.NewServer(mux)
+
+		request, err := http.NewRequest(http.MethodPost, gateway.URL+"/v1/chat/completions", strings.NewReader(raw))
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+rawKey)
+		response, err := gateway.Client().Do(request)
+		gateway.Close()
+		if err != nil {
+			t.Fatalf("gateway request: %v", err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			body, _ := io.ReadAll(response.Body)
+			t.Fatalf("status = %d, want 400; body=%s", response.StatusCode, body)
+		}
+		if client.calls != 0 {
+			t.Fatalf("provider calls = %d, want 0", client.calls)
+		}
+		if store.createCalls != 0 {
+			t.Fatalf("create calls = %d, want 0", store.createCalls)
+		}
 	}
 }

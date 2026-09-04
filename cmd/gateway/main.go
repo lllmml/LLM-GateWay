@@ -15,6 +15,7 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane"
 	"github.com/lllmml/production-go-llm-gateway/internal/dataplane"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
+	"github.com/lllmml/production-go-llm-gateway/internal/provider/anthropic"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/deepseek"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/openai"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
@@ -83,8 +84,9 @@ func run() error {
 	// transport or client is ever created per request.
 	providerHTTPClient := &http.Client{Transport: openAITransport}
 	providerRegistry, err := provider.NewRegistry(map[provider.Name]provider.Client{
-		provider.OpenAI:   openai.New(providerHTTPClient),
-		provider.DeepSeek: deepseek.New(providerHTTPClient),
+		provider.OpenAI:    openai.New(providerHTTPClient),
+		provider.DeepSeek:  deepseek.New(providerHTTPClient),
+		provider.Anthropic: anthropic.New(providerHTTPClient),
 	})
 	if err != nil {
 		database.Close()

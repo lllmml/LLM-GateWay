@@ -4,17 +4,24 @@ Update this after major decisions, completed phases, or bugs that future agents 
 
 ## Current State
 
-- Current task: Week 5 Provider Abstraction + DeepSeek is implemented and verified: a shared OpenAI-compatible wire layer (`internal/provider/oaiwire`), a DeepSeek adapter with its own stream terminal/usage semantics, openai+deepseek wired into the registry on one shared transport, provider-config deepseek parity in the Control Plane, and cross-provider Data Plane e2e tests against the deterministic mock/httptest providers.
-- Current phase: Week 5 Provider Abstraction + DeepSeek is complete; ready to plan Week 6 Anthropic Adapter.
-- Next step: Propose the bounded Week 6 Anthropic plan (Messages translation, named SSE events, stop/error mapping, token usage extraction) before touching provider interfaces again.
-- Blocked by: None. Real-provider smoke tests remain opt-in and require explicit cost-bearing approval.
+- Current task: Week 6 Anthropic Adapter is implemented and verified: a self-contained Messages API adapter (`internal/provider/anthropic`) that imports neither `oaiwire` nor its wire types (only `provider` + `provider/sse`), named SSE event parsing with synthetic OpenAI-compatible chunk re-encoding and a synthetic `[DONE]` at `message_stop`, stop/error mapping, dual-event usage extraction (input at `message_start`, cumulative output at `message_delta`), anthropic wired into the registry on the shared transport, provider-config anthropic parity in the Control Plane, an optional `max_tokens` public-subset amendment forwarded to all three providers, and cross-provider Data Plane e2e tests against Anthropic-shaped httptest mocks.
+- Current phase: Week 6 Anthropic Adapter is complete; ready to plan Week 7 Usage/Cost/Dashboard.
+- Next step: Propose the bounded Week 7 plan (pricing version table, estimated-cost, request history, usage aggregation, Overview/Usage/Requests UI) before touching the pricing/data model again.
+- Blocked by: None. Real-provider smoke tests remain opt-in and require explicit cost-bearing approval; the Anthropic error-envelope details and request-ID behavior should be confirmed in one approved live smoke test before launch.
 
 ## Decisions
+
+- 2026-09-04: Week 6 adds an optional integer `max_tokens` to the public OpenAI-compatible subset (approved Option 1): `internal/dataplane` decode accepts a positive value and keeps it off the wire when absent; OpenAI/DeepSeek forward it unchanged when present; Anthropic maps it onto its required `max_tokens` and applies a documented gateway default of `4096` (`defaultMaxTokens`) when the client omits it. `max_tokens <= 0` is rejected before any upstream work.
+- 2026-09-04: The Anthropic adapter (`internal/provider/anthropic`) is deliberately independent of `oaiwire`: it posts to `/v1/messages` on `https://api.anthropic.com`, authenticates with `x-api-key` plus the required `anthropic-version: 2023-06-01` (no `Authorization`), hoists `system` messages into the top-level `system` field (`"\n\n"`-joined), and captures the documented `request-id` response header. Contract facts were verified against the official Messages/Streaming/Errors docs and the anthropic-sdk-typescript source fetched 2026-09 (matrix: `docs/provider-capabilities.md`).
+- 2026-09-04: Anthropic streaming requires a bidirectional translation, unlike the OpenAI/DeepSeek byte passthrough: the adapter re-encodes `content_block_delta` text into OpenAI-compatible chunk envelopes, maps `stop_reason` onto OpenAI finish reasons (end_turn→stop, max_tokens/model_context_window_exceeded→length, stop_sequence→stop, tool_use→tool_calls, unknown→""), synthesizes `object`/`created` (Anthropic does not report them), and emits a synthetic `data: [DONE]` only at `message_stop`. Usage is committed only at `[DONE]`: `input_tokens` from `message_start`, cumulative `output_tokens` from `message_delta`; `total_tokens` is computed (Anthropic reports no total).
+- 2026-09-04: Anthropic differences kept explicit in the adapter: unknown named SSE events and non-text deltas (thinking/signature/input_json) are skipped gracefully per Anthropic's versioning policy, while a bare data frame without an event name fails loudly; `event: error` mid-stream classifies by `error.type` (overloaded/api/auth → provider_unavailable, rate_limit → provider_rate_limited). HTTP status mapping is adapter-owned: 400/404/409/413 → provider_invalid_request; 429 → provider_rate_limited; 504/408 → provider_timeout; 401/402/403 and 500/529 → provider_unavailable (server-side conditions never surface as client 400).
+- 2026-09-04: Anthropic `content` is an array of blocks; only `type:"text"` blocks are forwarded (joined without a separator so non-stream equals a stream of text deltas). Non-text blocks never appear because the gateway subset does not request tools/thinking; thinking is intentionally not forwarded, consistent with the DeepSeek `reasoning_content` handling.
+- 2026-09-04: The Control Plane provider-config boundary now accepts `anthropic` (mirror routes under `/provider-configs/{provider}`); the earlier anthropic-rejection test became a reject case for adapter-less providers (e.g. `gemini`). Credential creation already accepted anthropic since Week 2.
 
 - 2026-09-04: OpenAI-compatible wire mechanics (transport tuning, endpoint join/validation, bounded decode, bounded error-body reading, generic envelope message extraction, usage and response validation, shared JSON wire types) live in `internal/provider/oaiwire`; each adapter keeps its base-URL/path constants, request-ID header policy, HTTP status classification, and stream terminal semantics so provider differences stay explicit. The OpenAI adapter tests pass unchanged as the regression gate for the refactor.
 - 2026-09-04: DeepSeek adapter posts to `https://api.deepseek.com/chat/completions` (no `/v1` by default; an override may include it), sends no `stream_options` (official docs: last chunk carries usage either way), and its stream parser accepts usage only on the final content chunk (one choice, empty content, non-null `finish_reason`) before `data: [DONE]`; usage is committed only at `[DONE]`. Contract verified from official docs fetched 2026-09; the capability matrix lives at `docs/provider-capabilities.md`.
 - 2026-09-04: DeepSeek V4 thinking mode defaults on, so provider payloads may carry `reasoning_content`. Non-stream responses are normalized into the OpenAI-compatible `ChatResponse` envelope, which has no reasoning field, so reasoning content is intentionally not forwarded (documented limitation); streaming passes raw chunks through unchanged. Cache-hit/miss and reasoning token breakdowns are not separately persisted (prompt/completion/total only) - revisit when Week 7 pricing decides cache/reasoning pricing.
-- 2026-09-04: Control Plane provider-config upsert supports `openai` and `deepseek` (mirror routes under `/provider-configs/{provider}`); `anthropic` is rejected at the config boundary until its adapter exists in Week 6, even though credential creation already accepts the name.
+- 2026-09-04: Control Plane provider-config upsert supports `openai`, `deepseek`, and since Week 6 `anthropic` (mirror routes under `/provider-configs/{provider}`); an earlier decision rejected `anthropic` at the config boundary until its adapter existed (superseded 2026-09-04). Credential creation has accepted all three names since Week 2.
 - 2026-09-04: HTTP status -> gateway error category mapping is provider-owned and lives in each adapter (`openaiErrorCategory`/`deepSeekErrorCategory`), never in `internal/provider/oaiwire`. 401 (invalid upstream credential) and 402 (billing) mean the configured provider access is unusable, a server-side condition, and map to `provider_unavailable` (not `provider_invalid_request`) so they never surface to clients as HTTP 400. 400/422 map to `provider_invalid_request`, 429 to `provider_rate_limited`, 408/504 to `provider_timeout`, other 5xx to `provider_unavailable`.
 
 - 2026-08-28: Use a Go 1.26 `net/http` modular monolith with separate Data, Control, and private Operations listeners so the architectural boundary is real without premature microservices.
@@ -53,11 +60,11 @@ Update this after major decisions, completed phases, or bugs that future agents 
 
 ## Known Issues
 
+- Anthropic official docs (2026-09) document the error envelope shape and `request-id` header; the exact error-body fields beyond `error.type`/`error.message` and header casing should still be confirmed in an approved live smoke test before launch.
 - Performance targets are intentionally TBD until a reproducible direct-vs-gateway mock-provider baseline exists.
 - Hosting vendor, public domain, request-metadata retention window, and final managed-vs-self-hosted PostgreSQL choice remain implementation-time decisions.
 - Default Data Plane port `:8080` was occupied during local verification; the configurable address overrides were used successfully.
 - DeepSeek official docs (2026-09) document error status codes but not the JSON error envelope or an upstream request-ID header; the adapter uses best-effort generic envelope parsing and `X-Request-ID`. Confirm both in an approved live smoke test before launch.
-- Anthropic adapter does not exist yet (Week 6); provider-config and model namespaces for `anthropic/` currently fail with explicit configuration errors rather than routing.
 
 ## Completed
 
@@ -70,5 +77,6 @@ Update this after major decisions, completed phases, or bugs that future agents 
 - [x] Auth
 - [x] OpenAI streaming core
 - [x] Provider abstraction + DeepSeek adapter
+- [x] Anthropic adapter
 - [ ] Core MVP flow
 - [ ] Launch checks

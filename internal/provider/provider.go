@@ -38,6 +38,11 @@ type ChatRequest struct {
 	Model    string
 	Messages []Message
 	Stream   bool
+	// MaxTokens optionally caps the generated completion. It joined the public
+	// OpenAI-compatible subset in Week 6 because Anthropic's Messages API
+	// requires max_tokens; OpenAI/DeepSeek receive it only when the client
+	// supplied it, and each adapter owns the meaning of its absence.
+	MaxTokens *int64
 }
 
 type Message struct {

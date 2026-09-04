@@ -142,6 +142,9 @@ type Request struct {
 	Messages      []RequestMessage `json:"messages"`
 	Stream        bool             `json:"stream"`
 	StreamOptions *StreamOptions   `json:"stream_options,omitempty"`
+	// MaxTokens is the Week 6 public-subset addition. Omitempty keeps the wire
+	// body byte-identical to Week 5 when the client did not send max_tokens.
+	MaxTokens *int64 `json:"max_tokens,omitempty"`
 }
 
 type RequestMessage struct {

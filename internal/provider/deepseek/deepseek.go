@@ -197,9 +197,10 @@ func (c *Client) buildRequest(chat provider.ChatRequest, credential provider.Cre
 	// DeepSeek intentionally sends no stream_options.include_usage: official
 	// docs state the last chunk carries usage either way.
 	body := oaiwire.Request{
-		Model:    model,
-		Messages: make([]oaiwire.RequestMessage, 0, len(chat.Messages)),
-		Stream:   stream,
+		Model:     model,
+		Messages:  make([]oaiwire.RequestMessage, 0, len(chat.Messages)),
+		Stream:    stream,
+		MaxTokens: chat.MaxTokens,
 	}
 	for _, current := range chat.Messages {
 		body.Messages = append(body.Messages, oaiwire.RequestMessage{Role: current.Role, Content: current.Content})
