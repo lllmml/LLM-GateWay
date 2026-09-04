@@ -41,6 +41,18 @@ func NewService(store Store) (*Service, error) {
 }
 
 func (s *Service) UpsertOpenAI(ctx context.Context, ownerUserID, projectID, credentialID string, enabled bool) (Config, error) {
+	return s.upsert(ctx, ownerUserID, projectID, "openai", credentialID, enabled)
+}
+
+func (s *Service) UpsertDeepSeek(ctx context.Context, ownerUserID, projectID, credentialID string, enabled bool) (Config, error) {
+	return s.upsert(ctx, ownerUserID, projectID, "deepseek", credentialID, enabled)
+}
+
+func (s *Service) upsert(ctx context.Context, ownerUserID, projectID, provider, credentialID string, enabled bool) (Config, error) {
+	cleanProvider := strings.TrimSpace(strings.ToLower(provider))
+	if cleanProvider != "openai" && cleanProvider != "deepseek" {
+		return Config{}, &ValidationError{Field: "provider", Message: "must be openai or deepseek in this milestone"}
+	}
 	cleanCredentialID := strings.TrimSpace(credentialID)
 	if cleanCredentialID == "" {
 		return Config{}, &ValidationError{Field: "credential_id", Message: "is required"}
@@ -48,7 +60,7 @@ func (s *Service) UpsertOpenAI(ctx context.Context, ownerUserID, projectID, cred
 	return s.store.UpsertProviderConfig(ctx, UpsertParams{
 		OwnerUserID:  ownerUserID,
 		ProjectID:    projectID,
-		Provider:     "openai",
+		Provider:     cleanProvider,
 		CredentialID: cleanCredentialID,
 		Enabled:      enabled,
 	})

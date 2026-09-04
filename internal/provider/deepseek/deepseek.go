@@ -1,4 +1,18 @@
-package openai
+// Package deepseek implements the DeepSeek Chat Completions adapter.
+//
+// DeepSeek speaks an OpenAI-compatible wire format, so it shares the stateless
+// mechanics in internal/provider/oaiwire. The adapter keeps the provider-owned
+// differences explicit (see docs/provider-capabilities.md):
+//
+//   - endpoint POST /chat/completions on https://api.deepseek.com (no /v1
+//     prefix; an override may still include one);
+//   - no stream_options sent: official docs state the last stream chunk
+//     carries usage regardless;
+//   - the stream terminal rule differs from OpenAI: usage rides on the final
+//     content chunk (exactly one choice, empty content, non-null
+//     finish_reason) rather than on a dedicated choices=[] chunk;
+//   - request-ID header policy is best-effort via X-Request-ID.
+package deepseek
 
 import (
 	"bytes"
@@ -16,19 +30,10 @@ import (
 )
 
 const (
-	defaultBaseURL      = "https://api.openai.com"
-	chatCompletionsPath = "/v1/chat/completions"
+	defaultBaseURL      = "https://api.deepseek.com"
+	chatCompletionsPath = "/chat/completions"
+	maxStreamEventBytes = oaiwire.MaxStreamEventBytes
 )
-
-// Local aliases so adapter tests keep asserting the same constants.
-const (
-	maxErrorBodyBytes    = oaiwire.MaxErrorBodyBytes
-	maxResponseBodyBytes = oaiwire.MaxResponseBodyBytes
-	maxStreamEventBytes  = oaiwire.MaxStreamEventBytes
-)
-
-// requestBody is the wire request body shared by OpenAI-compatible providers.
-type requestBody = oaiwire.Request
 
 type Client struct {
 	httpClient *http.Client
@@ -78,7 +83,7 @@ func (c *Client) CompleteChat(ctx context.Context, chat provider.ChatRequest, cr
 		}, classifyResponseError(response, upstreamRequestID)
 	}
 
-	bodyBytes, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBodyBytes+1))
+	bodyBytes, err := io.ReadAll(io.LimitReader(response.Body, oaiwire.MaxResponseBodyBytes+1))
 	if err != nil {
 		return provider.Result{UpstreamStatus: response.StatusCode, UpstreamRequestID: upstreamRequestID}, &provider.Error{
 			Category:          provider.ProviderUnavailable,
@@ -87,7 +92,7 @@ func (c *Client) CompleteChat(ctx context.Context, chat provider.ChatRequest, cr
 			Err:               fmt.Errorf("read provider response: %w", err),
 		}
 	}
-	if len(bodyBytes) > maxResponseBodyBytes {
+	if len(bodyBytes) > oaiwire.MaxResponseBodyBytes {
 		return provider.Result{UpstreamStatus: response.StatusCode, UpstreamRequestID: upstreamRequestID}, &provider.Error{
 			Category:          provider.ProviderUnavailable,
 			StatusCode:        response.StatusCode,
@@ -186,16 +191,15 @@ func (c *Client) buildRequest(chat provider.ChatRequest, credential provider.Cre
 	}
 
 	model := chat.Model
-	if parsed, err := provider.ParseModel(chat.Model); err == nil && parsed.Provider == provider.OpenAI {
+	if parsed, err := provider.ParseModel(chat.Model); err == nil && parsed.Provider == provider.DeepSeek {
 		model = parsed.Model
 	}
+	// DeepSeek intentionally sends no stream_options.include_usage: official
+	// docs state the last chunk carries usage either way.
 	body := oaiwire.Request{
 		Model:    model,
 		Messages: make([]oaiwire.RequestMessage, 0, len(chat.Messages)),
 		Stream:   stream,
-	}
-	if stream {
-		body.StreamOptions = &oaiwire.StreamOptions{IncludeUsage: true}
 	}
 	for _, current := range chat.Messages {
 		body.Messages = append(body.Messages, oaiwire.RequestMessage{Role: current.Role, Content: current.Content})
@@ -212,18 +216,22 @@ func chatEndpoint(baseURL string) (string, error) {
 }
 
 func upstreamRequestID(response *http.Response) string {
-	id := response.Header.Get("X-Request-ID")
-	if id == "" {
-		id = response.Header.Get("OpenAI-Request-ID")
-	}
-	return id
+	return response.Header.Get("X-Request-ID")
 }
 
-// classifyResponseError maps a non-2xx OpenAI response onto a stable provider
-// error. The adapter owns this HTTP-status -> category policy: a 401 (bad
-// upstream credential) or 402 (billing) means the gateway's configured
-// provider access is not usable - a server-side condition - not that the
-// client request is malformed, so it must not surface as provider_invalid_request.
+// classifyResponseError maps a non-2xx DeepSeek response onto a stable
+// provider error. The adapter owns this HTTP-status -> category policy, and
+// DeepSeek's documented statuses (400/401/402/422/429/500/503) are mapped
+// explicitly:
+//   - 400/422: malformed/invalid request parameters -> provider_invalid_request
+//   - 429: rate limit -> provider_rate_limited
+//   - 408/504: request timeout -> provider_timeout
+//   - 401 (bad upstream credential) and 402 (insufficient balance): the
+//     gateway's configured provider access is unusable, which is a server-side
+//     condition, not a client request defect. They must NOT become
+//     provider_invalid_request (client HTTP 400); they stay provider_unavailable
+//     until a dedicated category is justified.
+//   - other 5xx: provider_unavailable
 func classifyResponseError(response *http.Response, upstreamRequestID string) error {
 	message := "provider request failed"
 	bodyBytes, tooLarge := oaiwire.ReadBoundedErrorBody(response.Body)
@@ -233,14 +241,14 @@ func classifyResponseError(response *http.Response, upstreamRequestID string) er
 		message = extracted
 	}
 	return &provider.Error{
-		Category:          openAIErrorCategory(response.StatusCode),
+		Category:          deepSeekErrorCategory(response.StatusCode),
 		StatusCode:        response.StatusCode,
 		UpstreamRequestID: upstreamRequestID,
 		Message:           message,
 	}
 }
 
-func openAIErrorCategory(statusCode int) provider.ErrorCategory {
+func deepSeekErrorCategory(statusCode int) provider.ErrorCategory {
 	switch statusCode {
 	case http.StatusTooManyRequests:
 		return provider.ProviderRateLimited
@@ -281,9 +289,10 @@ func responseFromWire(decoded oaiwire.Response) provider.Result {
 	return provider.Result{Response: result, Usage: usage}
 }
 
-// chatStream implements the OpenAI stream terminal rule: final usage arrives
-// on a dedicated chunk with choices==[] and the data: [DONE] message is the
-// only success marker. Usage is committed only when [DONE] is observed.
+// chatStream implements the DeepSeek stream terminal rule: usage rides on the
+// final content chunk (exactly one choice carrying no new content and a
+// non-null finish_reason), and the data: [DONE] message remains the only
+// success marker. Usage is committed only when [DONE] is observed.
 type chatStream struct {
 	body              io.ReadCloser
 	decoder           *sse.Decoder
@@ -376,9 +385,11 @@ func (s *chatStream) Usage() *provider.Usage {
 	return &copied
 }
 
-// validateStreamChunk enforces the OpenAI terminal rule: a usage-bearing chunk
-// must have an empty choices array (the dedicated final usage chunk), while a
-// content chunk must not carry usage and must contain meaningful deltas.
+// validateStreamChunk enforces the DeepSeek terminal rule: usage may only ride
+// on the final content chunk, which carries exactly one choice with no new
+// content and a non-null finish_reason. A chunk that carries usage and still
+// has meaningful content, or an OpenAI-style choices=[] usage chunk, is
+// malformed for this provider.
 func validateStreamChunk(decoded oaiwire.StreamChunk) error {
 	if err := oaiwire.ValidateUsage(decoded.Usage); err != nil {
 		return err
@@ -387,8 +398,15 @@ func validateStreamChunk(decoded oaiwire.StreamChunk) error {
 		return errors.New("provider stream event missing required fields")
 	}
 	if decoded.Usage != nil {
-		if decoded.Choices == nil || len(*decoded.Choices) != 0 {
-			return errors.New("provider stream final usage event must have empty choices")
+		if decoded.Choices == nil || len(*decoded.Choices) != 1 {
+			return errors.New("provider stream final usage event must carry exactly one choice")
+		}
+		choice := (*decoded.Choices)[0]
+		if choice.Delta != nil && choice.Delta.Content != nil && *choice.Delta.Content != "" {
+			return errors.New("provider stream final usage event must not carry new content")
+		}
+		if choice.FinishReason == nil || strings.TrimSpace(*choice.FinishReason) == "" {
+			return errors.New("provider stream final usage event must carry a finish reason")
 		}
 		return nil
 	}

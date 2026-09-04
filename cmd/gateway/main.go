@@ -15,6 +15,7 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane"
 	"github.com/lllmml/production-go-llm-gateway/internal/dataplane"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
+	"github.com/lllmml/production-go-llm-gateway/internal/provider/deepseek"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/openai"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
 	"github.com/lllmml/production-go-llm-gateway/internal/store/postgres"
@@ -78,9 +79,12 @@ func run() error {
 	}
 	openAITransport := openai.NewTransport()
 	defer openAITransport.CloseIdleConnections()
-	openAIHTTPClient := &http.Client{Transport: openAITransport}
+	// One long-lived transport is shared by every provider adapter; no
+	// transport or client is ever created per request.
+	providerHTTPClient := &http.Client{Transport: openAITransport}
 	providerRegistry, err := provider.NewRegistry(map[provider.Name]provider.Client{
-		provider.OpenAI: openai.New(openAIHTTPClient),
+		provider.OpenAI:   openai.New(providerHTTPClient),
+		provider.DeepSeek: deepseek.New(providerHTTPClient),
 	})
 	if err != nil {
 		database.Close()

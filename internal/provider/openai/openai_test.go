@@ -92,6 +92,45 @@ func TestCompleteChatClassifiesProviderError(t *testing.T) {
 	}
 }
 
+// OpenAI 401 means the configured upstream credential is invalid, a
+// server-side condition of the gateway's provider access rather than a client
+// request defect. The adapter therefore reports provider_unavailable (gateway
+// 502), not provider_invalid_request (client 400). This pins the provider-owned
+// status classification introduced by the error-policy boundary fix.
+func TestCompleteChatClassifiesAuthenticationFailureAsProviderUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("OpenAI-Request-ID", "req_401")
+		response.WriteHeader(http.StatusUnauthorized)
+		_, _ = response.Write([]byte(`{"error":{"message":"Incorrect API key provided","type":"invalid_request_error","code":"invalid_api_key"},"extra":"secret-raw-provider-body-xyz"}`))
+	}))
+	defer server.Close()
+
+	result, err := New(server.Client()).CompleteChat(
+		context.Background(),
+		provider.ChatRequest{Model: "openai/gpt-test"},
+		provider.Credential{APIKey: []byte("sk-test"), BaseURLOverride: server.URL},
+	)
+	if err == nil {
+		t.Fatal("CompleteChat returned nil error")
+	}
+	providerErr, ok := provider.AsError(err)
+	if !ok {
+		t.Fatalf("error type = %T", err)
+	}
+	if providerErr.Category != provider.ProviderUnavailable {
+		t.Fatalf("category = %q, want %q; error=%+v", providerErr.Category, provider.ProviderUnavailable, providerErr)
+	}
+	if providerErr.Message != "Incorrect API key provided" {
+		t.Fatalf("message = %q", providerErr.Message)
+	}
+	if strings.Contains(err.Error(), "secret-raw-provider-body-xyz") {
+		t.Fatalf("raw provider body leaked through error: %v", err)
+	}
+	if result.UpstreamStatus != http.StatusUnauthorized || result.UpstreamRequestID != "req_401" {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
 func TestCompleteChatRejectsMultipleJSONValues(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		response.WriteHeader(http.StatusOK)

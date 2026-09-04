@@ -4,13 +4,18 @@ Update this after major decisions, completed phases, or bugs that future agents 
 
 ## Current State
 
-- Current task: Week 4 Streaming Core is implemented and verified with bounded OpenAI SSE parsing, synchronous Data Plane streaming, TTFT persistence, deterministic mock streaming cases, and real HTTP streaming/cancellation/shutdown tests.
-- Current phase: Week 4 Streaming Core is complete.
-- Week 3 PR2 review fix: provider registry now supports dynamic provider namespaces, X-Request-ID/UUID trace propagation is preserved, and the stream flag reaches the service while SSE handling remains deferred to Week 4.
-- Next step: Propose the bounded Week 5 Provider Abstraction + DeepSeek plan before changing provider interfaces or adding a second provider execution path.
+- Current task: Week 5 Provider Abstraction + DeepSeek is implemented and verified: a shared OpenAI-compatible wire layer (`internal/provider/oaiwire`), a DeepSeek adapter with its own stream terminal/usage semantics, openai+deepseek wired into the registry on one shared transport, provider-config deepseek parity in the Control Plane, and cross-provider Data Plane e2e tests against the deterministic mock/httptest providers.
+- Current phase: Week 5 Provider Abstraction + DeepSeek is complete; ready to plan Week 6 Anthropic Adapter.
+- Next step: Propose the bounded Week 6 Anthropic plan (Messages translation, named SSE events, stop/error mapping, token usage extraction) before touching provider interfaces again.
 - Blocked by: None. Real-provider smoke tests remain opt-in and require explicit cost-bearing approval.
 
 ## Decisions
+
+- 2026-09-04: OpenAI-compatible wire mechanics (transport tuning, endpoint join/validation, bounded decode, bounded error-body reading, generic envelope message extraction, usage and response validation, shared JSON wire types) live in `internal/provider/oaiwire`; each adapter keeps its base-URL/path constants, request-ID header policy, HTTP status classification, and stream terminal semantics so provider differences stay explicit. The OpenAI adapter tests pass unchanged as the regression gate for the refactor.
+- 2026-09-04: DeepSeek adapter posts to `https://api.deepseek.com/chat/completions` (no `/v1` by default; an override may include it), sends no `stream_options` (official docs: last chunk carries usage either way), and its stream parser accepts usage only on the final content chunk (one choice, empty content, non-null `finish_reason`) before `data: [DONE]`; usage is committed only at `[DONE]`. Contract verified from official docs fetched 2026-09; the capability matrix lives at `docs/provider-capabilities.md`.
+- 2026-09-04: DeepSeek V4 thinking mode defaults on, so provider payloads may carry `reasoning_content`. Non-stream responses are normalized into the OpenAI-compatible `ChatResponse` envelope, which has no reasoning field, so reasoning content is intentionally not forwarded (documented limitation); streaming passes raw chunks through unchanged. Cache-hit/miss and reasoning token breakdowns are not separately persisted (prompt/completion/total only) - revisit when Week 7 pricing decides cache/reasoning pricing.
+- 2026-09-04: Control Plane provider-config upsert supports `openai` and `deepseek` (mirror routes under `/provider-configs/{provider}`); `anthropic` is rejected at the config boundary until its adapter exists in Week 6, even though credential creation already accepts the name.
+- 2026-09-04: HTTP status -> gateway error category mapping is provider-owned and lives in each adapter (`openaiErrorCategory`/`deepSeekErrorCategory`), never in `internal/provider/oaiwire`. 401 (invalid upstream credential) and 402 (billing) mean the configured provider access is unusable, a server-side condition, and map to `provider_unavailable` (not `provider_invalid_request`) so they never surface to clients as HTTP 400. 400/422 map to `provider_invalid_request`, 429 to `provider_rate_limited`, 408/504 to `provider_timeout`, other 5xx to `provider_unavailable`.
 
 - 2026-08-28: Use a Go 1.26 `net/http` modular monolith with separate Data, Control, and private Operations listeners so the architectural boundary is real without premature microservices.
 - 2026-08-28: Use PostgreSQL as the durable source of truth; create the request lifecycle record before starting paid upstream work.
@@ -51,6 +56,8 @@ Update this after major decisions, completed phases, or bugs that future agents 
 - Performance targets are intentionally TBD until a reproducible direct-vs-gateway mock-provider baseline exists.
 - Hosting vendor, public domain, request-metadata retention window, and final managed-vs-self-hosted PostgreSQL choice remain implementation-time decisions.
 - Default Data Plane port `:8080` was occupied during local verification; the configurable address overrides were used successfully.
+- DeepSeek official docs (2026-09) document error status codes but not the JSON error envelope or an upstream request-ID header; the adapter uses best-effort generic envelope parsing and `X-Request-ID`. Confirm both in an approved live smoke test before launch.
+- Anthropic adapter does not exist yet (Week 6); provider-config and model namespaces for `anthropic/` currently fail with explicit configuration errors rather than routing.
 
 ## Completed
 
@@ -62,5 +69,6 @@ Update this after major decisions, completed phases, or bugs that future agents 
 - [x] Core data model
 - [x] Auth
 - [x] OpenAI streaming core
+- [x] Provider abstraction + DeepSeek adapter
 - [ ] Core MVP flow
 - [ ] Launch checks

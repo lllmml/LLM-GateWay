@@ -17,6 +17,7 @@ import (
 
 	"github.com/lllmml/production-go-llm-gateway/internal/apikey"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
+	"github.com/lllmml/production-go-llm-gateway/internal/provider/deepseek"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/openai"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
 )
@@ -1421,6 +1422,11 @@ func newServiceForStore(t *testing.T, store Store, client provider.Client, logge
 
 func newServiceForStoreWithTimeouts(t *testing.T, store Store, client provider.Client, logger *slog.Logger, upstreamTimeout, streamMaxDuration time.Duration) *Service {
 	t.Helper()
+	return newServiceForStoreWithClientsAndTimeouts(t, store, map[provider.Name]provider.Client{provider.OpenAI: client}, logger, upstreamTimeout, streamMaxDuration)
+}
+
+func newServiceForStoreWithClientsAndTimeouts(t *testing.T, store Store, clients map[provider.Name]provider.Client, logger *slog.Logger, upstreamTimeout, streamMaxDuration time.Duration) *Service {
+	t.Helper()
 	cipher, err := security.NewCredentialCipher(bytes.Repeat([]byte{8}, 32))
 	if err != nil {
 		t.Fatalf("new cipher: %v", err)
@@ -1431,7 +1437,7 @@ func newServiceForStoreWithTimeouts(t *testing.T, store Store, client provider.C
 		CredentialCipher:          cipher,
 		UpstreamRequestTimeout:    upstreamTimeout,
 		UpstreamStreamMaxDuration: streamMaxDuration,
-		ProviderRegistry:          newTestProviderRegistry(t, map[provider.Name]provider.Client{provider.OpenAI: client}),
+		ProviderRegistry:          newTestProviderRegistry(t, clients),
 		Logger:                    logger,
 	})
 	if err != nil {
@@ -1451,6 +1457,37 @@ func newTestProviderRegistry(t *testing.T, clients map[provider.Name]provider.Cl
 
 func newAuthorizedStore(t *testing.T) (*fakeStore, string) {
 	t.Helper()
+	return newAuthorizedStoreForProvider(t, provider.OpenAI, testCredentialID)
+}
+
+func newAuthorizedStoreForProvider(t *testing.T, name provider.Name, credentialID string) (*fakeStore, string) {
+	t.Helper()
+	rawKey, prefix, keyHash := authorizedKey(t)
+	return &fakeStore{
+		prefix:     prefix,
+		keyHash:    keyHash,
+		auth:       AuthContext{ProjectID: testProjectID, VirtualKeyID: testVirtualKeyID, KeyPrefix: prefix},
+		credential: encryptTestCredential(t, name, credentialID),
+	}, rawKey
+}
+
+func newMultiProviderAuthorizedStore(t *testing.T, names ...provider.Name) (*fakeStore, string) {
+	t.Helper()
+	rawKey, prefix, keyHash := authorizedKey(t)
+	credentials := make(map[provider.Name]ProviderCredential, len(names))
+	for _, name := range names {
+		credentials[name] = encryptTestCredential(t, name, testCredentialID)
+	}
+	return &fakeStore{
+		prefix:      prefix,
+		keyHash:     keyHash,
+		auth:        AuthContext{ProjectID: testProjectID, VirtualKeyID: testVirtualKeyID, KeyPrefix: prefix},
+		credentials: credentials,
+	}, rawKey
+}
+
+func authorizedKey(t *testing.T) (string, string, []byte) {
+	t.Helper()
 	rawKey, prefix, err := apikey.GenerateRawKey()
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
@@ -1459,31 +1496,31 @@ func newAuthorizedStore(t *testing.T) (*fakeStore, string) {
 	if err != nil {
 		t.Fatalf("hash key: %v", err)
 	}
+	return rawKey, prefix, keyHash
+}
+
+func encryptTestCredential(t *testing.T, name provider.Name, credentialID string) ProviderCredential {
+	t.Helper()
 	cipher, err := security.NewCredentialCipher(bytes.Repeat([]byte{8}, 32))
 	if err != nil {
 		t.Fatalf("new cipher: %v", err)
 	}
 	encrypted, err := cipher.Encrypt([]byte("sk-test"), security.CredentialIdentity{
-		CredentialID: testCredentialID,
+		CredentialID: credentialID,
 		ProjectID:    testProjectID,
-		Provider:     string(provider.OpenAI),
+		Provider:     string(name),
 	})
 	if err != nil {
 		t.Fatalf("encrypt credential: %v", err)
 	}
-	return &fakeStore{
-		prefix:  prefix,
-		keyHash: keyHash,
-		auth:    AuthContext{ProjectID: testProjectID, VirtualKeyID: testVirtualKeyID, KeyPrefix: prefix},
-		credential: ProviderCredential{
-			ID:               testCredentialID,
-			ProjectID:        testProjectID,
-			Provider:         provider.OpenAI,
-			SecretCiphertext: encrypted.Ciphertext,
-			SecretNonce:      encrypted.Nonce,
-			KeyVersion:       encrypted.KeyVersion,
-		},
-	}, rawKey
+	return ProviderCredential{
+		ID:               credentialID,
+		ProjectID:        testProjectID,
+		Provider:         name,
+		SecretCiphertext: encrypted.Ciphertext,
+		SecretNonce:      encrypted.Nonce,
+		KeyVersion:       encrypted.KeyVersion,
+	}
 }
 
 type fakeStore struct {
@@ -1491,6 +1528,7 @@ type fakeStore struct {
 	keyHash             []byte
 	auth                AuthContext
 	credential          ProviderCredential
+	credentials         map[provider.Name]ProviderCredential
 	authCalls           int
 	resolveCalls        int
 	createCalls         int
@@ -1567,10 +1605,17 @@ func (s *fakeStore) AuthenticateVirtualKey(_ context.Context, prefix string, key
 	return s.auth, nil
 }
 
-func (s *fakeStore) ResolveProviderCredential(context.Context, string, provider.Name) (ProviderCredential, error) {
+func (s *fakeStore) ResolveProviderCredential(_ context.Context, _ string, name provider.Name) (ProviderCredential, error) {
 	s.resolveStartedAt = time.Now().UTC()
 	s.resolveCalls++
-	if s.credential.ID == "" {
+	if s.credentials != nil {
+		credential, ok := s.credentials[name]
+		if !ok {
+			return ProviderCredential{}, ErrNotFound
+		}
+		return credential, nil
+	}
+	if s.credential.ID == "" || s.credential.Provider != name {
 		return ProviderCredential{}, ErrNotFound
 	}
 	return s.credential, nil
@@ -1786,5 +1831,360 @@ func readSSEEvent(t *testing.T, reader *bufio.Reader) string {
 		if line == "\n" || line == "\r\n" {
 			return builder.String()
 		}
+	}
+}
+
+func TestDeepSeekModelRequiresDeepSeekCredentialBeforeUpstream(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t) // openai credential only
+	openAIClient := &fakeProviderClient{}
+	deepSeekClient := &fakeProviderClient{}
+	service := newServiceForStoreWithClientsAndTimeouts(t, store, map[provider.Name]provider.Client{
+		provider.OpenAI:   openAIClient,
+		provider.DeepSeek: deepSeekClient,
+	}, nil, time.Second, time.Second)
+
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	_, _, err = service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+		Model:    "deepseek/deepseek-chat",
+		Messages: []provider.Message{{Role: "user", Content: "hello"}},
+	})
+	gatewayErr, ok := err.(*GatewayError)
+	if !ok || gatewayErr.Category != provider.ProviderNotConfigured {
+		t.Fatalf("error = %#v, want ProviderNotConfigured", err)
+	}
+	if store.createCalls != 0 {
+		t.Fatalf("create calls = %d, want 0 (no paid upstream work without credential)", store.createCalls)
+	}
+	if deepSeekClient.calls != 0 || openAIClient.calls != 0 {
+		t.Fatalf("provider calls: deepseek=%d openai=%d, want 0", deepSeekClient.calls, openAIClient.calls)
+	}
+}
+
+func TestCrossProviderServiceRoutesDeepSeekToDeepSeekAdapter(t *testing.T) {
+	store, rawKey := newMultiProviderAuthorizedStore(t, provider.OpenAI, provider.DeepSeek)
+	openAIClient := &fakeProviderClient{
+		result: provider.Result{
+			Response: provider.ChatResponse{ID: "openai-result", Object: "chat.completion", Model: "gpt-test"},
+			Usage:    &provider.Usage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+		},
+	}
+	deepSeekClient := &fakeProviderClient{
+		result: provider.Result{
+			Response: provider.ChatResponse{
+				ID:      "deepseek-result",
+				Object:  "chat.completion",
+				Model:   "deepseek-chat",
+				Choices: []provider.Choice{{Index: 0, Message: provider.ResponseMessage{Role: "assistant", Content: "ok"}}},
+			},
+			Usage:             &provider.Usage{PromptTokens: 7, CompletionTokens: 3, TotalTokens: 10},
+			UpstreamStatus:    http.StatusOK,
+			UpstreamRequestID: "req_deepseek",
+		},
+	}
+	service := newServiceForStoreWithClientsAndTimeouts(t, store, map[provider.Name]provider.Client{
+		provider.OpenAI:   openAIClient,
+		provider.DeepSeek: deepSeekClient,
+	}, nil, time.Second, time.Second)
+
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	result, record, err := service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+		Model:    "deepseek/deepseek-chat",
+		Messages: []provider.Message{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("complete chat: %v", err)
+	}
+	if record.Provider != provider.DeepSeek || record.Model != "deepseek-chat" || record.ID != testRequestID {
+		t.Fatalf("record = %+v", record)
+	}
+	if result.Response.ID != "deepseek-result" {
+		t.Fatalf("result = %+v", result)
+	}
+	if openAIClient.calls != 0 {
+		t.Fatalf("openai provider calls = %d, want 0", openAIClient.calls)
+	}
+	if deepSeekClient.calls != 1 {
+		t.Fatalf("deepseek provider calls = %d, want 1", deepSeekClient.calls)
+	}
+	if deepSeekClient.lastChat.Model != "deepseek-chat" {
+		t.Fatalf("deepseek upstream model = %q", deepSeekClient.lastChat.Model)
+	}
+	if store.lastCreate.Provider != provider.DeepSeek || store.lastCreate.Model != "deepseek-chat" {
+		t.Fatalf("create params = %+v", store.lastCreate)
+	}
+	if store.lastFinalize.Status != "succeeded" || store.lastFinalize.ErrorCategory != nil {
+		t.Fatalf("finalize = %+v", store.lastFinalize)
+	}
+	if store.lastFinalize.TotalTokens == nil || *store.lastFinalize.TotalTokens != 10 {
+		t.Fatalf("finalize usage = %+v", store.lastFinalize)
+	}
+}
+
+func TestHandlerStreamsThroughDeepSeekClientOverHTTP(t *testing.T) {
+	firstChunkFlushed := make(chan struct{})
+	releaseRest := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/chat/completions" {
+			t.Fatalf("upstream path = %q", request.URL.Path)
+		}
+		if got := request.Header.Get("Accept"); got != "text/event-stream" {
+			t.Fatalf("upstream Accept = %q", got)
+		}
+		var body struct {
+			Model         string          `json:"model"`
+			Stream        bool            `json:"stream"`
+			StreamOptions json.RawMessage `json:"stream_options"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		if body.Model != "deepseek-chat" || !body.Stream {
+			t.Fatalf("upstream body = %+v", body)
+		}
+		if len(body.StreamOptions) > 0 {
+			t.Fatalf("stream_options present = %q, want absent", string(body.StreamOptions))
+		}
+		response.Header().Set("Content-Type", "text/event-stream")
+		response.Header().Set("X-Request-ID", "req_deepseek_stream")
+
+		_, _ = io.WriteString(response, `data: {"id":"ddchat_1","object":"chat.completion.chunk","created":123,"model":"deepseek-chat","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`+"\n\n")
+		response.(http.Flusher).Flush()
+		close(firstChunkFlushed)
+
+		<-releaseRest
+		_, _ = io.WriteString(response, `data: {"id":"ddchat_1","object":"chat.completion.chunk","created":123,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}`+"\n\n")
+		_, _ = io.WriteString(response, `data: {"id":"ddchat_1","object":"chat.completion.chunk","created":123,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`+"\n\n")
+		_, _ = io.WriteString(response, "data: [DONE]\n\n")
+		response.(http.Flusher).Flush()
+	}))
+	defer upstream.Close()
+
+	baseStore, rawKey := newAuthorizedStoreForProvider(t, provider.DeepSeek, testCredentialID)
+	baseStore.credential.BaseURLOverride = upstream.URL
+	store := newNotifyingStore(baseStore)
+	service := newServiceForStoreWithClientsAndTimeouts(t, store, map[provider.Name]provider.Client{
+		provider.DeepSeek: deepseek.New(upstream.Client()),
+	}, nil, time.Second, time.Second)
+	handler := NewHandler(service)
+	mux := http.NewServeMux()
+	handler.Register(mux)
+	gateway := httptest.NewServer(mux)
+	defer gateway.Close()
+
+	request, err := http.NewRequest(http.MethodPost, gateway.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model":"deepseek/deepseek-chat",
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response, err := gateway.Client().Do(request)
+	if err != nil {
+		t.Fatalf("gateway request: %v", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status = %d; body=%s", response.StatusCode, body)
+	}
+	if got := response.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if got := response.Header.Get("X-Gateway-Provider"); got != "deepseek" {
+		t.Fatalf("X-Gateway-Provider = %q", got)
+	}
+	reader := bufio.NewReader(response.Body)
+	firstEvent := readSSEEvent(t, reader)
+	if !strings.Contains(firstEvent, `data: {"id":"ddchat_1"`) {
+		t.Fatalf("first event = %q", firstEvent)
+	}
+	select {
+	case <-firstChunkFlushed:
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not flush first chunk")
+	}
+
+	close(releaseRest)
+	events := firstEvent
+	for !strings.Contains(events, "data: [DONE]\n\n") {
+		events += readSSEEvent(t, reader)
+	}
+	if !strings.Contains(events, `"finish_reason":"stop"`) || !strings.Contains(events, `"usage":{"prompt_tokens":7`) {
+		t.Fatalf("stream did not include DeepSeek final usage chunk: %s", events)
+	}
+	finalize := store.waitFinalize(t)
+	if finalize.params.Status != "succeeded" || finalize.params.ErrorCategory != nil {
+		t.Fatalf("finalize = %+v", finalize.params)
+	}
+	if finalize.params.TotalTokens == nil || *finalize.params.TotalTokens != 10 {
+		t.Fatalf("usage not finalized: %+v", finalize.params)
+	}
+	if finalize.params.UpstreamRequestID == nil || *finalize.params.UpstreamRequestID != "req_deepseek_stream" {
+		t.Fatalf("upstream request ID not finalized: %+v", finalize.params)
+	}
+}
+
+func TestHandlerCompleteChatThroughDeepSeekClientOverHTTP(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/chat/completions" {
+			t.Fatalf("upstream path = %q", request.URL.Path)
+		}
+		if got := request.Header.Get("Accept"); got != "application/json" {
+			t.Fatalf("upstream Accept = %q", got)
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{
+			"id":"ddchat_1",
+			"object":"chat.completion",
+			"created":123,
+			"model":"deepseek-chat",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"world"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}
+		}`))
+	}))
+	defer upstream.Close()
+
+	baseStore, rawKey := newAuthorizedStoreForProvider(t, provider.DeepSeek, testCredentialID)
+	baseStore.credential.BaseURLOverride = upstream.URL
+	store := newNotifyingStore(baseStore)
+	service := newServiceForStoreWithClientsAndTimeouts(t, store, map[provider.Name]provider.Client{
+		provider.DeepSeek: deepseek.New(upstream.Client()),
+	}, nil, time.Second, time.Second)
+	handler := NewHandler(service)
+	mux := http.NewServeMux()
+	handler.Register(mux)
+	gateway := httptest.NewServer(mux)
+	defer gateway.Close()
+
+	request, err := http.NewRequest(http.MethodPost, gateway.URL+"/v1/chat/completions", strings.NewReader(`{
+		"model":"deepseek/deepseek-chat",
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response, err := gateway.Client().Do(request)
+	if err != nil {
+		t.Fatalf("gateway request: %v", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status = %d; body=%s", response.StatusCode, body)
+	}
+	if got := response.Header.Get("X-Gateway-Provider"); got != "deepseek" {
+		t.Fatalf("X-Gateway-Provider = %q", got)
+	}
+	var decoded struct {
+		ID      string `json:"id"`
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
+		t.Fatalf("decode gateway response: %v", err)
+	}
+	if decoded.ID != "ddchat_1" || len(decoded.Choices) != 1 || decoded.Choices[0].Message.Content != "world" {
+		t.Fatalf("gateway response = %+v", decoded)
+	}
+	finalize := store.waitFinalize(t)
+	if finalize.params.Status != "succeeded" || finalize.params.ErrorCategory != nil {
+		t.Fatalf("finalize = %+v", finalize.params)
+	}
+	if finalize.params.TotalTokens == nil || *finalize.params.TotalTokens != 10 {
+		t.Fatalf("usage not finalized: %+v", finalize.params)
+	}
+}
+
+// DeepSeek 401/402 mean the configured upstream provider access is not usable
+// (invalid credential / insufficient balance). The gateway must surface these
+// as provider_unavailable (HTTP 502), not provider_invalid_request (HTTP 400):
+// the client request itself is valid; the upstream cannot be called right now.
+// A 422 control case pins that real client-side provider errors still map to
+// HTTP 400 provider_invalid_request.
+func TestHandlerDeepSeekServerSideUpstreamStatusesAreNotClientErrors(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		upstreamStatus int
+		stream         bool
+		wantStatus     int
+		wantType       string
+	}{
+		{"401 complete", http.StatusUnauthorized, false, http.StatusBadGateway, string(provider.ProviderUnavailable)},
+		{"402 complete", http.StatusPaymentRequired, false, http.StatusBadGateway, string(provider.ProviderUnavailable)},
+		{"402 stream", http.StatusPaymentRequired, true, http.StatusBadGateway, string(provider.ProviderUnavailable)},
+		{"422 complete control", http.StatusUnprocessableEntity, false, http.StatusBadRequest, string(provider.ProviderInvalidReq)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				response.WriteHeader(tt.upstreamStatus)
+				_, _ = response.Write([]byte(`{"error":{"message":"upstream said no","code":"upstream"},"extra":"secret-raw-upstream-body-xyz"}`))
+			}))
+			defer upstream.Close()
+
+			baseStore, rawKey := newAuthorizedStoreForProvider(t, provider.DeepSeek, testCredentialID)
+			baseStore.credential.BaseURLOverride = upstream.URL
+			store := newNotifyingStore(baseStore)
+			service := newServiceForStoreWithClientsAndTimeouts(t, store, map[provider.Name]provider.Client{
+				provider.DeepSeek: deepseek.New(upstream.Client()),
+			}, nil, time.Second, time.Second)
+			handler := NewHandler(service)
+			mux := http.NewServeMux()
+			handler.Register(mux)
+			gateway := httptest.NewServer(mux)
+			defer gateway.Close()
+
+			body := `{"model":"deepseek/deepseek-chat","messages":[{"role":"user","content":"hello"}]}`
+			if tt.stream {
+				body = `{"model":"deepseek/deepseek-chat","messages":[{"role":"user","content":"hello"}],"stream":true}`
+			}
+			request, err := http.NewRequest(http.MethodPost, gateway.URL+"/v1/chat/completions", strings.NewReader(body))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+rawKey)
+			response, err := gateway.Client().Do(request)
+			if err != nil {
+				t.Fatalf("gateway request: %v", err)
+			}
+			defer response.Body.Close()
+			responseBody, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatalf("read gateway response: %v", err)
+			}
+
+			if response.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", response.StatusCode, tt.wantStatus, responseBody)
+			}
+			if !strings.Contains(string(responseBody), `"type":"`+tt.wantType+`"`) {
+				t.Fatalf("error type = %s, want %q", responseBody, tt.wantType)
+			}
+			if strings.Contains(string(responseBody), "secret-raw-upstream-body-xyz") || strings.Contains(string(responseBody), "upstream said no") {
+				t.Fatalf("raw upstream error leaked to client: %s", responseBody)
+			}
+			finalize := store.waitFinalize(t)
+			if finalize.params.Status != "failed" || finalize.params.ErrorCategory == nil {
+				t.Fatalf("finalize = %+v", finalize.params)
+			}
+			if *finalize.params.ErrorCategory != provider.ErrorCategory(tt.wantType) {
+				t.Fatalf("finalized category = %q, want %q", *finalize.params.ErrorCategory, tt.wantType)
+			}
+		})
 	}
 }
