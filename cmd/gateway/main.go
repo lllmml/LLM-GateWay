@@ -73,6 +73,8 @@ func run() error {
 		database,
 		credentialCipher,
 		database,
+		database,
+		database,
 	)
 	if err != nil {
 		database.Close()
