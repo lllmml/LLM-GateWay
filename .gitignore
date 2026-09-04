@@ -10,8 +10,6 @@
 
 # Dependencies
 node_modules/
-/web/dist/
-/web/coverage/
 
 # Python
 __pycache__/
