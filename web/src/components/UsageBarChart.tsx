@@ -1,9 +1,14 @@
 import { useMemo } from "react";
 import type { UsagePoint } from "../api/analytics";
-import { formatCompact } from "../lib/format";
+import { formatCompact, formatNanoUSD } from "../lib/format";
 
 // Minimal dependency-free SVG bar chart for usage timeseries. Renders one
-// metric across zero-filled UTC buckets returned by the API.
+// metric across the zero-filled UTC buckets returned by the API.
+//
+// Cost is stored/transmitted in nano-USD; bars are unit-correct only because
+// the formatter matches the metric. Cost bars never imply a bill: buckets
+// whose requests were all unpriced carry no attributed cost and are labeled
+// as such instead of presenting $0.00 as a known zero.
 
 type MetricKey = "requests_total" | "estimated_cost_nano_usd" | "prompt_tokens";
 
@@ -27,7 +32,14 @@ export function UsageBarChart({ points, metric, height = 160 }: Props) {
       key: point.ts,
       value: point[metric],
       ratio: max > 0 ? point[metric] / max : 0,
-      label: bucketLabel(points, index, metric === "requests_total"),
+      label: metric === "estimated_cost_nano_usd" ? formatNanoUSD(point[metric]) : formatCompact(point[metric]),
+      coverage:
+        metric === "estimated_cost_nano_usd" && point.priced_requests === 0 && point.unpriced_requests > 0
+          ? "unpriced — no attributed cost (Week 7 has no DeepSeek price versions)"
+          : metric === "estimated_cost_nano_usd" && point.priced_requests > 0 && point.unpriced_requests > 0
+            ? `partial — ${point.priced_requests} priced · ${point.unpriced_requests} unpriced`
+            : undefined,
+      bucketLabel: bucketLabel(points, index, metric === "requests_total"),
     }));
   }, [points, metric]);
 
@@ -54,14 +66,21 @@ export function UsageBarChart({ points, metric, height = 160 }: Props) {
         {bars.map((bar, index) => {
           const x = (index * (560 - barWidth)) / Math.max(1, bars.length - 1);
           const barHeight = Math.max(1, bar.ratio * (height - 14));
+          const isUnpriced = bar.coverage?.startsWith("unpriced") ?? false;
           return (
             <g key={bar.key}>
-              <title>{`${bar.label}: ${formatCompact(bar.value)}`}</title>
-              <rect fill={bar.value > 0 ? "currentColor" : "#e2e8f0"} height={barHeight} opacity={0.9} width={barWidth} x={x} y={height - 6 - barHeight} />
+              <title>{bar.coverage ? `${bar.bucketLabel}: ${bar.coverage}` : `${bar.bucketLabel}: ${bar.label}`}</title>
+              <rect fill={bar.value > 0 ? "currentColor" : isUnpriced ? "#fde68a" : "#e2e8f0"} height={barHeight} opacity={0.9} width={barWidth} x={x} y={height - 6 - barHeight} />
             </g>
           );
         })}
       </svg>
+      {metric === "estimated_cost_nano_usd" ? (
+        <p className="mt-1 text-[11px] leading-4 text-slate-400">
+          Amber bars mark buckets with requests but no attributed cost (unpriced); they are not billed as $0.00. Values are base-rate
+          estimates, not invoices.
+        </p>
+      ) : null}
       {points.length > 1 ? (
         <div className="mt-1 flex justify-between text-[11px] text-slate-400">
           <span>{formatDay(points[0].ts)}</span>

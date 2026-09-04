@@ -62,6 +62,8 @@ export type UsagePoint = {
   requests_total: number;
   requests_succeeded: number;
   requests_failed: number;
+  priced_requests: number;
+  unpriced_requests: number;
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
@@ -81,6 +83,8 @@ export type UsageGroup = {
   key_prefix?: string;
   requests_total: number;
   requests_failed: number;
+  priced_requests: number;
+  unpriced_requests: number;
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
@@ -210,6 +214,8 @@ export function parseUsageTimeseries(value: unknown): UsageTimeseries {
       requests_total: numberValue("requests_total"),
       requests_succeeded: numberValue("requests_succeeded"),
       requests_failed: numberValue("requests_failed"),
+      priced_requests: numberValue("priced_requests"),
+      unpriced_requests: numberValue("unpriced_requests"),
       prompt_tokens: numberValue("prompt_tokens"),
       completion_tokens: numberValue("completion_tokens"),
       total_tokens: numberValue("total_tokens"),
@@ -240,6 +246,8 @@ export function parseUsageBreakdown(value: unknown): UsageBreakdown {
       key_prefix: typeof item.key_prefix === "string" ? item.key_prefix : undefined,
       requests_total: numberValue("requests_total"),
       requests_failed: numberValue("requests_failed"),
+      priced_requests: numberValue("priced_requests"),
+      unpriced_requests: numberValue("unpriced_requests"),
       prompt_tokens: numberValue("prompt_tokens"),
       completion_tokens: numberValue("completion_tokens"),
       total_tokens: numberValue("total_tokens"),

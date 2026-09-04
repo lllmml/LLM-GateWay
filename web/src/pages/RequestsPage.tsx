@@ -14,19 +14,23 @@ type Filters = {
 const emptyFilters: Filters = { provider: "", status: "", stream: "" };
 
 export function RequestsPage() {
-  const [filters, setFilters] = useState<Filters>(emptyFilters);
+  // draftFilters is what the form currently shows; appliedFilters is what the
+  // request list query uses. Apply copies draft -> applied; Reset returns both
+  // to empty so the visible selects and the sent query can never disagree.
+  const [draftFilters, setDraftFilters] = useState<Filters>(emptyFilters);
+  const [appliedFilters, setAppliedFilters] = useState<Filters>(emptyFilters);
   const [cursor, setCursor] = useState<string | null>(null);
   const [history, setHistory] = useState<string[]>([]);
   const [selectedID, setSelectedID] = useState<string | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
 
   const page = useQuery({
-    queryKey: ["requests", filters, cursor ?? "start"],
+    queryKey: ["requests", appliedFilters, cursor ?? "start"],
     queryFn: () =>
       listRequests({
-        provider: filters.provider || undefined,
-        status: filters.status || undefined,
-        stream: filters.stream === "" ? undefined : filters.stream === "true",
+        provider: appliedFilters.provider || undefined,
+        status: appliedFilters.status || undefined,
+        stream: appliedFilters.stream === "" ? undefined : appliedFilters.stream === "true",
         limit: 50,
         cursor,
       }),
@@ -40,12 +44,22 @@ export function RequestsPage() {
 
   const data: RequestPage | undefined = page.data;
 
-  const applyFilters = (next: Filters) => {
-    setFilters(next);
+  const resetPagination = () => {
     setCursor(null);
     setHistory([]);
-    setDetailOpen(false);
     setSelectedID(null);
+    setDetailOpen(false);
+  };
+
+  const applyDraft = () => {
+    setAppliedFilters(draftFilters);
+    resetPagination();
+  };
+
+  const resetFilters = () => {
+    setDraftFilters(emptyFilters);
+    setAppliedFilters(emptyFilters);
+    resetPagination();
   };
 
   const goNext = () => {
@@ -84,7 +98,7 @@ export function RequestsPage() {
         actions={
           <button
             className="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-100"
-            onClick={() => applyFilters(emptyFilters)}
+            onClick={resetFilters}
             type="button"
           >
             Reset filters
@@ -96,17 +110,18 @@ export function RequestsPage() {
           className="flex flex-wrap items-end gap-3 px-5 py-4"
           onSubmit={(event) => {
             event.preventDefault();
-            const form = new FormData(event.currentTarget);
-            applyFilters({
-              provider: String(form.get("provider") ?? ""),
-              status: String(form.get("status") ?? ""),
-              stream: String(form.get("stream") ?? ""),
-            });
+            applyDraft();
           }}
         >
           <label className="block text-sm">
             <span className="text-xs font-medium uppercase tracking-wide text-slate-500">Provider</span>
-            <select className="mt-1 block rounded-md border border-slate-300 bg-white px-3 py-2 text-sm" defaultValue={filters.provider} name="provider">
+            <select
+              aria-label="Provider filter"
+              className="mt-1 block rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+              name="provider"
+              onChange={(event) => setDraftFilters((current) => ({ ...current, provider: event.target.value }))}
+              value={draftFilters.provider}
+            >
               <option value="">All</option>
               <option value="openai">openai</option>
               <option value="anthropic">anthropic</option>
@@ -115,7 +130,13 @@ export function RequestsPage() {
           </label>
           <label className="block text-sm">
             <span className="text-xs font-medium uppercase tracking-wide text-slate-500">Status</span>
-            <select className="mt-1 block rounded-md border border-slate-300 bg-white px-3 py-2 text-sm" defaultValue={filters.status} name="status">
+            <select
+              aria-label="Status filter"
+              className="mt-1 block rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+              name="status"
+              onChange={(event) => setDraftFilters((current) => ({ ...current, status: event.target.value }))}
+              value={draftFilters.status}
+            >
               <option value="">All</option>
               <option value="succeeded">succeeded</option>
               <option value="failed">failed</option>
@@ -124,7 +145,13 @@ export function RequestsPage() {
           </label>
           <label className="block text-sm">
             <span className="text-xs font-medium uppercase tracking-wide text-slate-500">Stream</span>
-            <select className="mt-1 block rounded-md border border-slate-300 bg-white px-3 py-2 text-sm" defaultValue={filters.stream} name="stream">
+            <select
+              aria-label="Stream filter"
+              className="mt-1 block rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+              name="stream"
+              onChange={(event) => setDraftFilters((current) => ({ ...current, stream: event.target.value }))}
+              value={draftFilters.stream}
+            >
               <option value="">All</option>
               <option value="true">streaming</option>
               <option value="false">non-streaming</option>
