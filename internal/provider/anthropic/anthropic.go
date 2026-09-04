@@ -580,11 +580,11 @@ func finishReason(stopReason *string) string {
 // message_start and the first message_delta; message_stop is a valid terminal
 // only after at least one message_delta has been observed. Any violation fails
 // the stream (StreamInterrupted) without synthesizing [DONE] or exposing
-// usage. message_start requires a usage object with input_tokens and every
-// message_delta requires a usage object with output_tokens; a missing counter
-// is rejected rather than silently treated as zero, counters must be
-// non-negative, and message_delta output_tokens is cumulative and must never
-// decrease.
+// usage. message_start requires a usage object with input_tokens and
+// output_tokens; a missing counter is rejected rather than silently treated as
+// zero, counters must be non-negative, and message_start.output_tokens seeds
+// the cumulative output baseline that every later message_delta
+// usage.output_tokens (cumulative) must be greater than or equal to.
 type streamPhase int
 
 const (
@@ -646,10 +646,13 @@ func (s *chatStream) Next() (provider.StreamEvent, error) {
 				Message struct {
 					ID    string `json:"id"`
 					Model string `json:"model"`
-					// Pointer usage so a missing usage object or a missing
-					// input_tokens field is distinguishable from an explicit zero.
+					// Pointer usage so a missing usage object or a missing counter
+					// is distinguishable from an explicit zero. output_tokens in
+					// message_start seeds the cumulative output baseline that
+					// later message_delta values must be >= to.
 					Usage *struct {
-						InputTokens *int64 `json:"input_tokens"`
+						InputTokens  *int64 `json:"input_tokens"`
+						OutputTokens *int64 `json:"output_tokens"`
 					} `json:"usage"`
 				} `json:"message"`
 			}
@@ -665,18 +668,33 @@ func (s *chatStream) Next() (provider.StreamEvent, error) {
 			if *payload.Message.Usage.InputTokens < 0 {
 				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream reported negative input_tokens"))
 			}
+			// The Messages API reports output_tokens in message_start, and later
+			// message_delta usage.output_tokens values are cumulative against it.
+			if payload.Message.Usage.OutputTokens == nil {
+				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream message_start missing usage.output_tokens"))
+			}
+			if *payload.Message.Usage.OutputTokens < 0 {
+				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream reported negative output_tokens"))
+			}
 			s.phase = phaseStarted
 			s.messageID = payload.Message.ID
 			s.model = payload.Message.Model
 			s.created = time.Now().Unix()
 			s.inputTokens = *payload.Message.Usage.InputTokens
+			s.outputTokens = *payload.Message.Usage.OutputTokens
 			continue
 		case "content_block_start", "content_block_stop":
-			// Content block boundaries are known structural events and must not
-			// precede message_start. After the stream has started they carry no
-			// text and are tolerated (no per-block lifecycle is tracked).
+			// Content block boundaries are known structural events. They must
+			// not precede message_start, and once the first message_delta has
+			// been seen the stream has moved past content blocks, so a boundary
+			// after that phase is out of order. Only the started phase (between
+			// message_start and the first message_delta) may carry them; no
+			// per-block lifecycle or index tracking is implemented.
 			if s.phase == phaseInitial {
 				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream sent content block event before message_start"))
+			}
+			if s.phase != phaseStarted {
+				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream sent content block event after message_delta"))
 			}
 			continue
 		case "content_block_delta":
