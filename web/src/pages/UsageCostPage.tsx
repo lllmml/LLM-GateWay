@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchUsageBreakdown, fetchUsageSummary, fetchUsageTimeseries } from "../api/analytics";
 import { formatCount, formatNanoUSD, formatTime } from "../lib/format";
+import { costCoverageState } from "../lib/costCoverage";
 import { CostNotice } from "../components/CostNotice";
 import { SummaryTiles, TileGridLoading, SectionCard } from "../components/AnalyticsShared";
 import { UsageBarChart } from "../components/UsageBarChart";
@@ -109,7 +110,7 @@ export function UsageCostPage() {
 
 function BreakdownCard({ items, title }: { items: { key: string; key_prefix?: string; requests_total: number; requests_failed: number; priced_requests: number; unpriced_requests: number; prompt_tokens: number; completion_tokens: number; estimated_cost_nano_usd: number }[]; title: string }) {
   return (
-    <SectionCard subtitle="Sorted by estimated cost descending; an entirely unpriced group shows 'unpriced' rather than $0.00." title={title}>
+    <SectionCard subtitle="Sorted by estimated cost descending. Coverage column: priced / unpriced (succeeded only). Unpriced and failed-only groups show 'unpriced' or '—', never $0.00." title={title}>
       {items.length === 0 ? (
         <p className="px-5 py-6 text-sm text-slate-500">No breakdown data in this window.</p>
       ) : (
@@ -125,26 +126,35 @@ function BreakdownCard({ items, title }: { items: { key: string; key_prefix?: st
           </thead>
           <tbody className="divide-y divide-slate-100">
             {items.map((group) => {
-              const entirelyUnpriced = group.priced_requests === 0;
-              const partial = !entirelyUnpriced && group.unpriced_requests > 0;
+              const coverage = costCoverageState(group.requests_total, group.priced_requests, group.unpriced_requests);
+              const costCell =
+                coverage === "unpriced" ? (
+                  <span className="font-medium text-amber-700">unpriced</span>
+                ) : coverage === "not_estimated" ? (
+                  <span className="font-medium text-slate-500" title="failed-only requests are not priced">
+                    —
+                  </span>
+                ) : coverage === "partial" ? (
+                  <span>
+                    {formatNanoUSD(group.estimated_cost_nano_usd)}
+                    <span className="ml-2 rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700" title={`${group.priced_requests} priced · ${group.unpriced_requests} unpriced`}>
+                      partial
+                    </span>
+                  </span>
+                ) : (
+                  formatNanoUSD(group.estimated_cost_nano_usd)
+                );
               return (
                 <tr className="text-slate-700" key={group.key}>
                   <td className="max-w-56 truncate px-5 py-2 font-medium text-slate-800" title={group.key}>
                     {title === "By virtual key" && group.key_prefix ? group.key_prefix : group.key}
-                    {partial ? (
-                      <span className="ml-2 rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700" title="Some requests in this group have no attributed cost.">
-                        partial cost
-                      </span>
-                    ) : null}
                   </td>
                   <td className="px-3 py-2 text-right">{formatCount(group.requests_total)}</td>
                   <td className="px-3 py-2 text-right font-mono text-xs">
                     {group.priced_requests} / {group.unpriced_requests}
                   </td>
                   <td className="px-3 py-2 text-right">{formatCount(group.prompt_tokens + group.completion_tokens)}</td>
-                  <td className="px-5 py-2 text-right">
-                    {entirelyUnpriced ? <span className="font-medium text-amber-700">unpriced</span> : formatNanoUSD(group.estimated_cost_nano_usd)}
-                  </td>
+                  <td className="px-5 py-2 text-right">{costCell}</td>
                 </tr>
               );
             })}
