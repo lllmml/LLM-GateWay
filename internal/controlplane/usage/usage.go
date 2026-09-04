@@ -5,13 +5,16 @@
 //     bounds the service applies the default 30-day window; the maximum span is
 //     90 days.
 //   - Timeseries buckets use generate_series aligned to date_trunc(bucket,
-//     from), so the first/last buckets may be partial and empty buckets are
-//     zero-filled server-side. from does not need to be on a bucket boundary.
+//     from) computed in explicit UTC (independent of the PostgreSQL session
+//     TimeZone), so the first/last buckets may be partial and empty buckets
+//     are zero-filled server-side. from does not need to be on a bucket
+//     boundary.
 //   - estimated_cost_nano_usd is the BASE-RATE estimate aggregated over the
 //     requests that recorded a cost (usage + price version available). It is
-//     not an invoice and not the full bill: requests with unknown usage or no
-//     effective price version contribute to request counts but not to the cost
-//     or token sums. priced_requests / unpriced_requests expose that coverage.
+//     not an invoice and not the full bill. Token sums include every reported
+//     non-null usage regardless of pricing; priced_requests /
+//     unpriced_requests expose cost completeness so an unpriced group or
+//     bucket is never presented as zero cost.
 //   - Breakdown dimensions are allowlisted: provider, model, key.
 package usage
 
@@ -19,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -59,6 +63,8 @@ type Point struct {
 	RequestsTotal        int64     `json:"requests_total"`
 	RequestsSucceeded    int64     `json:"requests_succeeded"`
 	RequestsFailed       int64     `json:"requests_failed"`
+	PricedRequests       int64     `json:"priced_requests"`
+	UnpricedRequests     int64     `json:"unpriced_requests"`
 	PromptTokens         int64     `json:"prompt_tokens"`
 	CompletionTokens     int64     `json:"completion_tokens"`
 	TotalTokens          int64     `json:"total_tokens"`
@@ -71,6 +77,8 @@ type Group struct {
 	KeyPrefix            *string `json:"key_prefix,omitempty"`
 	RequestsTotal        int64   `json:"requests_total"`
 	RequestsFailed       int64   `json:"requests_failed"`
+	PricedRequests       int64   `json:"priced_requests"`
+	UnpricedRequests     int64   `json:"unpriced_requests"`
 	PromptTokens         int64   `json:"prompt_tokens"`
 	CompletionTokens     int64   `json:"completion_tokens"`
 	TotalTokens          int64   `json:"total_tokens"`
@@ -113,6 +121,9 @@ func NewService(store Store) *Service {
 // Summary returns aggregates over [from, to). Empty windows return zero
 // aggregates with error_rate and averages null.
 func (s *Service) Summary(ctx context.Context, ownerUserID, projectID string, from, to *time.Time) (Summary, error) {
+	if projectID != "" && !isUUID(projectID) {
+		return Summary{}, fmt.Errorf("%w: project_id must be a UUID", ErrInvalidParams)
+	}
 	fromTime, toTime, err := window(from, to)
 	if err != nil {
 		return Summary{}, err
@@ -157,6 +168,9 @@ func average(sum, count int64) *float64 {
 // The number of points equals the number of whole-or-partial buckets covering
 // [from, to); an empty range yields no points.
 func (s *Service) Timeseries(ctx context.Context, ownerUserID, projectID string, bucket string, from, to *time.Time) ([]Point, error) {
+	if projectID != "" && !isUUID(projectID) {
+		return nil, fmt.Errorf("%w: project_id must be a UUID", ErrInvalidParams)
+	}
 	if bucket != "hour" && bucket != "day" {
 		return nil, fmt.Errorf("%w: bucket must be hour or day", ErrInvalidParams)
 	}
@@ -180,6 +194,9 @@ func (s *Service) Timeseries(ctx context.Context, ownerUserID, projectID string,
 // Breakdown returns groups for one allowlisted dimension ordered by estimated
 // cost descending.
 func (s *Service) Breakdown(ctx context.Context, ownerUserID, projectID, dimension string, from, to *time.Time, limit int) ([]Group, error) {
+	if projectID != "" && !isUUID(projectID) {
+		return nil, fmt.Errorf("%w: project_id must be a UUID", ErrInvalidParams)
+	}
 	if dimension != "provider" && dimension != "model" && dimension != "key" {
 		return nil, fmt.Errorf("%w: dimension must be provider, model, or key", ErrInvalidParams)
 	}
@@ -228,4 +245,22 @@ func EffectiveWindow(from, to *time.Time) (time.Time, time.Time, error) {
 
 func window(from, to *time.Time) (time.Time, time.Time, error) {
 	return EffectiveWindow(from, to)
+}
+
+// isUUID reports whether value is a canonical hyphenated UUID, validated at
+// the domain boundary so a malformed project_id filter is a 400 invalid_request
+// regardless of the store implementation.
+func isUUID(value string) bool {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
+		return false
+	}
+	for _, char := range value {
+		if char == '-' {
+			continue
+		}
+		if !strings.ContainsRune("0123456789abcdefABCDEF", char) {
+			return false
+		}
+	}
+	return true
 }

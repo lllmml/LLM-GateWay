@@ -1539,6 +1539,7 @@ type fakeStore struct {
 	createErr           error
 	finalizeErr         error
 	priceLookupErr      error
+	priceLookupBlock    func(context.Context)
 	onAuth              func()
 	authStartedAt       time.Time
 	resolveStartedAt    time.Time
@@ -1653,9 +1654,15 @@ func (s *fakeStore) CreateGatewayRequest(_ context.Context, params CreateRequest
 	}, nil
 }
 
-func (s *fakeStore) FindModelPrice(_ context.Context, name provider.Name, model string, _ time.Time) (ModelPrice, error) {
+func (s *fakeStore) FindModelPrice(ctx context.Context, name provider.Name, model string, _ time.Time) (ModelPrice, error) {
 	if s.priceLookupErr != nil {
 		return ModelPrice{}, s.priceLookupErr
+	}
+	if s.priceLookupBlock != nil {
+		s.priceLookupBlock(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return ModelPrice{}, err
 	}
 	price, ok := s.prices[priceKey{provider: name, model: model}]
 	if !ok {
@@ -2913,5 +2920,36 @@ func TestStreamChatRecordsPricingIDAndEstimatedCostAtDone(t *testing.T) {
 	// 500*2e9/1e6 + 250*12e9/1e6 = 1_000_000 + 3_000_000 nano-USD.
 	if got := *store.lastFinalize.EstimatedCostNanoUSD; got != 4_000_000 {
 		t.Fatalf("estimated cost = %d, want 4000000", got)
+	}
+}
+
+func TestPricingLookupTimeoutStillFinalizesDurableRow(t *testing.T) {
+	store, rawKey := newAuthorizedStore(t)
+	addTerraPrice(store)
+	// The pricing lookup blocks until its own child context expires. This
+	// deterministically proves the lookup budget cannot starve the durable
+	// finalization that runs afterwards (ADR-016).
+	store.priceLookupBlock = func(ctx context.Context) {
+		<-ctx.Done()
+	}
+	runSuccessChat(t, store, rawKey, &fakeProviderClient{result: pricedOpenAIResult()})
+
+	if store.lastFinalize.Status != "succeeded" {
+		t.Fatalf("finalize status = %q, want succeeded (pricing timeout must not fail the request)", store.lastFinalize.Status)
+	}
+	if store.finalizeCalls != 1 {
+		t.Fatalf("finalize calls = %d, want 1", store.finalizeCalls)
+	}
+	if store.finalizeCtxErr != nil {
+		t.Fatalf("finalize received an expired context (%v); durable write must get a live context", store.finalizeCtxErr)
+	}
+	if !store.finalizeHadDeadline {
+		t.Fatal("finalize context is not bounded")
+	}
+	if store.lastFinalize.PricingID != nil || store.lastFinalize.EstimatedCostNanoUSD != nil {
+		t.Fatalf("cost attribution recorded despite pricing timeout: %+v", store.lastFinalize)
+	}
+	if store.lastFinalize.PromptTokens == nil || *store.lastFinalize.PromptTokens != 1000 {
+		t.Fatalf("reported usage should still be persisted: %+v", store.lastFinalize)
 	}
 }

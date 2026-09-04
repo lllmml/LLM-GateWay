@@ -41,6 +41,11 @@ const (
 )
 
 type Request struct {
+	// The durable row also stores provider_credential_id (the FK to the
+	// credential used upstream). It is intentionally NOT part of the public
+	// request-history contract: it is an internal attribution FK, and the
+	// virtual key + project identity already provide safe display attribution.
+	// No other analytics/UI field references it, so the SQL select omits it.
 	ID                   string     `json:"id"`
 	ProjectID            string     `json:"project_id"`
 	ProjectName          string     `json:"project_name"`
@@ -149,6 +154,9 @@ func (s *Service) Get(ctx context.Context, ownerUserID, requestID string) (Reque
 }
 
 func validateListParams(params *ListParams) error {
+	if params.ProjectID != "" && !isUUID(params.ProjectID) {
+		return fmt.Errorf("%w: project_id must be a UUID", ErrInvalidParams)
+	}
 	if params.Provider != "" && !oneOf(params.Provider, "openai", "anthropic", "deepseek") {
 		return fmt.Errorf("%w: provider must be openai, anthropic, or deepseek", ErrInvalidParams)
 	}
@@ -182,6 +190,25 @@ func oneOf(value string, allowed ...string) bool {
 		}
 	}
 	return false
+}
+
+// isUUID reports whether value is a canonical lowercase hyphenated UUID, the
+// form this API accepts for identifiers and filters. Validating at the domain
+// boundary keeps the HTTP contract (400 invalid_request) independent of any
+// store-level parse errors.
+func isUUID(value string) bool {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
+		return false
+	}
+	for _, char := range value {
+		if char == '-' {
+			continue
+		}
+		if !strings.ContainsRune("0123456789abcdefABCDEF", char) {
+			return false
+		}
+	}
+	return true
 }
 
 type cursorEnvelope struct {

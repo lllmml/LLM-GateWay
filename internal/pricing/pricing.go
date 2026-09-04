@@ -35,8 +35,10 @@ func Estimate(promptTokens, completionTokens, inputNanoPerMillion, outputNanoPer
 	if !ok {
 		return 0, false
 	}
-	// Each scaled() result is < math.MaxInt64, and both are non-negative;
-	// their sum still cannot overflow int64 (2*(MaxInt64-999_999) < MaxInt64).
+	// Correct bound: the overflow guard ensures tokens*nanoPerMillion <= MaxInt64
+	// before division, so each direction is <= MaxInt64/1_000_000 (~9.2e12).
+	// Two such values sum to ~1.8e13, far below MaxInt64 (~9.2e18), so the
+	// final addition cannot overflow int64.
 	return inputCost + outputCost, true
 }
 

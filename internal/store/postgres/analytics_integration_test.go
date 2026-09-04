@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"math"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 	"time"
 
 	sharedapikey "github.com/lllmml/production-go-llm-gateway/internal/apikey"
@@ -89,9 +91,16 @@ func newAnalyticsFixture(t *testing.T, ctx context.Context, store *Store) *analy
 // adapters so the durable lifecycle semantics are exercised end to end.
 func (f *analyticsFixture) insertRequest(t *testing.T, ctx context.Context, startedAt time.Time, status string, pricing *dataplane.ModelPrice, tokens *provider.Usage, retries int16, latencyMS *int64) string {
 	t.Helper()
+	return f.insertProviderRequest(t, ctx, startedAt, provider.OpenAI, "gpt-5.6-terra", status, pricing, tokens, retries, latencyMS)
+}
+
+// insertProviderRequest finalizes a gateway request row for an arbitrary
+// provider/model through the data plane store adapters.
+func (f *analyticsFixture) insertProviderRequest(t *testing.T, ctx context.Context, startedAt time.Time, name provider.Name, model, status string, pricing *dataplane.ModelPrice, tokens *provider.Usage, retries int16, latencyMS *int64) string {
+	t.Helper()
 	record, err := f.store.CreateGatewayRequest(ctx, dataplane.CreateRequestParams{
 		ProjectID: f.projectID, VirtualKeyID: f.keyID, ProviderCredentialID: f.credentialID,
-		Provider: provider.OpenAI, Model: "gpt-5.6-terra", IsStream: false, StartedAt: startedAt,
+		Provider: name, Model: model, IsStream: false, StartedAt: startedAt,
 	})
 	if err != nil {
 		t.Fatalf("create gateway request: %v", err)
@@ -430,7 +439,7 @@ func TestSeedMigrationIsDeterministicReversibleAndValid(t *testing.T) {
 		FROM model_prices AS a
 		JOIN model_prices AS b
 		  ON b.provider = a.provider AND b.model = a.model AND b.id <> a.id
-		 AND b.effective_from <= COALESCE(a.effective_to, 'infinity'::timestamptz)
+		 AND b.effective_from < COALESCE(a.effective_to, 'infinity'::timestamptz)
 		 AND a.effective_from < COALESCE(b.effective_to, 'infinity'::timestamptz)`).Scan(&overlaps)
 	if err != nil {
 		t.Fatalf("overlap check: %v", err)
@@ -555,3 +564,210 @@ var _ = fmt.Sprintf // keep fmt available for future diagnostics
 var _ = sharedapikey.ParseRawKey
 var _ = credential.SealedSecret{}
 var _ = dataplane.ErrNotFound
+
+func insertModelPriceRow(t *testing.T, ctx context.Context, pool *pgxpool.Pool, id, providerName, model string, inputNano int64, effectiveFrom, effectiveTo string) {
+	t.Helper()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO model_prices (id, provider, model, input_nano_usd_per_million, output_nano_usd_per_million, effective_from, effective_to, source_note)
+		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')::timestamptz, 'integration fixture')`,
+		id, providerName, model, inputNano, 1, effectiveFrom, effectiveTo)
+	if err != nil {
+		t.Fatalf("insert price %s: %v", id, err)
+	}
+}
+
+func countOverlaps(t *testing.T, ctx context.Context, pool *pgxpool.Pool, providerName, model string) int {
+	t.Helper()
+	var overlaps int
+	err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM model_prices AS a
+		JOIN model_prices AS b
+		  ON b.provider = a.provider AND b.model = a.model AND b.id <> a.id
+		 AND b.effective_from < COALESCE(a.effective_to, 'infinity'::timestamptz)
+		 AND a.effective_from < COALESCE(b.effective_to, 'infinity'::timestamptz)
+		WHERE a.provider = $1 AND a.model = $2`, providerName, model).Scan(&overlaps)
+	if err != nil {
+		t.Fatalf("overlap count: %v", err)
+	}
+	return overlaps
+}
+
+func TestModelPricesAdjacentWindowsAreNotOverlapping(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	pool, _, cleanup := newIsolatedPool(t, ctx)
+	defer cleanup()
+	applyMigration(t, ctx, pool, "000001_control_plane_foundation.up.sql")
+	applyMigration(t, ctx, pool, "000002_virtual_api_keys.up.sql")
+	applyMigration(t, ctx, pool, "000003_provider_credentials.up.sql")
+	applyMigration(t, ctx, pool, "000004_data_plane_foundation.up.sql")
+
+	// Adjacent half-open windows [t0,t1) + [t1,t2) must NOT be an overlap.
+	insertModelPriceRow(t, ctx, pool, "bbbbbbbb-0000-4000-8000-000000000001", "openai", "model-adjacent", 1_000_000_000, "2026-01-01T00:00:00Z", "2026-06-01T00:00:00Z")
+	insertModelPriceRow(t, ctx, pool, "bbbbbbbb-0000-4000-8000-000000000002", "openai", "model-adjacent", 2_000_000_000, "2026-06-01T00:00:00Z", "")
+	if overlaps := countOverlaps(t, ctx, pool, "openai", "model-adjacent"); overlaps != 0 {
+		t.Fatalf("adjacent windows reported as overlapping (%d); half-open [t0,t1)+[t1,t2) must be valid", overlaps)
+	}
+
+	// Truly overlapping windows [t0,t2) + [t1,t3) MUST be detected.
+	insertModelPriceRow(t, ctx, pool, "bbbbbbbb-0000-4000-8000-000000000003", "openai", "model-overlap", 1_000_000_000, "2026-01-01T00:00:00Z", "")
+	insertModelPriceRow(t, ctx, pool, "bbbbbbbb-0000-4000-8000-000000000004", "openai", "model-overlap", 2_000_000_000, "2026-03-01T00:00:00Z", "")
+	if overlaps := countOverlaps(t, ctx, pool, "openai", "model-overlap"); overlaps == 0 {
+		t.Fatal("overlapping windows were not detected")
+	}
+}
+
+func TestTimeseriesBucketsAreUTCIndependentOfSessionTimezone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	pool, _, cleanupPool := newIsolatedPool(t, ctx)
+	defer cleanupPool()
+	applyMigration(t, ctx, pool, "000001_control_plane_foundation.up.sql")
+	applyMigration(t, ctx, pool, "000002_virtual_api_keys.up.sql")
+	applyMigration(t, ctx, pool, "000003_provider_credentials.up.sql")
+	applyMigration(t, ctx, pool, "000004_data_plane_foundation.up.sql")
+	applyMigration(t, ctx, pool, "000005_seed_model_prices.up.sql")
+
+	// Bind every store call in this test to ONE connection whose session is
+	// deliberately non-UTC, so the query itself must do the UTC alignment.
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire conn: %v", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, "SET TIME ZONE 'America/Los_Angeles'"); err != nil {
+		t.Fatalf("set session timezone: %v", err)
+	}
+	var zone string
+	if err := conn.QueryRow(ctx, "SHOW TIME ZONE").Scan(&zone); err != nil {
+		t.Fatalf("read session timezone: %v", err)
+	}
+	if zone != "America/Los_Angeles" {
+		t.Fatalf("session timezone = %q, want America/Los_Angeles", zone)
+	}
+	store := &Store{queries: New(conn)}
+	fixture := newAnalyticsFixture(t, ctx, store)
+
+	// Day buckets: a request at 01:00Z on Sep 1 sits in UTC day Sep 1 even
+	// though a Los_Angeles session would place it on the previous local day.
+	fromDay := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	fixture.insertRequest(t, ctx, fromDay.Add(time.Hour), "succeeded", &analyticsTerraPrice, &provider.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}, 0, nil)
+	fixture.insertRequest(t, ctx, fromDay.Add(26*time.Hour), "succeeded", &analyticsTerraPrice, &provider.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}, 0, nil)
+	toDay := fromDay.Add(72 * time.Hour)
+
+	service := usage.NewService(store)
+	dayPoints, err := service.Timeseries(ctx, fixture.ownerID, "", "day", &fromDay, &toDay)
+	if err != nil {
+		t.Fatalf("day timeseries under LA session: %v", err)
+	}
+	if len(dayPoints) != 3 {
+		t.Fatalf("day points = %d, want 3", len(dayPoints))
+	}
+	wantUTC := []time.Time{
+		time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC),
+	}
+	for i, want := range wantUTC {
+		if !dayPoints[i].TS.Equal(want) {
+			t.Fatalf("day bucket %d = %v, want UTC %v", i, dayPoints[i].TS, want)
+		}
+	}
+	if dayPoints[0].RequestsTotal != 1 || dayPoints[1].RequestsTotal != 1 || dayPoints[2].RequestsTotal != 0 {
+		t.Fatalf("day totals = %+v", dayPoints)
+	}
+
+	// Hour buckets similarly land on UTC :00 boundaries under the LA session.
+	fromHour := time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC)
+	fixture.insertRequest(t, ctx, fromHour.Add(30*time.Minute), "succeeded", &analyticsTerraPrice, &provider.Usage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2}, 0, nil)
+	fixture.insertRequest(t, ctx, fromHour.Add(105*time.Minute), "succeeded", nil, &provider.Usage{PromptTokens: 3, CompletionTokens: 1, TotalTokens: 4}, 0, nil)
+	toHour := fromHour.Add(3 * time.Hour)
+	hourPoints, err := service.Timeseries(ctx, fixture.ownerID, "", "hour", &fromHour, &toHour)
+	if err != nil {
+		t.Fatalf("hour timeseries under LA session: %v", err)
+	}
+	if len(hourPoints) != 3 {
+		t.Fatalf("hour points = %d, want 3", len(hourPoints))
+	}
+	if !hourPoints[0].TS.Equal(time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC)) || hourPoints[0].RequestsTotal != 1 {
+		t.Fatalf("hour bucket 0 = %+v", hourPoints[0])
+	}
+	if !hourPoints[1].TS.Equal(time.Date(2026, 9, 5, 1, 0, 0, 0, time.UTC)) || hourPoints[1].RequestsTotal != 1 {
+		t.Fatalf("hour bucket 1 = %+v", hourPoints[1])
+	}
+	if !hourPoints[2].TS.Equal(time.Date(2026, 9, 5, 2, 0, 0, 0, time.UTC)) || hourPoints[2].RequestsTotal != 0 {
+		t.Fatalf("hour bucket 2 = %+v", hourPoints[2])
+	}
+}
+
+func TestUnpricedRequestsKeepTokensButNoCostAndCoverage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	store, cleanup := migratedAnalyticsStore(t, ctx)
+	defer cleanup()
+	fixture := newAnalyticsFixture(t, ctx, store)
+	base := time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC)
+
+	// One priced OpenAI request and one deliberately unpriced DeepSeek request
+	// (Week 7 has no DeepSeek price versions). Both report usage.
+	pricedID := fixture.insertRequest(t, ctx, base, "succeeded", &analyticsTerraPrice, &provider.Usage{PromptTokens: 1000, CompletionTokens: 500, TotalTokens: 1500}, 0, nil)
+	unpricedID := fixture.insertProviderRequest(t, ctx, base.Add(time.Minute), provider.DeepSeek, "deepseek-chat", "succeeded", nil, &provider.Usage{PromptTokens: 200, CompletionTokens: 100, TotalTokens: 300}, 0, nil)
+	_ = pricedID
+	_ = unpricedID
+
+	from := base.Add(-time.Hour)
+	to := base.Add(24 * time.Hour)
+	service := usage.NewService(fixture.store)
+
+	summary, err := service.Summary(ctx, fixture.ownerID, "", &from, &to)
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	// Tokens include EVERY reported usage, priced or not.
+	if summary.PromptTokens != 1200 || summary.CompletionTokens != 600 || summary.TotalTokens != 1800 {
+		t.Fatalf("token sums = %+v, want 1200/600/1800 (unpriced usage included)", summary)
+	}
+	// Cost only includes the priced request; coverage says one is unpriced.
+	if summary.EstimatedCostNanoUSD != 8_000_000 {
+		t.Fatalf("cost = %d, want 8000000 (only the priced request)", summary.EstimatedCostNanoUSD)
+	}
+	if summary.PricedRequests != 1 || summary.UnpricedRequests != 1 {
+		t.Fatalf("coverage priced=%d unpriced=%d, want 1/1", summary.PricedRequests, summary.UnpricedRequests)
+	}
+
+	// Breakdown: the DeepSeek group is entirely unpriced yet still reports its
+	// tokens; the aggregate cost value is zero but priced_requests==0 exposes
+	// that nothing was attributed (the UI renders it as unpriced, not $0.00).
+	groups, err := service.Breakdown(ctx, fixture.ownerID, "", "provider", &from, &to, 10)
+	if err != nil {
+		t.Fatalf("breakdown: %v", err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("provider groups = %+v", groups)
+	}
+	var openAIGroup, deepSeekGroup *usage.Group
+	for i := range groups {
+		if groups[i].Key == "openai" {
+			openAIGroup = &groups[i]
+		}
+		if groups[i].Key == "deepseek" {
+			deepSeekGroup = &groups[i]
+		}
+	}
+	if openAIGroup == nil || deepSeekGroup == nil {
+		t.Fatalf("missing groups: %+v", groups)
+	}
+	if openAIGroup.PricedRequests != 1 || openAIGroup.UnpricedRequests != 0 || openAIGroup.EstimatedCostNanoUSD != 8_000_000 {
+		t.Fatalf("openai group = %+v", openAIGroup)
+	}
+	if deepSeekGroup.PricedRequests != 0 || deepSeekGroup.UnpricedRequests != 1 {
+		t.Fatalf("deepseek group coverage = %+v", deepSeekGroup)
+	}
+	if deepSeekGroup.EstimatedCostNanoUSD != 0 {
+		t.Fatalf("deepseek cost = %d; aggregate sum is 0 but coverage must mark it unpriced", deepSeekGroup.EstimatedCostNanoUSD)
+	}
+	if deepSeekGroup.PromptTokens != 200 || deepSeekGroup.CompletionTokens != 100 || deepSeekGroup.TotalTokens != 300 {
+		t.Fatalf("deepseek group tokens = %+v, want reported usage aggregated", deepSeekGroup)
+	}
+}

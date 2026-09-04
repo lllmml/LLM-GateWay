@@ -56,6 +56,7 @@ func TestRequestHandlerRejectsBadQueryParameters(t *testing.T) {
 	cases := []string{
 		"/api/v1/requests?provider=gemini",
 		"/api/v1/requests?status=exploded",
+		"/api/v1/requests?project_id=not-a-uuid",
 		"/api/v1/requests?stream=maybe",
 		"/api/v1/requests?limit=99999",
 		"/api/v1/requests?from=not-a-time",

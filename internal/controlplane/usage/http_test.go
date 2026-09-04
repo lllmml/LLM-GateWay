@@ -54,8 +54,11 @@ func TestUsageEndpointsRejectBadParams(t *testing.T) {
 	mux := newUsageHandler(t, &handlerUsageStore{}, signedIn)
 	cases := []string{
 		"/api/v1/usage/timeseries?bucket=week",
+		"/api/v1/usage/timeseries?project_id=not-a-uuid",
 		"/api/v1/usage/timeseries?from=oops",
 		"/api/v1/usage/breakdown?dimension=region",
+		"/api/v1/usage/breakdown?dimension=provider&project_id=not-a-uuid",
+		"/api/v1/usage/summary?project_id=not-a-uuid",
 		"/api/v1/usage/summary?from=2026-09-02T00:00:00Z&to=2026-09-01T00:00:00Z",
 		"/api/v1/usage/summary?from=2020-01-01T00:00:00Z&to=2026-09-01T00:00:00Z", // >90 days
 	}

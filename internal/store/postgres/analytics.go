@@ -172,7 +172,8 @@ func (s *Store) UsageTimeseries(ctx context.Context, ownerUserID, projectID, buc
 		for _, row := range rows {
 			points = append(points, usage.Point{
 				TS: row.Ts.Time.UTC(), RequestsTotal: row.RequestsTotal, RequestsSucceeded: row.RequestsSucceeded,
-				RequestsFailed: row.RequestsFailed, PromptTokens: row.PromptTokens, CompletionTokens: row.CompletionTokens,
+				RequestsFailed: row.RequestsFailed, PricedRequests: row.RequestsPriced, UnpricedRequests: row.RequestsUnpriced,
+				PromptTokens: row.PromptTokens, CompletionTokens: row.CompletionTokens,
 				TotalTokens: row.TotalTokens, EstimatedCostNanoUSD: row.EstimatedCostNanoUsd,
 			})
 		}
@@ -187,7 +188,8 @@ func (s *Store) UsageTimeseries(ctx context.Context, ownerUserID, projectID, buc
 		for _, row := range rows {
 			points = append(points, usage.Point{
 				TS: row.Ts.Time.UTC(), RequestsTotal: row.RequestsTotal, RequestsSucceeded: row.RequestsSucceeded,
-				RequestsFailed: row.RequestsFailed, PromptTokens: row.PromptTokens, CompletionTokens: row.CompletionTokens,
+				RequestsFailed: row.RequestsFailed, PricedRequests: row.RequestsPriced, UnpricedRequests: row.RequestsUnpriced,
+				PromptTokens: row.PromptTokens, CompletionTokens: row.CompletionTokens,
 				TotalTokens: row.TotalTokens, EstimatedCostNanoUSD: row.EstimatedCostNanoUsd,
 			})
 		}
@@ -218,7 +220,7 @@ func (s *Store) UsageBreakdown(ctx context.Context, ownerUserID, projectID, dime
 		}
 		groups := make([]usage.Group, 0, len(rows))
 		for _, row := range rows {
-			groups = append(groups, groupFromRow(row.Key, row.RequestsTotal, row.RequestsFailed, row.PromptTokens, row.CompletionTokens, row.TotalTokens, row.EstimatedCostNanoUsd))
+			groups = append(groups, groupFromRow(row.Key, row.RequestsTotal, row.RequestsFailed, row.RequestsPriced, row.RequestsUnpriced, row.PromptTokens, row.CompletionTokens, row.TotalTokens, row.EstimatedCostNanoUsd))
 		}
 		return groups, nil
 	case "model":
@@ -230,7 +232,7 @@ func (s *Store) UsageBreakdown(ctx context.Context, ownerUserID, projectID, dime
 		}
 		groups := make([]usage.Group, 0, len(rows))
 		for _, row := range rows {
-			groups = append(groups, groupFromRow(row.Key, row.RequestsTotal, row.RequestsFailed, row.PromptTokens, row.CompletionTokens, row.TotalTokens, row.EstimatedCostNanoUsd))
+			groups = append(groups, groupFromRow(row.Key, row.RequestsTotal, row.RequestsFailed, row.RequestsPriced, row.RequestsUnpriced, row.PromptTokens, row.CompletionTokens, row.TotalTokens, row.EstimatedCostNanoUsd))
 		}
 		return groups, nil
 	case "key":
@@ -242,7 +244,7 @@ func (s *Store) UsageBreakdown(ctx context.Context, ownerUserID, projectID, dime
 		}
 		groups := make([]usage.Group, 0, len(rows))
 		for _, row := range rows {
-			group := groupFromRow(row.KeyPrefix, row.RequestsTotal, row.RequestsFailed, row.PromptTokens, row.CompletionTokens, row.TotalTokens, row.EstimatedCostNanoUsd)
+			group := groupFromRow(row.KeyPrefix, row.RequestsTotal, row.RequestsFailed, row.RequestsPriced, row.RequestsUnpriced, row.PromptTokens, row.CompletionTokens, row.TotalTokens, row.EstimatedCostNanoUsd)
 			keyID := formatUUID(row.KeyID)
 			group.KeyID = &keyID
 			group.KeyPrefix = &row.KeyPrefix
@@ -254,9 +256,10 @@ func (s *Store) UsageBreakdown(ctx context.Context, ownerUserID, projectID, dime
 	}
 }
 
-func groupFromRow(key string, total, failed, prompt, completion, totalTokens, cost int64) usage.Group {
+func groupFromRow(key string, total, failed, priced, unpriced, prompt, completion, totalTokens, cost int64) usage.Group {
 	return usage.Group{
 		Key: key, RequestsTotal: total, RequestsFailed: failed,
+		PricedRequests: priced, UnpricedRequests: unpriced,
 		PromptTokens: prompt, CompletionTokens: completion, TotalTokens: totalTokens,
 		EstimatedCostNanoUSD: cost,
 	}

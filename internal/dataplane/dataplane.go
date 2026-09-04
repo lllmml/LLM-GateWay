@@ -20,6 +20,13 @@ var (
 
 const finalizeTimeout = 5 * time.Second
 
+// pricingLookupBudget bounds the price-version lookup independently of the
+// durable row finalization. It must be strictly smaller than finalizeTimeout
+// so a slow/hung pricing lookup can never consume the whole finalization
+// budget: pricing failure degrades to NULL cost, while the final durable write
+// still receives a live context (ADR-016).
+const pricingLookupBudget = 1 * time.Second
+
 type AuthContext struct {
 	ProjectID    string
 	VirtualKeyID string
@@ -447,10 +454,15 @@ func (s *Service) finalizeStream(ctx context.Context, record GatewayRequest, res
 	// matched price version (provenance); estimated cost is derived and stays
 	// NULL when usage is missing or the calculation fails. Pricing problems
 	// never fail the request: they degrade to NULL plus a bounded log line.
+	// The pricing lookup gets its own child budget strictly smaller than
+	// finalizeCtx, so a lookup that burns its budget cannot starve the durable
+	// row write below.
 	var pricingID *string
 	var estimatedCostNanoUSD *int64
 	if status == "succeeded" {
-		pricingID, estimatedCostNanoUSD = s.resolvePricing(finalizeCtx, record, usage)
+		pricingCtx, pricingCancel := context.WithTimeout(finalizeCtx, pricingLookupBudget)
+		pricingID, estimatedCostNanoUSD = s.resolvePricing(pricingCtx, record, usage)
+		pricingCancel()
 	}
 	return s.store.FinalizeGatewayRequest(finalizeCtx, FinalizeParams{
 		ID:                   record.ID,
@@ -492,7 +504,11 @@ func (s *Service) resolvePricing(ctx context.Context, record GatewayRequest, usa
 		return nil, nil
 	}
 	if err != nil {
-		s.logger.Warn("pricing lookup failed; finalizing without estimated cost", append(logFields, slog.String("error", err.Error()))...)
+		if errors.Is(err, context.DeadlineExceeded) {
+			s.logger.Warn("pricing lookup budget exceeded; finalizing without estimated cost", logFields...)
+		} else {
+			s.logger.Warn("pricing lookup failed; finalizing without estimated cost", append(logFields, slog.String("error", err.Error()))...)
+		}
 		return nil, nil
 	}
 	if usage == nil {

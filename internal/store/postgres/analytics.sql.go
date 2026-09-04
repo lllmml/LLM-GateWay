@@ -16,7 +16,6 @@ SELECT
     r.id,
     r.project_id,
     r.virtual_key_id,
-    r.provider_credential_id,
     r.provider,
     r.model,
     r.is_stream,
@@ -58,7 +57,6 @@ type GetRequestForOwnerRow struct {
 	ID                   pgtype.UUID
 	ProjectID            pgtype.UUID
 	VirtualKeyID         pgtype.UUID
-	ProviderCredentialID pgtype.UUID
 	Provider             string
 	Model                string
 	IsStream             bool
@@ -91,7 +89,6 @@ func (q *Queries) GetRequestForOwner(ctx context.Context, arg GetRequestForOwner
 		&i.ID,
 		&i.ProjectID,
 		&i.VirtualKeyID,
-		&i.ProviderCredentialID,
 		&i.Provider,
 		&i.Model,
 		&i.IsStream,
@@ -125,7 +122,6 @@ SELECT
     r.id,
     r.project_id,
     r.virtual_key_id,
-    r.provider_credential_id,
     r.provider,
     r.model,
     r.is_stream,
@@ -189,7 +185,6 @@ type ListRequestsForOwnerRow struct {
 	ID                   pgtype.UUID
 	ProjectID            pgtype.UUID
 	VirtualKeyID         pgtype.UUID
-	ProviderCredentialID pgtype.UUID
 	Provider             string
 	Model                string
 	IsStream             bool
@@ -225,9 +220,15 @@ type ListRequestsForOwnerRow struct {
 // generate_series aligned to date_trunc(bucket, from); the first and last
 // buckets may be partial. Zero-fill is server-side via LEFT JOIN + COALESCE.
 //
-// estimated_cost_nano_usd aggregates only base-rate attributed costs (rows
-// with a recorded cost). Requests whose usage or price version was unknown
-// contribute to counts but not to the cost/token sums.
+// Token sums include EVERY reported non-null usage, independent of whether a
+// price version exists. estimated_cost_nano_usd aggregates only base-rate
+// attributed costs (succeeded rows with pricing_id and a recorded cost);
+// priced/unpriced request counts expose cost completeness separately.
+//
+// The durable gateway_requests row carries provider_credential_id, an
+// internal attribution FK. It is intentionally NOT selected here: the public
+// request-history contract exposes virtual-key and project identity for safe
+// display attribution and no analytics path references the credential FK.
 func (q *Queries) ListRequestsForOwner(ctx context.Context, arg ListRequestsForOwnerParams) ([]ListRequestsForOwnerRow, error) {
 	rows, err := q.db.Query(ctx, listRequestsForOwner,
 		arg.OwnerUserID,
@@ -253,7 +254,6 @@ func (q *Queries) ListRequestsForOwner(ctx context.Context, arg ListRequestsForO
 			&i.ID,
 			&i.ProjectID,
 			&i.VirtualKeyID,
-			&i.ProviderCredentialID,
 			&i.Provider,
 			&i.Model,
 			&i.IsStream,
@@ -294,6 +294,8 @@ SELECT
     k.key_prefix AS key_prefix,
     count(*)::bigint AS requests_total,
     count(*) FILTER (WHERE r.status = 'failed')::bigint AS requests_failed,
+    count(*) FILTER (WHERE r.status = 'succeeded' AND r.pricing_id IS NOT NULL AND r.estimated_cost_nano_usd IS NOT NULL)::bigint AS requests_priced,
+    count(*) FILTER (WHERE r.status = 'succeeded' AND (r.pricing_id IS NULL OR r.estimated_cost_nano_usd IS NULL))::bigint AS requests_unpriced,
     COALESCE(SUM(r.prompt_tokens), 0)::bigint AS prompt_tokens,
     COALESCE(SUM(r.completion_tokens), 0)::bigint AS completion_tokens,
     COALESCE(SUM(r.total_tokens), 0)::bigint AS total_tokens,
@@ -325,6 +327,8 @@ type UsageBreakdownByKeyForOwnerRow struct {
 	KeyPrefix            string
 	RequestsTotal        int64
 	RequestsFailed       int64
+	RequestsPriced       int64
+	RequestsUnpriced     int64
 	PromptTokens         int64
 	CompletionTokens     int64
 	TotalTokens          int64
@@ -351,6 +355,8 @@ func (q *Queries) UsageBreakdownByKeyForOwner(ctx context.Context, arg UsageBrea
 			&i.KeyPrefix,
 			&i.RequestsTotal,
 			&i.RequestsFailed,
+			&i.RequestsPriced,
+			&i.RequestsUnpriced,
 			&i.PromptTokens,
 			&i.CompletionTokens,
 			&i.TotalTokens,
@@ -371,6 +377,8 @@ SELECT
     r.model AS key,
     count(*)::bigint AS requests_total,
     count(*) FILTER (WHERE r.status = 'failed')::bigint AS requests_failed,
+    count(*) FILTER (WHERE r.status = 'succeeded' AND r.pricing_id IS NOT NULL AND r.estimated_cost_nano_usd IS NOT NULL)::bigint AS requests_priced,
+    count(*) FILTER (WHERE r.status = 'succeeded' AND (r.pricing_id IS NULL OR r.estimated_cost_nano_usd IS NULL))::bigint AS requests_unpriced,
     COALESCE(SUM(r.prompt_tokens), 0)::bigint AS prompt_tokens,
     COALESCE(SUM(r.completion_tokens), 0)::bigint AS completion_tokens,
     COALESCE(SUM(r.total_tokens), 0)::bigint AS total_tokens,
@@ -399,6 +407,8 @@ type UsageBreakdownByModelForOwnerRow struct {
 	Key                  string
 	RequestsTotal        int64
 	RequestsFailed       int64
+	RequestsPriced       int64
+	RequestsUnpriced     int64
 	PromptTokens         int64
 	CompletionTokens     int64
 	TotalTokens          int64
@@ -424,6 +434,8 @@ func (q *Queries) UsageBreakdownByModelForOwner(ctx context.Context, arg UsageBr
 			&i.Key,
 			&i.RequestsTotal,
 			&i.RequestsFailed,
+			&i.RequestsPriced,
+			&i.RequestsUnpriced,
 			&i.PromptTokens,
 			&i.CompletionTokens,
 			&i.TotalTokens,
@@ -444,6 +456,8 @@ SELECT
     r.provider AS key,
     count(*)::bigint AS requests_total,
     count(*) FILTER (WHERE r.status = 'failed')::bigint AS requests_failed,
+    count(*) FILTER (WHERE r.status = 'succeeded' AND r.pricing_id IS NOT NULL AND r.estimated_cost_nano_usd IS NOT NULL)::bigint AS requests_priced,
+    count(*) FILTER (WHERE r.status = 'succeeded' AND (r.pricing_id IS NULL OR r.estimated_cost_nano_usd IS NULL))::bigint AS requests_unpriced,
     COALESCE(SUM(r.prompt_tokens), 0)::bigint AS prompt_tokens,
     COALESCE(SUM(r.completion_tokens), 0)::bigint AS completion_tokens,
     COALESCE(SUM(r.total_tokens), 0)::bigint AS total_tokens,
@@ -472,6 +486,8 @@ type UsageBreakdownByProviderForOwnerRow struct {
 	Key                  string
 	RequestsTotal        int64
 	RequestsFailed       int64
+	RequestsPriced       int64
+	RequestsUnpriced     int64
 	PromptTokens         int64
 	CompletionTokens     int64
 	TotalTokens          int64
@@ -497,6 +513,8 @@ func (q *Queries) UsageBreakdownByProviderForOwner(ctx context.Context, arg Usag
 			&i.Key,
 			&i.RequestsTotal,
 			&i.RequestsFailed,
+			&i.RequestsPriced,
+			&i.RequestsUnpriced,
 			&i.PromptTokens,
 			&i.CompletionTokens,
 			&i.TotalTokens,
@@ -592,21 +610,25 @@ SELECT
     COALESCE(a.requests_total, 0)::bigint AS requests_total,
     COALESCE(a.requests_succeeded, 0)::bigint AS requests_succeeded,
     COALESCE(a.requests_failed, 0)::bigint AS requests_failed,
+    COALESCE(a.requests_priced, 0)::bigint AS requests_priced,
+    COALESCE(a.requests_unpriced, 0)::bigint AS requests_unpriced,
     COALESCE(a.prompt_tokens, 0)::bigint AS prompt_tokens,
     COALESCE(a.completion_tokens, 0)::bigint AS completion_tokens,
     COALESCE(a.total_tokens, 0)::bigint AS total_tokens,
     COALESCE(a.estimated_cost_nano_usd, 0)::bigint AS estimated_cost_nano_usd
 FROM generate_series(
-    date_trunc('day', $1::timestamptz),
-    date_trunc('day', $2::timestamptz - interval '1 microsecond'),
+    date_trunc('day', ($1::timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+    date_trunc('day', (($2::timestamptz) - interval '1 microsecond') AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
     interval '1 day'
 ) AS buckets(ts)
 LEFT JOIN (
     SELECT
-        date_trunc('day', r.started_at)::timestamptz AS ts,
+        date_trunc('day', (r.started_at AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC' AS ts,
         count(*)::bigint AS requests_total,
         count(*) FILTER (WHERE r.status = 'succeeded')::bigint AS requests_succeeded,
         count(*) FILTER (WHERE r.status = 'failed')::bigint AS requests_failed,
+        count(*) FILTER (WHERE r.status = 'succeeded' AND r.pricing_id IS NOT NULL AND r.estimated_cost_nano_usd IS NOT NULL)::bigint AS requests_priced,
+        count(*) FILTER (WHERE r.status = 'succeeded' AND (r.pricing_id IS NULL OR r.estimated_cost_nano_usd IS NULL))::bigint AS requests_unpriced,
         COALESCE(SUM(r.prompt_tokens), 0)::bigint AS prompt_tokens,
         COALESCE(SUM(r.completion_tokens), 0)::bigint AS completion_tokens,
         COALESCE(SUM(r.total_tokens), 0)::bigint AS total_tokens,
@@ -635,6 +657,8 @@ type UsageTimeseriesForOwnerDayRow struct {
 	RequestsTotal        int64
 	RequestsSucceeded    int64
 	RequestsFailed       int64
+	RequestsPriced       int64
+	RequestsUnpriced     int64
 	PromptTokens         int64
 	CompletionTokens     int64
 	TotalTokens          int64
@@ -660,6 +684,8 @@ func (q *Queries) UsageTimeseriesForOwnerDay(ctx context.Context, arg UsageTimes
 			&i.RequestsTotal,
 			&i.RequestsSucceeded,
 			&i.RequestsFailed,
+			&i.RequestsPriced,
+			&i.RequestsUnpriced,
 			&i.PromptTokens,
 			&i.CompletionTokens,
 			&i.TotalTokens,
@@ -681,21 +707,25 @@ SELECT
     COALESCE(a.requests_total, 0)::bigint AS requests_total,
     COALESCE(a.requests_succeeded, 0)::bigint AS requests_succeeded,
     COALESCE(a.requests_failed, 0)::bigint AS requests_failed,
+    COALESCE(a.requests_priced, 0)::bigint AS requests_priced,
+    COALESCE(a.requests_unpriced, 0)::bigint AS requests_unpriced,
     COALESCE(a.prompt_tokens, 0)::bigint AS prompt_tokens,
     COALESCE(a.completion_tokens, 0)::bigint AS completion_tokens,
     COALESCE(a.total_tokens, 0)::bigint AS total_tokens,
     COALESCE(a.estimated_cost_nano_usd, 0)::bigint AS estimated_cost_nano_usd
 FROM generate_series(
-    date_trunc('hour', $1::timestamptz),
-    date_trunc('hour', $2::timestamptz - interval '1 microsecond'),
+    date_trunc('hour', ($1::timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+    date_trunc('hour', (($2::timestamptz) - interval '1 microsecond') AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
     interval '1 hour'
 ) AS buckets(ts)
 LEFT JOIN (
     SELECT
-        date_trunc('hour', r.started_at)::timestamptz AS ts,
+        date_trunc('hour', (r.started_at AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC' AS ts,
         count(*)::bigint AS requests_total,
         count(*) FILTER (WHERE r.status = 'succeeded')::bigint AS requests_succeeded,
         count(*) FILTER (WHERE r.status = 'failed')::bigint AS requests_failed,
+        count(*) FILTER (WHERE r.status = 'succeeded' AND r.pricing_id IS NOT NULL AND r.estimated_cost_nano_usd IS NOT NULL)::bigint AS requests_priced,
+        count(*) FILTER (WHERE r.status = 'succeeded' AND (r.pricing_id IS NULL OR r.estimated_cost_nano_usd IS NULL))::bigint AS requests_unpriced,
         COALESCE(SUM(r.prompt_tokens), 0)::bigint AS prompt_tokens,
         COALESCE(SUM(r.completion_tokens), 0)::bigint AS completion_tokens,
         COALESCE(SUM(r.total_tokens), 0)::bigint AS total_tokens,
@@ -724,6 +754,8 @@ type UsageTimeseriesForOwnerHourRow struct {
 	RequestsTotal        int64
 	RequestsSucceeded    int64
 	RequestsFailed       int64
+	RequestsPriced       int64
+	RequestsUnpriced     int64
 	PromptTokens         int64
 	CompletionTokens     int64
 	TotalTokens          int64
@@ -749,6 +781,8 @@ func (q *Queries) UsageTimeseriesForOwnerHour(ctx context.Context, arg UsageTime
 			&i.RequestsTotal,
 			&i.RequestsSucceeded,
 			&i.RequestsFailed,
+			&i.RequestsPriced,
+			&i.RequestsUnpriced,
 			&i.PromptTokens,
 			&i.CompletionTokens,
 			&i.TotalTokens,
