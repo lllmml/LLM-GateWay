@@ -19,10 +19,13 @@
 //     gained an optional max_tokens in Week 6; when the client omits it the
 //     adapter applies a documented default (defaultMaxTokens) instead of
 //     silently inventing per-request behavior;
-//   - system messages are hoisted from the OpenAI-style messages array into
-//     the top-level Anthropic system field, because the Messages API expects
-//     system context there and treats messages as alternating user/assistant
-//     turns;
+//   - only LEADING system messages (before the first user/assistant message)
+//     are translated into the top-level Anthropic system field (joined with
+//     "\n\n"). The Messages API can only express system context in that
+//     top-level field, so a system message that appears after the conversation
+//     has started cannot be represented without silently reordering it; the
+//     adapter rejects such a request (unsupported_feature) before any upstream
+//     HTTP work instead of changing conversation semantics;
 //   - responses carry content blocks and a stop_reason instead of
 //     choices[].message; the adapter joins text blocks into the OpenAI-
 //     compatible content channel, maps stop reasons onto OpenAI finish
@@ -267,11 +270,24 @@ func (c *Client) buildRequest(chat provider.ChatRequest, credential provider.Cre
 	}
 	var systemParts []string
 	messages := make([]wireRequestMessage, 0, len(chat.Messages))
+	seenConversationTurn := false
 	for _, current := range chat.Messages {
 		if current.Role == "system" {
+			if seenConversationTurn {
+				// The Messages API can only carry system context in its top-level
+				// system field, so a system message that arrives after the first
+				// user/assistant turn cannot be expressed without silently moving
+				// it to the front and changing conversation semantics. Reject the
+				// request before any upstream HTTP work.
+				return nil, "", &provider.Error{
+					Category: provider.UnsupportedFeature,
+					Message:  "system messages must appear before the first user or assistant message",
+				}
+			}
 			systemParts = append(systemParts, current.Content)
 			continue
 		}
+		seenConversationTurn = true
 		messages = append(messages, wireRequestMessage{Role: current.Role, Content: current.Content})
 	}
 	maxTokens := int64(defaultMaxTokens)
@@ -515,11 +531,15 @@ func normalizeUsage(usage *wireUsage) *provider.Usage {
 }
 
 // finishReason maps an Anthropic stop_reason onto the OpenAI-compatible
-// finish_reason vocabulary of the public subset. Reasons that cannot occur
-// under the gateway subset still map defensively (tool_use -> tool_calls even
-// though the gateway never requests tools); genuinely unknown reasons map to
-// "" because Anthropic's versioning policy allows new values and a completed
-// turn must not be turned into a failure by an unfamiliar stop reason.
+// finish_reason vocabulary of the public subset. refusal is a documented,
+// normal successful Messages API stop reason; it maps to content_filter so a
+// refusing completion still terminates with an explicit finish reason instead
+// of an open-ended stop. tool_use maps defensively (the gateway never requests
+// tools). pause_turn and any genuinely unknown reasons map to "" because
+// Anthropic's versioning policy allows new values and a completed turn must
+// not be turned into a failure by an unfamiliar stop reason; pause_turn is
+// documented as outside the supported gateway subset (no server-tool
+// support).
 func finishReason(stopReason *string) string {
 	if stopReason == nil {
 		return ""
@@ -527,30 +547,53 @@ func finishReason(stopReason *string) string {
 	switch *stopReason {
 	case "end_turn":
 		return "stop"
-	case "max_tokens", "model_context_window_exceeded":
-		return "length"
 	case "stop_sequence":
 		return "stop"
+	case "max_tokens", "model_context_window_exceeded":
+		return "length"
 	case "tool_use":
 		return "tool_calls"
+	case "refusal":
+		return "content_filter"
 	default:
 		return ""
 	}
 }
 
 // chatStream decodes the Anthropic named SSE event stream and re-encodes it as
-// OpenAI-compatible chunk events plus a synthetic data: [DONE] on
+// OpenAI-compatible chunk events plus a synthetic data: [DONE] on a valid
 // message_stop, so the shared Data Plane contract (DONE is the only success
 // marker; usage is committed only at DONE) is preserved. Usage.input_tokens is
 // captured from message_start; usage.output_tokens is captured (cumulative)
 // from message_delta. Non-text content deltas (thinking, signature,
 // input_json) and unknown named event types are skipped gracefully, per the
 // Anthropic versioning policy.
+//
+// The sequence contract is enforced with explicit phase state: message_start
+// must be the first event and occur exactly once; content deltas may only
+// appear between message_start and the first message_delta; message_stop is a
+// valid terminal only after at least one message_delta has been observed. Any
+// violation fails the stream (StreamInterrupted) without synthesizing [DONE]
+// or exposing usage. Usage counters must be non-negative, and message_delta
+// output_tokens is cumulative and must never decrease.
+type streamPhase int
+
+const (
+	// phaseInitial means no structural event has been observed yet.
+	phaseInitial streamPhase = iota
+	// phaseStarted means message_start has been observed exactly once.
+	phaseStarted
+	// phaseFinalized means at least one message_delta has been observed.
+	phaseFinalized
+)
+
 type chatStream struct {
 	body              io.ReadCloser
 	decoder           *sse.Decoder
 	upstreamStatus    int
 	upstreamRequestID string
+
+	phase streamPhase
 
 	// Synthesis state drawn from message_start.
 	messageID string
@@ -587,7 +630,7 @@ func (s *chatStream) Next() (provider.StreamEvent, error) {
 		}
 		switch event.Name {
 		case "message_start":
-			if s.messageID != "" {
+			if s.phase != phaseInitial {
 				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream sent message_start more than once"))
 			}
 			var payload struct {
@@ -605,17 +648,24 @@ func (s *chatStream) Next() (provider.StreamEvent, error) {
 			if strings.TrimSpace(payload.Message.ID) == "" || strings.TrimSpace(payload.Message.Model) == "" {
 				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream message_start missing required fields"))
 			}
+			if payload.Message.Usage.InputTokens < 0 {
+				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream reported negative input_tokens"))
+			}
+			s.phase = phaseStarted
 			s.messageID = payload.Message.ID
 			s.model = payload.Message.Model
 			s.created = time.Now().Unix()
 			s.inputTokens = payload.Message.Usage.InputTokens
 			continue
 		case "content_block_delta":
-			if s.stopSent {
-				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream sent content after the final message delta"))
-			}
-			if s.messageID == "" {
+			if s.phase == phaseInitial {
 				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream sent content before message_start"))
+			}
+			if s.phase != phaseStarted {
+				// Content blocks precede message_delta events in the contract; a
+				// delta after any message_delta (including one that only carried
+				// usage) is out of order.
+				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream sent content after message_delta"))
 			}
 			var payload struct {
 				Delta struct {
@@ -640,6 +690,9 @@ func (s *chatStream) Next() (provider.StreamEvent, error) {
 			}
 			return provider.StreamEvent{Data: encoded}, nil
 		case "message_delta":
+			if s.phase == phaseInitial {
+				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream sent message_delta before message_start"))
+			}
 			var payload struct {
 				Delta struct {
 					StopReason *string `json:"stop_reason"`
@@ -651,6 +704,13 @@ func (s *chatStream) Next() (provider.StreamEvent, error) {
 			if err := decodeSingle(event.Data, &payload); err != nil {
 				return provider.StreamEvent{}, s.fail(s.decodeError(err))
 			}
+			if payload.Usage.OutputTokens < 0 {
+				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream reported negative output_tokens"))
+			}
+			if payload.Usage.OutputTokens < s.outputTokens {
+				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream output_tokens decreased"))
+			}
+			s.phase = phaseFinalized
 			s.outputTokens = payload.Usage.OutputTokens
 			if reason := finishReason(payload.Delta.StopReason); reason != "" && !s.stopSent {
 				s.stopSent = true
@@ -662,6 +722,11 @@ func (s *chatStream) Next() (provider.StreamEvent, error) {
 			}
 			continue
 		case "message_stop":
+			if s.phase != phaseFinalized {
+				// A successful terminal requires at least one message_delta (the
+				// event that carries the final usage and stop reason).
+				return provider.StreamEvent{}, s.fail(s.sequenceError("provider stream reached message_stop without a prior message_delta"))
+			}
 			s.done = true
 			s.usage = &provider.Usage{
 				PromptTokens:     s.inputTokens,

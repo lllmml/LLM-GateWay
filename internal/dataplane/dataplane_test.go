@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -2631,5 +2632,79 @@ func TestHandlerRejectsNonPositiveMaxTokensBeforeUpstream(t *testing.T) {
 		if store.createCalls != 0 {
 			t.Fatalf("create calls = %d, want 0", store.createCalls)
 		}
+	}
+}
+
+// A mid-conversation system message cannot be expressed by the Anthropic
+// Messages API without silently reordering the prompt. The adapter rejects it
+// before any upstream HTTP work; the gateway surfaces a stable 400
+// unsupported_feature and still records the failed attempt for attribution.
+func TestHandlerRejectsAnthropicMidConversationSystemBeforeUpstream(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "non-stream"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			upstreamCalls := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				upstreamCalls++
+				t.Fatalf("upstream must not be called for a rejected request")
+			}))
+			defer upstream.Close()
+
+			baseStore, rawKey := newAuthorizedStoreForProvider(t, provider.Anthropic, testCredentialID)
+			baseStore.credential.BaseURLOverride = upstream.URL
+			store := newNotifyingStore(baseStore)
+			service := newServiceForStoreWithClientsAndTimeouts(t, store, map[provider.Name]provider.Client{
+				provider.Anthropic: anthropic.New(upstream.Client()),
+			}, nil, time.Second, time.Second)
+			handler := NewHandler(service)
+			mux := http.NewServeMux()
+			handler.Register(mux)
+			gateway := httptest.NewServer(mux)
+			defer gateway.Close()
+
+			request, err := http.NewRequest(http.MethodPost, gateway.URL+"/v1/chat/completions", strings.NewReader(`{
+				"model":"anthropic/claude-sonnet-x",
+				"messages":[
+					{"role":"system","content":"lead rule"},
+					{"role":"user","content":"hello"},
+					{"role":"system","content":"late rule"}
+				],
+				"stream":`+strconv.FormatBool(stream)+`
+			}`))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+rawKey)
+			response, err := gateway.Client().Do(request)
+			if err != nil {
+				t.Fatalf("gateway request: %v", err)
+			}
+			defer response.Body.Close()
+
+			if response.StatusCode != http.StatusBadRequest {
+				body, _ := io.ReadAll(response.Body)
+				t.Fatalf("status = %d, want 400; body=%s", response.StatusCode, body)
+			}
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatalf("read response body: %v", err)
+			}
+			if !strings.Contains(string(body), `"code":"unsupported_feature"`) ||
+				!strings.Contains(string(body), "request includes a feature not supported by the selected provider") {
+				t.Fatalf("response body = %s", body)
+			}
+			if upstreamCalls != 0 {
+				t.Fatalf("upstream calls = %d, want 0", upstreamCalls)
+			}
+			finalize := store.waitFinalize(t)
+			if finalize.params.Status != "failed" || finalize.params.ErrorCategory == nil ||
+				*finalize.params.ErrorCategory != provider.UnsupportedFeature {
+				t.Fatalf("finalize = %+v", finalize.params)
+			}
+		})
 	}
 }

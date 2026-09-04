@@ -143,40 +143,163 @@ func TestCompleteChatForwardsExplicitMaxTokens(t *testing.T) {
 	}
 }
 
-func TestCompleteChatHoistsMultipleSystemMessages(t *testing.T) {
+// Leading system messages (before the first user/assistant turn) are the only
+// system context Anthropic can express in its top-level system field. One or
+// more consecutive leading system messages are joined with "\n\n".
+func TestCompleteChatTranslatesLeadingSystemMessages(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		messages   []provider.Message
+		wantSystem string
+		wantRoles  []string
+	}{
+		{
+			name:       "single leading system message",
+			messages:   []provider.Message{{Role: "system", Content: "rule"}, {Role: "user", Content: "hi"}},
+			wantSystem: "rule",
+			wantRoles:  []string{"user"},
+		},
+		{
+			name: "multiple consecutive leading system messages",
+			messages: []provider.Message{
+				{Role: "system", Content: "first rule"},
+				{Role: "system", Content: "second rule"},
+				{Role: "user", Content: "hi"},
+				{Role: "assistant", Content: "hello"},
+			},
+			wantSystem: "first rule\n\nsecond rule",
+			wantRoles:  []string{"user", "assistant"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				rawBody, err := io.ReadAll(request.Body)
+				if err != nil {
+					t.Fatalf("read request body: %v", err)
+				}
+				body := decodeRequestBody(t, rawBody)
+				if body.System != tt.wantSystem {
+					t.Fatalf("system = %q, want %q", body.System, tt.wantSystem)
+				}
+				roles := make([]string, 0, len(body.Messages))
+				for _, current := range body.Messages {
+					roles = append(roles, current.Role)
+				}
+				if strings.Join(roles, ",") != strings.Join(tt.wantRoles, ",") {
+					t.Fatalf("messages roles = %v, want %v", roles, tt.wantRoles)
+				}
+				response.Header().Set("Content-Type", "application/json")
+				_, _ = response.Write([]byte(`{
+					"id":"msg_03","type":"message","role":"assistant","model":"claude-sonnet-x",
+					"content":[{"type":"text","text":"ok"}],
+					"stop_reason":"end_turn","stop_sequence":null,
+					"usage":{"input_tokens":2,"output_tokens":3}
+				}`))
+			}))
+			defer server.Close()
+
+			_, err := New(server.Client()).CompleteChat(context.Background(), provider.ChatRequest{
+				Model:    "claude-sonnet-x",
+				Messages: tt.messages,
+			}, provider.Credential{APIKey: []byte("sk-ant-test"), BaseURLOverride: server.URL})
+			if err != nil {
+				t.Fatalf("complete chat: %v", err)
+			}
+		})
+	}
+}
+
+// A system message after the first user/assistant turn cannot be expressed by
+// the Messages API without silently moving it to the front of the prompt. The
+// adapter must reject it before any upstream HTTP work instead of changing
+// conversation semantics.
+func TestCompleteChatRejectsMidConversationSystemMessage(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		messages []provider.Message
+	}{
+		{
+			name:     "system after user",
+			messages: []provider.Message{{Role: "user", Content: "hi"}, {Role: "system", Content: "late rule"}},
+		},
+		{
+			name:     "system after assistant",
+			messages: []provider.Message{{Role: "assistant", Content: "hello"}, {Role: "system", Content: "late rule"}},
+		},
+		{
+			name:     "system between user and assistant turns",
+			messages: []provider.Message{{Role: "system", Content: "lead rule"}, {Role: "user", Content: "hi"}, {Role: "system", Content: "late rule"}},
+		},
+		{
+			name: "system after several turns",
+			messages: []provider.Message{
+				{Role: "system", Content: "a"},
+				{Role: "user", Content: "u"},
+				{Role: "assistant", Content: "a"},
+				{Role: "user", Content: "u2"},
+				{Role: "system", Content: "z"},
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			upstreamCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				upstreamCalls++
+				t.Fatalf("upstream must not be called for a rejected request")
+			}))
+			defer server.Close()
+
+			_, err := New(server.Client()).CompleteChat(context.Background(), provider.ChatRequest{
+				Model:    "anthropic/claude-sonnet-x",
+				Messages: tt.messages,
+			}, provider.Credential{APIKey: []byte("sk-ant-test"), BaseURLOverride: server.URL})
+			if err == nil {
+				t.Fatal("CompleteChat returned nil error")
+			}
+			providerErr, ok := provider.AsError(err)
+			if !ok {
+				t.Fatalf("error type = %T", err)
+			}
+			if providerErr.Category != provider.UnsupportedFeature {
+				t.Fatalf("category = %q, want %q (error=%+v)", providerErr.Category, provider.UnsupportedFeature, providerErr)
+			}
+			if providerErr.Message != "system messages must appear before the first user or assistant message" {
+				t.Fatalf("message = %q, want stable rejection message", providerErr.Message)
+			}
+			if upstreamCalls != 0 {
+				t.Fatalf("upstream calls = %d, want 0", upstreamCalls)
+			}
+		})
+	}
+}
+
+// buildRequest is shared by the stream path, so a mid-conversation system
+// message must also be rejected before the upstream stream request is sent.
+func TestStreamChatRejectsMidConversationSystemMessageBeforeUpstream(t *testing.T) {
+	upstreamCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		rawBody, err := io.ReadAll(request.Body)
-		if err != nil {
-			t.Fatalf("read request body: %v", err)
-		}
-		body := decodeRequestBody(t, rawBody)
-		if body.System != "first rule\n\nsecond rule" {
-			t.Fatalf("system = %q", body.System)
-		}
-		if len(body.Messages) != 2 || body.Messages[0].Role != "user" || body.Messages[1].Role != "assistant" {
-			t.Fatalf("messages = %+v", body.Messages)
-		}
-		response.Header().Set("Content-Type", "application/json")
-		_, _ = response.Write([]byte(`{
-			"id":"msg_03","type":"message","role":"assistant","model":"claude-sonnet-x",
-			"content":[{"type":"text","text":"ok"}],
-			"stop_reason":"end_turn","stop_sequence":null,
-			"usage":{"input_tokens":2,"output_tokens":3}
-		}`))
+		upstreamCalls++
+		t.Fatalf("upstream must not be called for a rejected request")
 	}))
 	defer server.Close()
 
-	_, err := New(server.Client()).CompleteChat(context.Background(), provider.ChatRequest{
-		Model: "claude-sonnet-x",
-		Messages: []provider.Message{
-			{Role: "system", Content: "first rule"},
-			{Role: "user", Content: "hi"},
-			{Role: "system", Content: "second rule"},
-			{Role: "assistant", Content: "hello"},
-		},
+	_, err := New(server.Client()).StreamChat(context.Background(), provider.ChatRequest{
+		Model:    "anthropic/claude-sonnet-x",
+		Messages: []provider.Message{{Role: "user", Content: "hi"}, {Role: "system", Content: "late rule"}},
+		Stream:   true,
 	}, provider.Credential{APIKey: []byte("sk-ant-test"), BaseURLOverride: server.URL})
-	if err != nil {
-		t.Fatalf("complete chat: %v", err)
+	if err == nil {
+		t.Fatal("StreamChat returned nil error")
+	}
+	providerErr, ok := provider.AsError(err)
+	if !ok {
+		t.Fatalf("error type = %T", err)
+	}
+	if providerErr.Category != provider.UnsupportedFeature {
+		t.Fatalf("category = %q, want %q (error=%+v)", providerErr.Category, provider.UnsupportedFeature, providerErr)
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("upstream calls = %d, want 0", upstreamCalls)
 	}
 }
 
@@ -191,7 +314,9 @@ func TestCompleteChatMapsStopReasons(t *testing.T) {
 		{"model_context_window_exceeded to length", "model_context_window_exceeded", "length"},
 		{"stop_sequence to stop", "stop_sequence", "stop"},
 		{"tool_use to tool_calls", "tool_use", "tool_calls"},
-		{"unknown reason maps to empty", "refusal", ""},
+		{"refusal to content_filter", "refusal", "content_filter"},
+		{"pause_turn is outside the supported subset and maps to empty", "pause_turn", ""},
+		{"genuinely unknown reason maps to empty", "future_stop_reason", ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
@@ -506,6 +631,56 @@ func TestStreamChatAccumulatesCumulativeOutputUsage(t *testing.T) {
 	}
 }
 
+// refusal is a documented, normal successful stop reason; the stream must emit
+// an explicit content_filter finish chunk before [DONE] so clients observe a
+// terminal state instead of an open-ended stop.
+func TestStreamChatEmitsRefusalFinishChunkBeforeDone(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		_, _ = response.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_r\",\"model\":\"claude-sonnet-x\",\"usage\":{\"input_tokens\":5}}}\n\n"))
+		_, _ = response.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"I cannot help with that.\"}}\n\n"))
+		_, _ = response.Write([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7}}\n\n"))
+		_, _ = response.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer server.Close()
+
+	result, err := New(server.Client()).StreamChat(
+		context.Background(),
+		provider.ChatRequest{Model: "claude-sonnet-x", Stream: true},
+		provider.Credential{APIKey: []byte("sk-ant-test"), BaseURLOverride: server.URL},
+	)
+	if err != nil {
+		t.Fatalf("stream chat: %v", err)
+	}
+	defer result.Stream.Close()
+
+	event, err := result.Stream.Next()
+	if err != nil {
+		t.Fatalf("content next: %v", err)
+	}
+	if !strings.Contains(string(event.Data), `"content":"I cannot help with that."`) {
+		t.Fatalf("content event data = %s", event.Data)
+	}
+	event, err = result.Stream.Next()
+	if err != nil {
+		t.Fatalf("finish next: %v", err)
+	}
+	if event.Done || !strings.Contains(string(event.Data), `"finish_reason":"content_filter"`) {
+		t.Fatalf("refusal finish event = %+v (data=%s)", event, event.Data)
+	}
+	event, err = result.Stream.Next()
+	if err != nil {
+		t.Fatalf("done next: %v", err)
+	}
+	if !event.Done || string(event.Data) != "[DONE]" {
+		t.Fatalf("done event = %+v", event)
+	}
+	usage := result.Stream.Usage()
+	if usage == nil || usage.PromptTokens != 5 || usage.CompletionTokens != 7 || usage.TotalTokens != 12 {
+		t.Fatalf("usage = %+v", usage)
+	}
+}
+
 // A stream that never reaches message_stop is never a success, even when
 // content and the final message_delta arrived, and must not expose usage.
 func TestStreamChatDoesNotExposeUsageWhenInterruptedBeforeMessageStop(t *testing.T) {
@@ -619,7 +794,47 @@ func TestStreamChatFailsOnSequenceViolations(t *testing.T) {
 			},
 		},
 		{
-			name: "content after final message delta",
+			name: "message_delta before message_start",
+			events: []string{
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+			},
+		},
+		{
+			name: "message_stop before message_start",
+			events: []string{
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+			},
+		},
+		{
+			name: "message_stop without a message_delta",
+			events: []string{
+				"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"model\":\"claude-sonnet-x\",\"usage\":{\"input_tokens\":1}}}\n\n",
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+			},
+		},
+		{
+			name: "negative input_tokens",
+			events: []string{
+				"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"model\":\"claude-sonnet-x\",\"usage\":{\"input_tokens\":-1}}}\n\n",
+			},
+		},
+		{
+			name: "negative output_tokens",
+			events: []string{
+				"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"model\":\"claude-sonnet-x\",\"usage\":{\"input_tokens\":1}}}\n\n",
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":-1}}\n\n",
+			},
+		},
+		{
+			name: "cumulative output_tokens decreased",
+			events: []string{
+				"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"model\":\"claude-sonnet-x\",\"usage\":{\"input_tokens\":1}}}\n\n",
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null},\"usage\":{\"output_tokens\":8}}\n\n",
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+			},
+		},
+		{
+			name: "content after a message_delta",
 			events: []string{
 				"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"model\":\"claude-sonnet-x\",\"usage\":{\"input_tokens\":1}}}\n\n",
 				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
@@ -654,9 +869,13 @@ func TestStreamChatFailsOnSequenceViolations(t *testing.T) {
 			defer result.Stream.Close()
 
 			for {
-				_, err = result.Stream.Next()
-				if err != nil {
+				event, nextErr := result.Stream.Next()
+				if nextErr != nil {
+					err = nextErr
 					break
+				}
+				if event.Done {
+					t.Fatalf("invalid stream synthesized [DONE]")
 				}
 			}
 			providerErr, ok := provider.AsError(err)

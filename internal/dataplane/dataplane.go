@@ -520,6 +520,8 @@ func clientMessage(category provider.ErrorCategory) string {
 		return "provider is unavailable"
 	case provider.StreamInterrupted:
 		return "stream interrupted"
+	case provider.UnsupportedFeature:
+		return "request includes a feature not supported by the selected provider"
 	default:
 		return "request could not be completed"
 	}
