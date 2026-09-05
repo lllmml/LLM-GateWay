@@ -641,3 +641,251 @@ func TestWrapperRecoveryDependencyFailureDegradesAndRestartsProbes(t *testing.T)
 		t.Fatalf("probe count after failed recovery = %d, want reset to 0", got)
 	}
 }
+
+// TestWrapperRecoveryBarrierBlocksProbesWhileOldClaimsInflight pins the P1-1
+// recovery barrier: probes must not count while a distributed attempt claimed
+// before the degraded transition is still in-flight, so no stale pre-degraded
+// result can cross the recovery boundary.
+func TestWrapperRecoveryBarrierBlocksProbesWhileOldClaimsInflight(t *testing.T) {
+	cfg := wrapperTestConfig()
+	cfg.ProjectRPM = 100
+	core := newFakeAdmissionCore(0)
+	var probeCalls int
+	limiter := newTestWrapper(t, core, cfg)
+
+	r1 := make(chan error, 1)
+	r2 := make(chan error, 1)
+	go func() { _, err := limiter.Admit(context.Background(), "k", "p"); r1 <- err }()
+	core.waitStarted(t) // R1 claimed while normal
+	go func() { _, err := limiter.Admit(context.Background(), "k", "p"); r2 <- err }()
+	core.waitStarted(t) // R2 claimed while normal
+
+	core.push(depFailure) // R1 fails -> degraded; R2 remains in-flight
+	if err := <-r1; err != nil {
+		t.Fatalf("R1 error: %v", err)
+	}
+	if limiter.currentStateForTest() != stateDegraded {
+		t.Fatalf("state = %v, want degraded", limiter.currentStateForTest())
+	}
+
+	// While R2 is still in-flight, probes must not run or count at all.
+	limiter.cfg.Probe = func(context.Context) error {
+		probeCalls++
+		return nil
+	}
+	for i := 0; i < cfg.ProbeThreshold; i++ {
+		limiter.probeCycle(context.Background())
+	}
+	if probeCalls != 0 {
+		t.Fatalf("probe ran %d times while an old claim was in-flight", probeCalls)
+	}
+	if got := limiter.probeCountForTest(); got != 0 {
+		t.Fatalf("probe successes = %d, want 0 before old claims drained", got)
+	}
+
+	// R2 (pre-claimed) dependency-fails after degraded -> emergency fallback;
+	// inflight drops to zero and the state stays degraded.
+	core.push(depFailure)
+	if err := <-r2; err != nil {
+		t.Fatalf("R2 error: %v", err)
+	}
+	if limiter.currentStateForTest() != stateDegraded {
+		t.Fatalf("state after R2 failure = %v, want degraded", limiter.currentStateForTest())
+	}
+
+	// Only after the old generation drained do probes count: K successes ->
+	// recovering.
+	for i := 0; i < cfg.ProbeThreshold; i++ {
+		limiter.probeCycle(context.Background())
+	}
+	if probeCalls != cfg.ProbeThreshold {
+		t.Fatalf("probe ran %d times, want %d after drain", probeCalls, cfg.ProbeThreshold)
+	}
+	if limiter.currentStateForTest() != stateRecovering {
+		t.Fatalf("state after drained probes = %v, want recovering", limiter.currentStateForTest())
+	}
+
+	// The single real recovery admission succeeds -> normal.
+	done := make(chan error, 1)
+	go func() { _, err := limiter.Admit(context.Background(), "k", "p"); done <- err }()
+	core.waitStarted(t)
+	core.push(redisAllow)
+	if err := <-done; err != nil {
+		t.Fatalf("recovery admission error: %v", err)
+	}
+	if limiter.currentStateForTest() != stateNormal {
+		t.Fatalf("state after successful recovery = %v, want normal", limiter.currentStateForTest())
+	}
+
+	// No stale old-generation attempt exists any more: the next live request
+	// uses the Redis path normally and cannot be degraded retroactively.
+	before := core.calls.Load()
+	core.push(redisAllow)
+	if !mustAdmit(t, limiter, "k", "p").Allowed {
+		t.Fatal("post-recovery live request not admitted")
+	}
+	if got := core.calls.Load(); got != before+1 {
+		t.Fatalf("post-recovery request did not use the Redis path (calls %d -> %d)", before, got)
+	}
+	if limiter.currentStateForTest() != stateNormal {
+		t.Fatalf("state = %v, want normal", limiter.currentStateForTest())
+	}
+}
+
+// TestWrapperPreClaimedSuccessDrainsLastInflightAttempt pins the success
+// variant: a pre-claimed Redis success drains the final in-flight attempt and
+// afterwards probes may qualify recovery.
+func TestWrapperPreClaimedSuccessDrainsLastInflightAttempt(t *testing.T) {
+	cfg := wrapperTestConfig()
+	core := newFakeAdmissionCore(0)
+	var probeCalls int
+	limiter := newTestWrapper(t, core, cfg)
+
+	r1 := make(chan error, 1)
+	r2 := make(chan error, 1)
+	go func() { _, err := limiter.Admit(context.Background(), "k", "p"); r1 <- err }()
+	core.waitStarted(t)
+	go func() { _, err := limiter.Admit(context.Background(), "k", "p"); r2 <- err }()
+	core.waitStarted(t)
+
+	core.push(depFailure) // R1 fails -> degraded
+	if err := <-r1; err != nil {
+		t.Fatalf("R1 error: %v", err)
+	}
+	limiter.cfg.Probe = func(context.Context) error {
+		probeCalls++
+		return nil
+	}
+	limiter.probeCycle(context.Background())
+	if probeCalls != 0 {
+		t.Fatalf("probe ran while R2 was in-flight (calls = %d)", probeCalls)
+	}
+
+	core.push(redisReject(1111 * time.Millisecond)) // R2 (pre-claimed) succeeds
+	if err := <-r2; err != nil {
+		t.Fatalf("R2 error: %v", err)
+	}
+	if limiter.currentStateForTest() != stateDegraded {
+		t.Fatalf("state = %v, want degraded (pre-claimed success must not restore normal)", limiter.currentStateForTest())
+	}
+	for i := 0; i < cfg.ProbeThreshold; i++ {
+		limiter.probeCycle(context.Background())
+	}
+	if limiter.currentStateForTest() != stateRecovering {
+		t.Fatalf("state after drained probes = %v, want recovering", limiter.currentStateForTest())
+	}
+}
+
+// TestWrapperProbeCancelledByClose pins P1-2 lifecycle: Close cancels an
+// in-flight probe (derived from the lifecycle context), returns promptly, and
+// leaks nothing.
+func TestWrapperProbeCancelledByClose(t *testing.T) {
+	cfg := wrapperTestConfig()
+	cfg.ProbeInterval = 5 * time.Millisecond
+	cfg.CommandTimeout = time.Minute // probe must be canceled by Close, not this
+	core := newFakeAdmissionCore(1)
+	core.push(depFailure)
+
+	probeStarted := make(chan struct{})
+	var startedOnce atomic.Bool
+	probeFinished := make(chan error, 1)
+	cfg.Probe = func(ctx context.Context) error {
+		if !startedOnce.CompareAndSwap(false, true) {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		close(probeStarted)
+		<-ctx.Done()
+		err := ctx.Err()
+		probeFinished <- err
+		return err
+	}
+
+	limiter, err := newWrapper(core, cfg, nil)
+	if err != nil {
+		t.Fatalf("new wrapper: %v", err)
+	}
+	// Enter degraded (inflight drains to zero), then the background loop starts
+	// a probe at the 5ms cadence.
+	mustAdmit(t, limiter, "k", "p")
+	select {
+	case <-probeStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("background probe did not start")
+	}
+
+	closed := make(chan struct{})
+	go func() { limiter.Close(); close(closed) }()
+	select {
+	case err := <-probeFinished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("probe finished with %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("in-flight probe was not cancelled by Close")
+	}
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not return promptly after cancelling the probe")
+	}
+}
+
+// TestWrapperBackgroundProbeBoundedByCommandTimeout pins P1-2: a background
+// probe that does not respect its context is still bounded by the wrapper
+// CommandTimeout.
+func TestWrapperBackgroundProbeBoundedByCommandTimeout(t *testing.T) {
+	cfg := wrapperTestConfig()
+	cfg.ProbeInterval = 5 * time.Millisecond
+	cfg.CommandTimeout = 80 * time.Millisecond
+	core := newFakeAdmissionCore(1)
+	core.push(depFailure)
+
+	probeStarted := make(chan struct{})
+	var startedOnce atomic.Bool
+	probeFinished := make(chan error, 1)
+	cfg.Probe = func(ctx context.Context) error {
+		if startedOnce.CompareAndSwap(false, true) {
+			close(probeStarted)
+		}
+		<-ctx.Done()
+		err := ctx.Err()
+		if startedOnce.Load() && probeFinished != nil {
+			select {
+			case probeFinished <- err:
+			default:
+			}
+		}
+		return err
+	}
+
+	limiter, err := newWrapper(core, cfg, nil)
+	if err != nil {
+		t.Fatalf("new wrapper: %v", err)
+	}
+	defer limiter.Close()
+	mustAdmit(t, limiter, "k", "p") // degraded; inflight drained
+	select {
+	case <-probeStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("background probe did not start")
+	}
+	startedAt := time.Now()
+	select {
+	case err := <-probeFinished:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("probe finished with %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("probe was not bounded by CommandTimeout")
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("probe exceeded the CommandTimeout bound (%v)", elapsed)
+	}
+	if limiter.currentStateForTest() != stateDegraded {
+		t.Fatalf("state = %v, want degraded after a timed-out probe", limiter.currentStateForTest())
+	}
+	if got := limiter.probeCountForTest(); got != 0 {
+		t.Fatalf("probe successes = %d, want 0 after timeout", got)
+	}
+}

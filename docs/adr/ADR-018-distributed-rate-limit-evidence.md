@@ -535,6 +535,30 @@ wrapper (D6/D7/D9/D10) will own the public `Admit` and consume the core's
   admission atomicity) pass on the pinned Redis under `make integration` and
   with `-race`.
 
+## Implementation refinement (Slice B2a review - recovery barrier and lifecycle)
+
+Two review-driven refinements to the accepted D6/D9 design, applied in the
+wrapper without changing Core/Lua or the Accepted architecture:
+
+1. **Recovery barrier (D6/D9)**: recovery probes may only run/count while
+   `state == degraded AND inflight == 0`, where `inflight` counts the
+   distributed attempts claimed while the replica was normal. A pre-degraded
+   attempt that finishes later therefore cannot contribute stale probe
+   success, cross the recovery boundary, or re-degrade a freshly recovered
+   normal state. This uses the existing bounded attempt-claim model; it does
+   not introduce a distributed epoch/transaction mechanism.
+2. **Probe lifecycle (D9)**: the wrapper owns a lifecycle context canceled by
+   `Close()`; every background probe runs under
+   `context.WithTimeout(lifecycle, CommandTimeout)`, so probe duration is
+   bounded by the wrapper's own CommandTimeout and an in-flight probe is
+   cancellable by `Close()` - shutdown never depends on the external Redis
+   client's timeout defaults. The state mutex is never held across probe I/O
+   and Close remains idempotent.
+
+Deterministic tests cover: probes blocked while old claims are in-flight,
+pre-claimed failure/success draining the last in-flight attempt before
+qualification, probe cancellation on Close, and the CommandTimeout probe bound.
+
 ## Migration / rollback
 
 No schema change. Rollback per commit slice: distributed mode is opt-in via

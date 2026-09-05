@@ -130,6 +130,11 @@ type Limiter struct {
 
 	stop chan struct{}
 	done chan struct{}
+
+	// lifecycle is canceled by Close: it bounds and cancels in-flight recovery
+	// probes so shutdown never depends on an external client's defaults.
+	lifecycle context.Context
+	cancel    context.CancelFunc
 }
 
 // NewLimiter builds the production wrapper around a real Redis core and starts
@@ -199,6 +204,7 @@ func newWrapper(core admissionCore, cfg WrapperConfig, probe ProbeFunc) (*Limite
 	if err != nil {
 		return nil, fmt.Errorf("configure emergency limiter: %w", err)
 	}
+	lifecycle, cancel := context.WithCancel(context.Background())
 	limiter := &Limiter{
 		core:      core,
 		cfg:       cfg,
@@ -206,6 +212,8 @@ func newWrapper(core admissionCore, cfg WrapperConfig, probe ProbeFunc) (*Limite
 		state:     stateNormal,
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
+		lifecycle: lifecycle,
+		cancel:    cancel,
 	}
 	if probe != nil {
 		limiter.cfg.Probe = probe
@@ -220,6 +228,9 @@ func newWrapper(core admissionCore, cfg WrapperConfig, probe ProbeFunc) (*Limite
 
 // Close stops the background probe loop and the emergency registry's janitor.
 // It is idempotent.
+// Close stops the background probe loop (canceling any in-flight probe), waits
+// for it, and closes the emergency registry's janitor. It is idempotent and
+// never blocks longer than an in-flight probe's ctx cancellation.
 func (l *Limiter) Close() {
 	l.mu.Lock()
 	if l.stop == nil {
@@ -228,6 +239,7 @@ func (l *Limiter) Close() {
 	}
 	close(l.stop)
 	l.stop = nil
+	l.cancel() // cancels any in-flight probe derived from the lifecycle context
 	l.mu.Unlock()
 	<-l.done
 	l.emergency.Close()
@@ -360,17 +372,25 @@ func (l *Limiter) probeLoop(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			l.probeCycle(context.Background())
+			// Every probe is bounded by the wrapper CommandTimeout and is
+			// canceled when the lifecycle (Close) ends.
+			probeCtx, cancelProbe := context.WithTimeout(l.lifecycle, l.cfg.CommandTimeout)
+			l.probeCycle(probeCtx)
+			cancelProbe()
 		}
 	}
 }
 
-// probeCycle runs one non-mutating health probe when degraded and updates the
-// consecutive-success counter. K successes -> recovering; a probe failure
-// resets the counter. Deterministic tests drive this directly.
+// probeCycle runs one non-mutating health probe when degraded AND no
+// distributed attempt claimed before the degraded transition is still
+// in-flight (recovery barrier, ADR-018 D6/D9 refinement). Once degraded is
+// observable no new normal claims can start, so inflight == 0 means the old
+// normal generation has fully drained and no stale pre-degradation result can
+// cross the recovery boundary. K consecutive successes -> recovering; a probe
+// failure resets the counter. Deterministic tests drive this directly.
 func (l *Limiter) probeCycle(ctx context.Context) {
 	l.mu.Lock()
-	if l.state != stateDegraded || l.cfg.Probe == nil {
+	if l.state != stateDegraded || l.inflight != 0 || l.cfg.Probe == nil {
 		l.mu.Unlock()
 		return
 	}
@@ -381,8 +401,8 @@ func (l *Limiter) probeCycle(ctx context.Context) {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.state != stateDegraded {
-		return // may have left degraded while the probe was in flight
+	if l.state != stateDegraded || l.inflight != 0 {
+		return // left degraded or a new in-flight generation appeared meanwhile
 	}
 	if err != nil {
 		l.probeSuccess = 0
