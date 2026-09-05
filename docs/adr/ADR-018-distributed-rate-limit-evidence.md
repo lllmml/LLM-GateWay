@@ -241,28 +241,60 @@ way the ADR-017 registry write lock did in-process.
 
 ### D6. Degraded mode: entry on the FIRST dependency failure, no entry hysteresis
 
-Concurrency contract (no over-promise about in-flight requests):
+Concurrency contract (no over-promise about in-flight requests).
+
+**Atomic attempt claim - a distributed attempt is "in-flight" from the moment
+it has atomically claimed permission under the state mutex while state ==
+normal, NOT from the moment its network I/O starts.** The normal path is:
+
+```
+lock
+  if state != normal: use emergency limiter (no claim)
+  else:               claim/register a distributed attempt
+unlock
+
+perform Redis network I/O     (state mutex is NEVER held across this)
+
+lock
+  finish/unregister the attempt
+  apply any required state transition
+unlock
+```
+
+This eliminates the state-check TOCTOU. A naive "check normal under lock,
+unlock, then start Redis I/O" is forbidden: between the unlock and the I/O
+start another request could fail and transition the replica to degraded, and
+the would-be attempt must already count as in-flight (claimed) so it may
+finish under the documented policy rather than starting Redis work after the
+replica is observably degraded.
+
+Rules:
 
 - The first Redis admission dependency error/timeout/ambiguous outcome
   **immediately transitions the replica to degraded** (no "N consecutive
   failures" threshold).
-- Once degraded is observable, **no NEW admission may begin a Redis
-  distributed attempt**; newly starting admissions use only the emergency
+- Once degraded is observable, **no NEW request may successfully claim a
+  distributed-admission attempt**; unclaimed requests use only the emergency
   limiter until recovery qualification succeeds.
-- Redis attempts that were **already in flight before the transition may
-  complete**; their results are handled per the documented policy (success of
-  an in-flight attempt does not cancel the degraded state - the transition
-  already happened).
-- This bounded transition overlap (an in-flight Redis attempt finishing after
-  the replica is degraded) is accepted and explicitly documented. This slice
-  does not design an epoch/transaction mechanism to eliminate all in-flight
-  overlap; the safety guarantee is unchanged:
+- Attempts **claimed before the degraded transition are in-flight even if
+  their network I/O has not physically started yet**; those pre-claimed
+  attempts may finish.
+- A successful pre-claimed Redis attempt returns its distributed `Decision`
+  to that request and **MUST NOT perform a second emergency admission**.
+- That success **MUST NOT restore normal after another request has already
+  transitioned the replica to degraded** (the in-flight attempt unregisters
+  and applies no transition; the replica stays degraded).
+- A dependency-failed pre-claimed attempt falls back to emergency for that
+  request.
+- Subsequent unclaimed requests use emergency until recovery.
+- This bounded transition overlap is accepted and explicitly documented. This
+  slice does not design epoch/transaction machinery beyond this bounded
+  attempt-claim model unless later tests prove it necessary; the safety
+  guarantee is unchanged:
   **no unlimited fail-open + bounded local emergency admission + no exact
   global quota guarantee during dependency failure/partition**.
 - Degraded mode prevents indefinite request-by-request alternation between
   Redis and emergency admission sources.
-- The request that triggered the transition is itself served by the emergency
-  limiter (single admission source per request).
 - Recovery may use hysteresis (see D9), entry never does.
 
 ### D7. Emergency limiter: bounded fallback, NOT an exact global quota
@@ -327,11 +359,31 @@ Safety contract (no stronger claim):
   I/O.** A recovering request: (1) acquires the lock; (2) claims the single
   recovery-attempt flag; (3) releases the lock; (4) performs the real Redis
   admission; (5) reacquires the lock; (6) commits the normal/degraded
-  transition; (7) releases the lock. If the attempt fails, the state stays
-  degraded and that request is served by the emergency limiter. Other
-  concurrent requests are not blocked by the Redis round-trip: while the
-  recovery attempt is in flight they continue to use the emergency limiter
-  (no new distributed admission may start - see D6).
+  transition; (7) releases the lock. Other concurrent requests are not blocked
+  by the Redis round-trip: while the recovery attempt is in flight they
+  continue to use the emergency limiter (no new distributed admission may
+  start - see D6).
+- **Recovery "success" means the Redis operation executed successfully and
+  returned a valid `Decision` - NOT `Allowed=true`.** A real Redis admission
+  may legitimately return `Decision{Allowed: false, RetryAfter: ...}`; that
+  is a healthy distributed write path, not a recovery failure. Both outcomes
+  therefore recover:
+
+  - `Allowed=true` -> transition `recovering -> normal`, return the allow;
+  - `Allowed=false` -> transition `recovering -> normal`, return that Redis
+    rate-limit rejection.
+
+  Only these outcomes keep the replica degraded and fall back to emergency
+  for the current request:
+
+  - Redis dependency error;
+  - Redis command timeout while the parent context is still live;
+  - ambiguous Redis outcome.
+
+  Parent context cancellation/deadline remains distinct (cancellation !=
+  dependency failure) and must not trigger degraded/emergency behavior. If the
+  attempt fails with a dependency outcome, the state stays degraded and that
+  request is served by the emergency limiter.
 - No unlimited window on recovery: during degraded/recovering every admission
   is emergency-bounded; keys carry TTL (10m) far longer than the recovery hold
   time, so most keys retain near-current counts. Keys that expired during a
@@ -369,10 +421,16 @@ Safety contract (no stronger claim):
   expiration/bounded state; cancellation A/B/C cases (pre-execution cancel =
   no state, ambiguous = no retransmit + degraded, post-success cancel =
   charge retained); **transition race: concurrent Redis admissions + one
-  dependency failure - the replica transitions to degraded exactly once, no
-  new Redis admission starts after the transition, already-in-flight attempts
-  may finish per the documented policy, no data race/deadlock, and subsequent
-  requests consistently use emergency**; race tests.
+  dependency failure - the replica transitions to degraded exactly once, and
+  after the transition NO NEW distributed-attempt CLAIM succeeds (asserted at
+  the claim boundary, not at the physical instant a socket write starts);
+  attempts claimed before the transition may finish per the documented policy
+  (a successful pre-claimed attempt returns its distributed Decision without a
+  second emergency admission and does not restore normal after the degraded
+  transition); no data race/deadlock; subsequent unclaimed requests
+  consistently use emergency**; **recovery write-path success returning an
+  `Allowed=false` Decision must still transition `recovering -> normal` and
+  return that Redis rejection, not the emergency fallback**; race tests.
 
 ## Failure policy summary (degraded dependency)
 
