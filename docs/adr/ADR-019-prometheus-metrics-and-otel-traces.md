@@ -1,6 +1,6 @@
 # ADR-019: Prometheus metrics + OTel traces with a telemetry lifecycle seam (Week 10)
 
-- Status: Draft (decision baseline finalized; pending owner review of this ADR commit before Slice A1 starts)
+- Status: Accepted
 - Date: 2026-09-05
 - Related: Tech Design §24 (Metrics contract), §25 (OpenTelemetry Tracing), §27.2 (Local services), §29 (Readiness and graceful shutdown), §37 (Failure Matrix), §36 minimum ADR list item "ADR-012 Prometheus metrics + OTel traces" (recorded in practice as ADR-019); Week 10 roadmap entry; ADR-017 D8 (rate-limit rejection counters planned for Week 10); packages `internal/telemetry`, `internal/app`, `internal/dataplane`, `cmd/gateway`; local Docker Compose topology (A3). No schema change.
 
@@ -12,8 +12,18 @@
   baseline, so no evidence-first "should we adopt it?" experiment precedes this
   decision; the implementation evidence is appended to this ADR after the fact.
   All seven owner constraints from the plan review are binding decisions below.
-  Expected transition to **Accepted** after the owner reviews this commit;
-  Slice A1 starts only after that review passes.
+- 2026-09-05: transitioned to **Accepted** by the docs-only fix commit after the
+  owner reviewed the architecture baseline and approved it. The fix folds in
+  the closing constraints as binding requirements: (P1) the telemetry shutdown
+  covers every `App.Run` exit path including partial `listen()` failure via a
+  Run-scope cleanup, and the telemetry runtime `Shutdown` is idempotent with a
+  `main` fallback for the construction-failure corner where `App.Run` is never
+  reached; (P2) `gateway_requests_total` is defined as a durable lifecycle
+  metric with explicit finalize-persistence-failure counting semantics;
+  (P3) invalid/over-long `X-Request-ID` only drops the correlation value and
+  never rejects the request; (P4) pprof protection hashes the token and uses a
+  single guarded handler/mux with no `DefaultServeMux`/global bypass. Slice A1
+  starts only after the owner confirms this commit.
 
 ## Context
 
@@ -111,7 +121,7 @@ Week 10, `gateway_usage_finalization_failures_total`,
 `gateway_ttft_seconds`, `gateway_upstream_duration_seconds`,
 `gateway_usage_finalize_duration_seconds`, `gateway_degraded_dependency`).
 
-**No ingress metric is added in the foundation.** The draft plan's
+**No ingress metric is added in the foundation.** (See counting semantics below.) The draft plan's
 `gateway_ingress_requests_total{status_class}` is rejected:
 
 - it is outside the approved §24.1 core contract;
@@ -123,6 +133,23 @@ Week 10, `gateway_usage_finalization_failures_total`,
   `slog` events (ADR-017 D8 `event=admission_rejected` etc.). The pre-row
   observability gap is designed separately in the later complete-metrics slice
   if it is still needed then.
+
+Counting semantics (binding):
+
+- `gateway_requests_total` is a **durable gateway request lifecycle metric**,
+  not an HTTP ingress metric. It is observed when a request's business
+  terminal state is determined at finalize. Pre-auth, malformed-body,
+  unsupported-parameter, and admission-rejected requests are intentionally
+  never counted - that exclusion is part of the approved contract, and their
+  visibility stays with the bounded `slog` events (ADR-017 D8) plus the
+  later full-§24.1 design.
+- A finalize **persistence failure does not change the request count**: the
+  counter is observed as soon as the business terminal state is determined
+  (the finalize call carries a decided `status=succeeded|failed`), regardless
+  of whether the durable write itself succeeds. Durable-write failure is a
+  separate operational signal that belongs to
+  `gateway_usage_finalization_failures_total` (full §24.1 slice); it must
+  never silently alter `gateway_requests_total`.
 
 ### D4. Active gauge boundaries; the admission API is not polluted with telemetry
 
@@ -216,6 +243,9 @@ Correlation is a `slog.Handler` wrapper around the existing JSON handler:
 - an over-length or control-character value is **dropped** and replaced by a
   bounded marker (e.g. `client_request_id_present=true`) so an arbitrarily long
   header cannot cause log amplification;
+- dropping the value is the only consequence. An invalid/over-long/
+  control-character `X-Request-ID` never rejects, delays, or alters the LLM
+  request itself: the request proceeds exactly as if the header were absent;
 - it is not a span attribute unless a future slice demonstrates an explicit
   need, which requires a new decision here.
 
@@ -234,12 +264,22 @@ Correlation is a `slog.Handler` wrapper around the existing JSON handler:
   (e.g. `OTEL_TRACES_SAMPLER`), not gateway-specific switches.
 - No `METRICS_ENABLED` (D2). No other new toggles for A1/A2.
 - pprof (A3): `PPROF_ENABLED` defaults false. When enabled, `PPROF_TOKEN` is
-  required (non-empty) and every ops-plane `/debug/pprof*` handler requires it
-  via constant-time comparison. Data and control muxes never mount pprof or
-  metrics. Production does not rely on the token as a substitute for network
-  isolation: the Ops plane lives only on a private network and is never
-  publicly routed (D10). This security model is decided now and is not
-  re-decided while coding.
+  required (non-empty). Implementation constraints are fixed now, not decided
+  while coding:
+  - every ops-plane `/debug/pprof*` endpoint is mounted behind the **same
+    protected handler/mux** (single choke point for the token check);
+  - the token is compared by hashing it once to a fixed-length digest
+    (SHA-256) and using `subtle.ConstantTimeCompare` on the digests, so the
+    comparison is constant-time and never touches the raw token length;
+  - registration never bypasses the guard: no `http.DefaultServeMux` and no
+    package-global registration anywhere; pprof/metrics exist only on the Ops
+    mux built by `internal/app` from injected handlers;
+  - mux-isolation tests keep locking that data and control muxes never mount
+    pprof or metrics, whether enabled or not.
+  Data and control muxes never mount pprof or metrics. Production does not
+  rely on the token as a substitute for network isolation: the Ops plane lives
+  only on a private network and is never publicly routed (D10). This security
+  model is decided now and is not re-decided while coding.
 
 ### D9. Telemetry lifecycle seam inside `internal/app`; accurate shutdown order
 
@@ -264,31 +304,59 @@ HTTP handlers/streams all ended
 
 Because `database.Close()` already runs inside `App.Run`, a tracer shutdown
 placed after `application.Run()` returns would run **after** PostgreSQL is
-closed - unacceptable. The minimal seam is therefore additive inside `App`:
+closed - unacceptable. The minimal seam is therefore additive inside `App`,
+with `database.Close()` ownership staying in `App.Run` and the three-server
+concurrent drain untouched:
 
 - `app.Options` gains an optional `TelemetryShutdown func(context.Context)
-  error` (nil allowed; no-op when absent).
-- `App.Run` invokes it after server drain completes and before the
-  `database.Close()` defer runs, under a fresh bounded context
-  (fixed `telemetryFlushTimeout`, e.g. 5s, independent of the server shutdown
-  budget).
-- `internal/app` depends only on that small function type - never on concrete
-  OTel types.
-- The hook runs on both exit paths (signal-driven shutdown and serve-error
-  abort). A hook error is logged at error level but is **not** joined into
-  `Run`'s returned error: telemetry flush is best-effort and must not change
-  the process exit status.
+  error` (nil allowed; no-op when absent). `internal/app` depends only on that
+  small function type - never on concrete OTel types.
+- The seam is registered as a **Run-scope cleanup, not an ordinary control-flow
+  step after `a.shutdown()`**. Concretely: inside `App.Run`, the telemetry
+  cleanup is deferred after `database.Close()` is deferred, so the LIFO order
+  guarantees the telemetry cleanup always runs **before** `database.Close()`
+  on every exit path of `Run`.
+- Because the cleanup is registered before `listen()` is attempted, it also
+  covers the abnormal exits: a partial `listen()`/startup failure (one listener
+  bound, a later one failing) runs the telemetry cleanup too, and still before
+  `database.Close()`.
+- In normal operation the HTTP drain has already completed inside `Run` before
+  the deferred cleanup runs, so the observable order remains:
+  `HTTP handlers/streams drain -> telemetry flush/shutdown -> database.Close()`.
+- Exactly-once and bounded: the deferred cleanup runs once per `Run`; the hook
+  is invoked under a fresh bounded context (fixed `telemetryFlushTimeout`,
+  e.g. 5s, independent of the server shutdown budget). A hook error is logged
+  at error level but is **not** joined into `Run`'s returned error: telemetry
+  flush is best-effort and must not change the process exit status.
+- **Idempotent runtime shutdown + `main` fallback for the pre-`Run` corner:**
+  the TracerProvider is created by `main` before `App.Run`, so a construction
+  failure after the tracer exists (e.g. handler/service wiring fails and
+  `App.Run` is never called) needs its own cleanup. The telemetry runtime's
+  `Shutdown` is required to be idempotent (safe to call more than once; the
+  OTel SDK `TracerProvider.Shutdown` satisfies this), and `main` registers its
+  own deferred fallback that calls the same `Shutdown` right after the
+  TracerProvider is created. The two callers then divide responsibility:
+  - the `App` hook is responsible for the correct DB-close ordering during the
+    normal runtime lifecycle (flush after drain, before `database.Close()`);
+  - the `main` fallback is responsible for the construction-failure corner
+    where `App` never took over; when `App.Run` did run, the fallback's later
+    redundant call is a safe idempotent no-op.
 - Wiring in `cmd/gateway`: when a real (non-noop) TracerProvider was built,
-  `main` passes a hook that calls `TracerProvider.Shutdown(ctx)`. Noop mode
-  passes nothing (or a nil/no-op hook). The existing deferred close order for
-  limiter/Redis/transport is unchanged; those run after `Run` returns, i.e.
-  after the telemetry flush.
+  `main` defers `TracerProvider.Shutdown(boundedCtx)` immediately after
+  creation (fallback) and passes the App hook that calls the same `Shutdown`.
+  Noop mode builds nothing and passes no hook. The existing deferred close
+  order for limiter/Redis/transport is unchanged; those run after `Run`
+  returns, i.e. after the telemetry flush.
 
-Deterministic lifecycle test (A2): a fake hook and a fake database record
+Deterministic lifecycle tests (A2): a fake hook and a fake database record
 ordering, asserting (1) the hook runs only after all three servers report
 `Shutdown` complete, (2) the hook runs before `database.Close()`, (3) the hook
-receives a bounded context and returns within it, (4) both exit paths run the
-hook, (5) exporter goroutines do not leak (`-race`).
+receives a bounded context and returns within it, (4) the hook runs on both
+normal exit paths (signal-driven shutdown and serve-error abort) **and** on a
+partial `listen()`/startup-failure exit, all still before `database.Close()`,
+(5) the hook runs exactly once per `Run`, (6) `Shutdown` is idempotent: a
+second invocation (the `main` fallback after a successful `App.Run`) is a
+safe no-op, (7) exporter goroutines do not leak (`-race`).
 
 The exporter pipeline (A2): `BatchSpanProcessor` with a bounded, non-blocking
 export queue and export timeout; `Shutdown(ctx)` is bounded; exporter failure
