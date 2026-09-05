@@ -89,10 +89,10 @@ func TestRunStartsAllPlanesAndStopsCleanly(t *testing.T) {
 	}()
 
 	client := &http.Client{Timeout: 200 * time.Millisecond}
-	waitForStatus(t, client, "http://"+options.OpsAddr+"/health/live", http.StatusOK)
-	waitForStatus(t, client, "http://"+options.OpsAddr+"/health/ready", http.StatusOK)
-	waitForStatus(t, client, "http://"+options.DataPlaneAddr+"/", http.StatusNotFound)
-	waitForStatus(t, client, "http://"+options.ControlPlaneAddr+"/", http.StatusNotFound)
+	waitForReady(t, client, "http://"+options.OpsAddr+"/health/live", http.StatusOK, runResult)
+	waitForReady(t, client, "http://"+options.OpsAddr+"/health/ready", http.StatusOK, runResult)
+	waitForReady(t, client, "http://"+options.DataPlaneAddr+"/", http.StatusNotFound, runResult)
+	waitForReady(t, client, "http://"+options.ControlPlaneAddr+"/", http.StatusNotFound, runResult)
 
 	cancel()
 	select {
@@ -128,7 +128,7 @@ func TestRunDrainsActiveDataPlaneRequest(t *testing.T) {
 	}()
 
 	client := &http.Client{Timeout: 2 * time.Second}
-	waitForStatus(t, client, "http://"+options.OpsAddr+"/health/live", http.StatusOK)
+	waitForReady(t, client, "http://"+options.OpsAddr+"/health/live", http.StatusOK, runResult)
 	requestResult := make(chan error, 1)
 	go func() {
 		response, err := client.Get("http://" + options.DataPlaneAddr + "/active")
@@ -188,7 +188,7 @@ func TestRunDrainsActiveFlushedDataPlaneStream(t *testing.T) {
 	}()
 
 	client := &http.Client{Timeout: 2 * time.Second}
-	waitForStatus(t, client, "http://"+options.OpsAddr+"/health/live", http.StatusOK)
+	waitForReady(t, client, "http://"+options.OpsAddr+"/health/live", http.StatusOK, runResult)
 
 	response, err := client.Get("http://" + options.DataPlaneAddr + "/stream")
 	if err != nil {
@@ -262,7 +262,7 @@ func TestRunStartsDataPlaneShutdownWhileControlPlaneRequestIsBlocked(t *testing.
 	}()
 
 	client := &http.Client{Timeout: 2 * time.Second}
-	waitForStatus(t, client, "http://"+options.OpsAddr+"/health/live", http.StatusOK)
+	waitForReady(t, client, "http://"+options.OpsAddr+"/health/live", http.StatusOK, runResult)
 
 	controlResult := make(chan error, 1)
 	go func() {
@@ -335,7 +335,7 @@ func TestRunForceClosesStuckRequestAfterShutdownTimeout(t *testing.T) {
 	}()
 
 	client := &http.Client{Timeout: 2 * time.Second}
-	waitForStatus(t, client, "http://"+options.OpsAddr+"/health/live", http.StatusOK)
+	waitForReady(t, client, "http://"+options.OpsAddr+"/health/live", http.StatusOK, runResult)
 
 	requestResult := make(chan error, 1)
 	go func() {
@@ -381,8 +381,15 @@ func TestRunReturnsListenErrorAndClosesDatabase(t *testing.T) {
 	defer occupied.Close()
 
 	database := &fakeDatabase{}
-	options := testOptions(t)
-	options.DataPlaneAddr = occupied.Addr().String()
+	// Deliberately NO pre-bound listeners: this test exercises the real
+	// net.Listen startup path and must fail on the occupied data-plane port.
+	options := Options{
+		DataPlaneAddr:    occupied.Addr().String(),
+		ControlPlaneAddr: "127.0.0.1:0",
+		OpsAddr:          "127.0.0.1:0",
+		ReadinessTimeout: 100 * time.Millisecond,
+		ShutdownTimeout:  time.Second,
+	}
 	application := newTestApp(t, database, options)
 
 	err = application.Run(context.Background())
@@ -432,34 +439,61 @@ func newTestApp(t *testing.T, database Database, options Options) *App {
 	return New(options, database, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
+// newBoundListeners reserves three loopback listeners that stay open until the
+// test ends. The lifecycle tests hand these to the App (Options.listeners) so
+// startup serves the already-bound sockets instead of the bind-close-rebind
+// pattern freeAddress used (reserve ephemeral port -> close -> later rebind).
+// That TOCTOU let another process steal the port between the two steps and made
+// startup fail intermittently under load, which was then masked by readiness
+// polling. Keeping the listeners bound removes the race deterministically.
+func newBoundListeners(t *testing.T) []net.Listener {
+	t.Helper()
+	listeners := make([]net.Listener, 3)
+	for index := range listeners {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			for _, previous := range listeners[:index] {
+				_ = previous.Close()
+			}
+			t.Fatalf("reserve listener %d: %v", index, err)
+		}
+		listeners[index] = listener
+	}
+	t.Cleanup(func() {
+		for _, listener := range listeners {
+			_ = listener.Close()
+		}
+	})
+	return listeners
+}
+
 func testOptions(t *testing.T) Options {
 	t.Helper()
+	listeners := newBoundListeners(t)
 	return Options{
-		DataPlaneAddr:    freeAddress(t),
-		ControlPlaneAddr: freeAddress(t),
-		OpsAddr:          freeAddress(t),
+		DataPlaneAddr:    listeners[0].Addr().String(),
+		ControlPlaneAddr: listeners[1].Addr().String(),
+		OpsAddr:          listeners[2].Addr().String(),
+		listeners:        listeners,
 		ReadinessTimeout: 100 * time.Millisecond,
 		ShutdownTimeout:  time.Second,
 	}
 }
 
-func freeAddress(t *testing.T) string {
-	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve address: %v", err)
-	}
-	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		t.Fatalf("release reserved address: %v", err)
-	}
-	return address
-}
-
-func waitForStatus(t *testing.T, client *http.Client, url string, want int) {
+// waitForReady polls url for the wanted status while also distinguishing an
+// early Run failure from a readiness timeout: if Run exits before the server
+// becomes ready, the actual error is reported immediately instead of being
+// masked as "health/live did not return status 200". runResult is the
+// buffered channel Run writes to; it is only consumed on the failure path.
+func waitForReady(t *testing.T, client *http.Client, url string, want int, runResult <-chan error) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-runResult:
+			t.Fatalf("Run returned before %s became ready: %v", url, err)
+		default:
+		}
 		response, err := client.Get(url)
 		if err == nil {
 			_ = response.Body.Close()
@@ -469,7 +503,7 @@ func waitForStatus(t *testing.T, client *http.Client, url string, want int) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("%s did not return status %d", url, want)
+	t.Fatalf("%s did not return status %d within the readiness window", url, want)
 }
 
 func readAppSSEEvent(t *testing.T, reader *bufio.Reader) string {
