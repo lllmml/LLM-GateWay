@@ -559,14 +559,54 @@ func (r *Registry) scopeKeys() []string {
 	return keys
 }
 
+// limiterTokens reports a scope's token count evaluated at the Registry's
+// INJECTED clock (r.now()), never at the wall clock. Admission tests freeze the
+// injected clock at a fixed timestamp, and rate.Limiter.Tokens() would evaluate
+// against the real time.Now() - once wall time passes the frozen timestamp the
+// bucket appears to refill and the tests become time-of-day dependent. Use
+// TokensAt(r.now()) so inspection and admissions share the same clock contract.
 func (r *Registry) limiterTokens(scope Scope, id string) float64 {
 	r.mu.RLock()
+	defer r.mu.RUnlock()
 	current := r.entries[scopeKey(scope, id)]
-	r.mu.RUnlock()
 	if current == nil {
 		return -1
 	}
-	return current.lim.Tokens()
+	return current.lim.TokensAt(r.now())
+}
+
+// TestLimiterTokensInspectionUsesInjectedClock pins the test-helper clock
+// contract: token inspection must be evaluated at the Registry's injected
+// (frozen) clock, not the wall clock. The frozen timestamp is a fixed
+// historical instant; if inspection drifted to the wall clock the bucket would
+// appear fully refilled (burst 3) once real time passed that instant.
+func TestLimiterTokensInspectionUsesInjectedClock(t *testing.T) {
+	frozenAt := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	clock := newFakeClock(frozenAt)
+	cfg := testConfig()
+	cfg.KeyRPM = 0
+	cfg.ProjectRPM = 3
+	registry := testRegistry(t, cfg, clock)
+
+	// Drain the project burst under the frozen clock: exactly 3 admissions.
+	for i := 0; i < 3; i++ {
+		if d := admitTest(t, registry, testKeyID, testProjID); !d.Allowed {
+			t.Fatalf("drain admission %d rejected", i)
+		}
+	}
+
+	got := registry.limiterTokens(ScopeProject, testProjID)
+	if !nearTokens(got, 0) {
+		t.Fatalf("project tokens after drain = %v, want 0 evaluated at the injected clock", got)
+	}
+	// Directly tie the helper to the injected clock: the result must equal
+	// TokensAt(frozenAt) no matter how far the real wall clock has moved on.
+	registry.mu.RLock()
+	direct := registry.entries[scopeKey(ScopeProject, testProjID)].lim.TokensAt(frozenAt)
+	registry.mu.RUnlock()
+	if !nearTokens(got, direct) {
+		t.Fatalf("limiterTokens = %v, want %v (TokensAt(injected clock))", got, direct)
+	}
 }
 
 type atomicCounter struct {
