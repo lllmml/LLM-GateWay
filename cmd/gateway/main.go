@@ -18,6 +18,7 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/anthropic"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/deepseek"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/openai"
+	"github.com/lllmml/production-go-llm-gateway/internal/ratelimit"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
 	"github.com/lllmml/production-go-llm-gateway/internal/store/postgres"
 	"github.com/lllmml/production-go-llm-gateway/internal/telemetry"
@@ -94,6 +95,24 @@ func run() error {
 		database.Close()
 		return fmt.Errorf("configure provider registry: %w", err)
 	}
+	// Week 8 in-memory rate limiting. The registry owns a janitor goroutine,
+	// so it is created only when at least one scope is enabled and is closed
+	// when the process exits.
+	var rateLimiter *ratelimit.Registry
+	if cfg.RateLimitKeyRequestsPerMinute > 0 || cfg.RateLimitProjectRequestsPerMinute > 0 {
+		rateLimiter, err = ratelimit.NewRegistry(ratelimit.Config{
+			KeyRPM:        float64(cfg.RateLimitKeyRequestsPerMinute),
+			ProjectRPM:    float64(cfg.RateLimitProjectRequestsPerMinute),
+			EntryCap:      cfg.RateLimiterEntryCap,
+			IdleTTL:       cfg.RateLimiterIdleTTL,
+			SweepInterval: cfg.RateLimiterSweepInterval,
+		})
+		if err != nil {
+			database.Close()
+			return fmt.Errorf("configure rate limiter: %w", err)
+		}
+		defer rateLimiter.Close()
+	}
 	dataPlaneService, err := dataplane.NewService(dataplane.Options{
 		Store:                     database,
 		VirtualKeyPepper:          cfg.VirtualKeyPepper,
@@ -102,6 +121,11 @@ func run() error {
 		UpstreamStreamMaxDuration: cfg.UpstreamStreamMaxDuration,
 		ProviderRegistry:          providerRegistry,
 		Logger:                    logger,
+		RateLimiter:               rateLimiter,
+		MaxConcurrentRequests:     cfg.MaxConcurrentRequests,
+		MaxConcurrentStreams:      cfg.MaxConcurrentStreams,
+		RetryMaxRetries:           cfg.RetryMaxRetries,
+		RetryBackoffMax:           cfg.RetryBackoffMax,
 	})
 	if err != nil {
 		database.Close()

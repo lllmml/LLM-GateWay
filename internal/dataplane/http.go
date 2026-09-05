@@ -9,6 +9,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -75,7 +76,7 @@ func (h *Handler) chatCompletions(response http.ResponseWriter, request *http.Re
 	}
 	response.Header().Set("X-Gateway-Request-ID", record.ID)
 	response.Header().Set("X-Gateway-Provider", string(record.Provider))
-	response.Header().Set("X-Gateway-Retry-Count", "0")
+	response.Header().Set("X-Gateway-Retry-Count", strconv.FormatInt(int64(record.RetryCount), 10))
 	writeJSON(response, http.StatusOK, result.Response)
 }
 
@@ -177,7 +178,10 @@ func writeGatewayError(response http.ResponseWriter, record GatewayRequest, err 
 	if record.ID != "" {
 		response.Header().Set("X-Gateway-Request-ID", record.ID)
 		response.Header().Set("X-Gateway-Provider", string(record.Provider))
-		response.Header().Set("X-Gateway-Retry-Count", "0")
+		response.Header().Set("X-Gateway-Retry-Count", strconv.FormatInt(int64(record.RetryCount), 10))
+	}
+	if gatewayErr.RetryAfter != nil {
+		response.Header().Set("Retry-After", formatRetryAfter(*gatewayErr.RetryAfter))
 	}
 	status := http.StatusInternalServerError
 	switch gatewayErr.Category {
@@ -264,7 +268,7 @@ func (s *httpStreamSink) Prepare(record GatewayRequest) error {
 	header.Set("Cache-Control", "no-cache, no-store")
 	header.Set("X-Gateway-Request-ID", record.ID)
 	header.Set("X-Gateway-Provider", string(record.Provider))
-	header.Set("X-Gateway-Retry-Count", "0")
+	header.Set("X-Gateway-Retry-Count", strconv.FormatInt(int64(record.RetryCount), 10))
 	return nil
 }
 
@@ -289,6 +293,17 @@ func (s *httpStreamSink) WriteEvent(event provider.StreamEvent) error {
 
 func (s *httpStreamSink) Committed() bool {
 	return s.committed
+}
+
+// formatRetryAfter renders a Retry-After header value (whole seconds, ceil,
+// never negative). A present zero hint renders "0" so the header stays
+// meaningful ("retry immediately") rather than disappearing.
+func formatRetryAfter(duration time.Duration) string {
+	if duration <= 0 {
+		return "0"
+	}
+	seconds := (duration + time.Second - 1) / time.Second
+	return strconv.FormatInt(int64(seconds), 10)
 }
 
 func cleanSSEEventName(name string) string {
