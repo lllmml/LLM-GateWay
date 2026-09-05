@@ -34,6 +34,14 @@ type Options struct {
 	ShutdownTimeout     time.Duration
 	DataPlaneHandler    http.Handler
 	ControlPlaneHandler http.Handler
+
+	// listeners, when non-empty, is a test seam: the three pre-bound
+	// listeners are used instead of binding DataPlaneAddr / ControlPlaneAddr /
+	// OpsAddr (in that order). Production callers never set it, so real
+	// startup keeps using net.Listen. Same-package tests use it to remove the
+	// bind-close-rebind TOCTOU from lifecycle tests. Unexported because it is
+	// only meaningful inside this package.
+	listeners []net.Listener
 }
 
 type App struct {
@@ -44,6 +52,7 @@ type App struct {
 	dataPlaneServer    *http.Server
 	controlPlaneServer *http.Server
 	opsServer          *http.Server
+	listeners          []net.Listener // test seam, see Options.listeners
 }
 
 type runningServer struct {
@@ -65,6 +74,7 @@ func New(options Options, database Database, logger *slog.Logger) *App {
 		logger:           logger,
 		readinessTimeout: options.ReadinessTimeout,
 		shutdownTimeout:  options.ShutdownTimeout,
+		listeners:        options.listeners,
 	}
 	application.dataPlaneServer = newDataPlaneServer(options.DataPlaneAddr, options.DataPlaneHandler)
 	application.controlPlaneServer = newControlPlaneServer(options.ControlPlaneAddr, options.ControlPlaneHandler)
@@ -124,8 +134,18 @@ func (a *App) listen() ([]runningServer, error) {
 	}
 
 	servers := make([]runningServer, 0, len(definitions))
-	for _, definition := range definitions {
-		listener, err := net.Listen("tcp", definition.server.Addr)
+	for index, definition := range definitions {
+		var (
+			listener net.Listener
+			err      error
+		)
+		if index < len(a.listeners) {
+			// Test seam: a pre-bound listener is used verbatim (no
+			// bind-close-rebind window). Production leaves a.listeners empty.
+			listener = a.listeners[index]
+		} else {
+			listener, err = net.Listen("tcp", definition.server.Addr)
+		}
 		if err != nil {
 			for _, current := range servers {
 				_ = current.listener.Close()
