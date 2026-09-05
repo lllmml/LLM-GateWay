@@ -335,8 +335,6 @@ func TestCapEvictionNeverDetachesCurrentAdmissionLimb(t *testing.T) {
 
 // TestNoSilentBurstResetWithoutEviction verifies quota persists under cap
 // pressure until a documented LRU eviction actually resets that scope's entry.
-// TestNoSilentBurstResetWithoutEviction verifies quota persists under cap
-// pressure until a documented LRU eviction actually resets that scope's entry.
 //
 // The fake clock is advanced between k1 and k2 creation so their lastSeen
 // timestamps never tie: the LRU victim assertion below requires k1 to be
