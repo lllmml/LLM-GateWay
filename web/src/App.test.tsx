@@ -74,7 +74,9 @@ describe("App", () => {
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    renderApp();
+    // Mount on a placeholder route so Overview analytics queries do not
+    // consume the logout mock queue; the shared header logout button is present.
+    renderApp("/projects");
 
     await userEvent.click(await screen.findByRole("button", { name: /logout/i }));
 

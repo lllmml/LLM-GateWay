@@ -70,3 +70,25 @@ When a provider changes its contract, update this matrix and the affected adapte
 the same change. Real-provider smoke tests remain opt-in, secret-gated, and approval-gated;
 rows flagged "live smoke test should confirm" (Anthropic error envelope fields, plus the
 existing DeepSeek error envelope / request-ID uncertainty) must be confirmed before launch.
+
+## Pricing and estimated cost (Week 7)
+
+Pricing is versioned data, not code. `db/migrations/000005_seed_model_prices`
+seeds the current catalog; see `docs/adr/ADR-016-pricing-and-analytics.md` for
+the full semantics. Summary for provider owners:
+
+| provider | seeded models | estimated cost |
+|---|---|---|
+| openai | gpt-6-astra, gpt-5.6-terra, gpt-5.6-luna | Yes — standard/short-context base rate |
+| anthropic | claude-fable-5-1, claude-opus-5, claude-sonnet-5, claude-haiku-4-5-20251001 | Yes — standard base rate (no caching/batch/fast in the subset) |
+| deepseek | none in Week 7 | No — DeepSeek 2026 pricing splits cache hit/miss and peak/off-peak; the Week 7 schema persists only prompt/completion/total tokens, so no price version is seeded and estimated cost stays NULL (deliberate, ADR-016) |
+
+- `estimated_cost_nano_usd` is a **base-rate estimate**, never an invoice.
+- Prices were verified 2026-09-05 against official provider pages and
+  announcements; `effective_from` is the official effective date, not the
+  migration date. Re-verify model IDs, prices, and effective dates before any
+  public launch or when a provider changes pricing.
+- The gateway subset never enables prompt caching, batch, fast, or thinking,
+  so standard single-tier pricing applies to OpenAI/Anthropic requests.
+  DeepSeek cache/off-peak exact pricing is deferred (needs adapter + schema
+  support for the missing billing dimensions).

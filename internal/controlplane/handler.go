@@ -9,6 +9,8 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/credential"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/project"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/providerconfig"
+	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/requesthistory"
+	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/usage"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
 )
 
@@ -20,6 +22,8 @@ func NewHandler(
 	credentials credential.Store,
 	credentialCipher *security.CredentialCipher,
 	providerConfigs providerconfig.Store,
+	requests requesthistory.Store,
+	usageStore usage.Store,
 ) (http.Handler, error) {
 	root := http.NewServeMux()
 	auth.Register(root)
@@ -69,5 +73,14 @@ func NewHandler(
 	protectedProjects := auth.RequireSession(auth.RequireSameOrigin(projectMux))
 	root.Handle("/api/v1/projects", protectedProjects)
 	root.Handle("/api/v1/projects/", protectedProjects)
+
+	requestHistoryService := requesthistory.NewService(requests)
+	requesthistory.NewHandler(requestHistoryService, currentUserID).Register(projectMux)
+	usageService := usage.NewService(usageStore)
+	usage.NewHandler(usageService, currentUserID).Register(projectMux)
+	protectedAnalytics := auth.RequireSession(auth.RequireSameOrigin(projectMux))
+	root.Handle("/api/v1/requests", protectedAnalytics)
+	root.Handle("/api/v1/requests/", protectedAnalytics)
+	root.Handle("/api/v1/usage/", protectedAnalytics)
 	return root, nil
 }

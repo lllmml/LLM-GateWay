@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/lllmml/production-go-llm-gateway/internal/apikey"
+	"github.com/lllmml/production-go-llm-gateway/internal/pricing"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
 )
@@ -18,6 +19,13 @@ var (
 )
 
 const finalizeTimeout = 5 * time.Second
+
+// pricingLookupBudget bounds the price-version lookup independently of the
+// durable row finalization. It must be strictly smaller than finalizeTimeout
+// so a slow/hung pricing lookup can never consume the whole finalization
+// budget: pricing failure degrades to NULL cost, while the final durable write
+// still receives a live context (ADR-016).
+const pricingLookupBudget = 1 * time.Second
 
 type AuthContext struct {
 	ProjectID    string
@@ -87,6 +95,7 @@ type Store interface {
 	AuthenticateVirtualKey(context.Context, string, []byte) (AuthContext, error)
 	ResolveProviderCredential(context.Context, string, provider.Name) (ProviderCredential, error)
 	CreateGatewayRequest(context.Context, CreateRequestParams) (GatewayRequest, error)
+	FindModelPrice(context.Context, provider.Name, string, time.Time) (ModelPrice, error)
 	FinalizeGatewayRequest(context.Context, FinalizeParams) error
 }
 
@@ -441,22 +450,76 @@ func (s *Service) finalizeStream(ctx context.Context, record GatewayRequest, res
 		source := "provider"
 		usageSource = &source
 	}
+	// Cost attribution only for succeeded requests. pricing_id records the
+	// matched price version (provenance); estimated cost is derived and stays
+	// NULL when usage is missing or the calculation fails. Pricing problems
+	// never fail the request: they degrade to NULL plus a bounded log line.
+	// The pricing lookup gets its own child budget strictly smaller than
+	// finalizeCtx, so a lookup that burns its budget cannot starve the durable
+	// row write below.
+	var pricingID *string
+	var estimatedCostNanoUSD *int64
+	if status == "succeeded" {
+		pricingCtx, pricingCancel := context.WithTimeout(finalizeCtx, pricingLookupBudget)
+		pricingID, estimatedCostNanoUSD = s.resolvePricing(pricingCtx, record, usage)
+		pricingCancel()
+	}
 	return s.store.FinalizeGatewayRequest(finalizeCtx, FinalizeParams{
-		ID:                 record.ID,
-		Status:             status,
-		FirstChunkAt:       firstChunkAt,
-		CompletedAt:        completedAt,
-		LatencyMS:          &latency,
-		TTFTMS:             ttftMS,
-		UpstreamHTTPStatus: upstreamStatus,
-		ErrorCategory:      category,
-		RetryCount:         0,
-		PromptTokens:       promptTokens,
-		CompletionTokens:   completionTokens,
-		TotalTokens:        totalTokens,
-		UsageSource:        usageSource,
-		UpstreamRequestID:  upstreamRequestID,
+		ID:                   record.ID,
+		Status:               status,
+		FirstChunkAt:         firstChunkAt,
+		CompletedAt:          completedAt,
+		LatencyMS:            &latency,
+		TTFTMS:               ttftMS,
+		UpstreamHTTPStatus:   upstreamStatus,
+		ErrorCategory:        category,
+		RetryCount:           0,
+		PromptTokens:         promptTokens,
+		CompletionTokens:     completionTokens,
+		TotalTokens:          totalTokens,
+		UsageSource:          usageSource,
+		PricingID:            pricingID,
+		EstimatedCostNanoUSD: estimatedCostNanoUSD,
+		UpstreamRequestID:    upstreamRequestID,
 	})
+}
+
+// resolvePricing looks up the price version effective at the request start
+// time and computes the base-rate estimated cost. It returns (nil, nil) when
+// no price version is effective, and (matched, nil) when the price version is
+// found but the request has no usage or the integer calculation fails.
+func (s *Service) resolvePricing(ctx context.Context, record GatewayRequest, usage *provider.Usage) (*string, *int64) {
+	logFields := []any{
+		slog.String("gateway_request_id", record.ID),
+		slog.String("project_id", record.ProjectID),
+		slog.String("provider", string(record.Provider)),
+		slog.String("model", record.Model),
+	}
+	price, err := s.store.FindModelPrice(ctx, record.Provider, record.Model, record.StartedAt)
+	if errors.Is(err, ErrNotFound) {
+		// No effective price version (for example DeepSeek in Week 7, whose
+		// cache/time-tier-aware pricing is deliberately deferred). Cost stays
+		// NULL; this is expected and not an error.
+		s.logger.Debug("no pricing version effective for model", logFields...)
+		return nil, nil
+	}
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			s.logger.Warn("pricing lookup budget exceeded; finalizing without estimated cost", logFields...)
+		} else {
+			s.logger.Warn("pricing lookup failed; finalizing without estimated cost", append(logFields, slog.String("error", err.Error()))...)
+		}
+		return nil, nil
+	}
+	if usage == nil {
+		return &price.ID, nil
+	}
+	costNano, ok := pricing.Estimate(usage.PromptTokens, usage.CompletionTokens, price.InputNanoUSDPerMillion, price.OutputNanoUSDPerMillion)
+	if !ok {
+		s.logger.Warn("estimated cost calculation failed; recording pricing version without cost", logFields...)
+		return &price.ID, nil
+	}
+	return &price.ID, &costNano
 }
 
 func (s *Service) persistenceError(record GatewayRequest, category provider.ErrorCategory, err error) *GatewayError {

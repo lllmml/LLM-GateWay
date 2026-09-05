@@ -13,6 +13,9 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { fetchAuthState, logout, type ConsoleUser } from "./api/auth";
+import { OverviewPage } from "./pages/OverviewPage";
+import { UsageCostPage } from "./pages/UsageCostPage";
+import { RequestsPage } from "./pages/RequestsPage";
 
 const navItems = [
   { to: "/", label: "Overview", icon: Activity },
@@ -190,12 +193,12 @@ function AuthenticatedConsole({ user }: { user: ConsoleUser }) {
         </nav>
 
         <Routes>
-          <Route path="/" element={<ConsolePage page={pages.overview} />} />
+          <Route path="/" element={<OverviewPage />} />
           <Route path="/projects" element={<ConsolePage page={pages.projects} />} />
           <Route path="/virtual-keys" element={<ConsolePage page={pages.virtualKeys} />} />
           <Route path="/provider-credentials" element={<ConsolePage page={pages.providerCredentials} />} />
-          <Route path="/usage-cost" element={<ConsolePage page={pages.usageCost} />} />
-          <Route path="/requests" element={<ConsolePage page={pages.requests} />} />
+          <Route path="/usage-cost" element={<UsageCostPage />} />
+          <Route path="/requests" element={<RequestsPage />} />
           <Route path="/observability" element={<ConsolePage page={pages.observability} />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

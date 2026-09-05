@@ -12,6 +12,8 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/credential"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/project"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/providerconfig"
+	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/requesthistory"
+	"github.com/lllmml/production-go-llm-gateway/internal/controlplane/usage"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
 )
 
@@ -29,7 +31,7 @@ func TestControlPlaneProjectKeyAndCredentialRoutesUseSessionOwnerAndCSRF(t *test
 	if err != nil {
 		t.Fatalf("new credential cipher: %v", err)
 	}
-	handler, err := NewHandler(auth, projects, keys, bytes.Repeat([]byte{9}, 32), credentials, cipher, configs)
+	handler, err := NewHandler(auth, projects, keys, bytes.Repeat([]byte{9}, 32), credentials, cipher, configs, &handlerRequestStore{}, &handlerUsageStore{})
 	if err != nil {
 		t.Fatalf("new handler: %v", err)
 	}
@@ -313,4 +315,28 @@ func (s *handlerProviderConfigStore) UpsertProviderConfig(_ context.Context, par
 		Enabled:      params.Enabled,
 		UpdatedAt:    time.Now().UTC(),
 	}, nil
+}
+
+type handlerRequestStore struct{}
+
+func (*handlerRequestStore) ListRequests(context.Context, string, requesthistory.ListParams) ([]requesthistory.Request, error) {
+	return []requesthistory.Request{}, nil
+}
+
+func (*handlerRequestStore) GetRequest(context.Context, string, string) (requesthistory.Request, error) {
+	return requesthistory.Request{}, requesthistory.ErrNotFound
+}
+
+type handlerUsageStore struct{}
+
+func (*handlerUsageStore) UsageSummary(context.Context, string, string, time.Time, time.Time) (usage.UsageSummaryRow, error) {
+	return usage.UsageSummaryRow{}, nil
+}
+
+func (*handlerUsageStore) UsageTimeseries(context.Context, string, string, string, time.Time, time.Time) ([]usage.Point, error) {
+	return []usage.Point{}, nil
+}
+
+func (*handlerUsageStore) UsageBreakdown(context.Context, string, string, string, time.Time, time.Time, int) ([]usage.Group, error) {
+	return []usage.Group{}, nil
 }
