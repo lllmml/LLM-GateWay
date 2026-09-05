@@ -189,9 +189,13 @@ new_last_ms      = effective_now_ms
 ```
 
 `elapsed_ms` is additionally never negative. State loss (server restart)
-equals key expiry/rebuild, which is fine because keys are reproducible. The
-pinned Redis image/version is verified at gate time with an integration test
-proving `TIME` + writes inside the mutating Lua actually work on that version.
+equals key expiry/rebuild, which is fine because keys are reproducible.
+
+Mandatory Slice B acceptance requirement (not yet verified - this ADR commit
+is docs-only): during Slice B implementation, pin the Redis image/version and
+add an integration test proving that Redis `TIME` and writes inside the
+mutating Lua script behave as assumed on that exact version. Slice B is not
+complete until this verification passes.
 
 ### D4. Composite two-scope atomic Lua; rejection is token-charge atomic, not storage-write-free
 
@@ -226,19 +230,37 @@ way the ADR-017 registry write lock did in-process.
 - Keys hold only internal UUIDs - never a raw virtual key, its digest, its
   prefix, or any credential material.
 - Every write (allow and reject) refreshes `PEXPIRE = RATE_LIMITER_IDLE_TTL`
-  (default 10m). Idle keys expire; TTL bounds memory in place of the
-  ADR-017 janitor/EntryCap, which remain only for the local emergency
-  registry. Per-key state is O(1).
+  (default 10m). Idle state expires. TTL bounds the lifetime of idle/stale
+  Redis limiter state; it is NOT a hard cardinality cap equivalent to
+  `Registry.EntryCap`. Live Redis limiter cardinality is proportional to
+  recently active valid virtual-key/project scopes within the TTL window.
+  Week 9 does not implement a Redis-side EntryCap. Per-key state is O(1).
 - **Week 9 scope: standalone Redis only.** Redis Cluster is a future reopen
   trigger, noted so the shared-hash-tag namespace is chosen now to avoid a
   migration later.
 
 ### D6. Degraded mode: entry on the FIRST dependency failure, no entry hysteresis
 
-- **A Redis admission dependency error/timeout/ambiguous outcome immediately
-  enters degraded** (no "N consecutive failures" threshold): from that moment
-  every request in this replica is served by the local emergency limiter until
-  full recovery, so two admission sources are never mixed over time.
+Concurrency contract (no over-promise about in-flight requests):
+
+- The first Redis admission dependency error/timeout/ambiguous outcome
+  **immediately transitions the replica to degraded** (no "N consecutive
+  failures" threshold).
+- Once degraded is observable, **no NEW admission may begin a Redis
+  distributed attempt**; newly starting admissions use only the emergency
+  limiter until recovery qualification succeeds.
+- Redis attempts that were **already in flight before the transition may
+  complete**; their results are handled per the documented policy (success of
+  an in-flight attempt does not cancel the degraded state - the transition
+  already happened).
+- This bounded transition overlap (an in-flight Redis attempt finishing after
+  the replica is degraded) is accepted and explicitly documented. This slice
+  does not design an epoch/transaction mechanism to eliminate all in-flight
+  overlap; the safety guarantee is unchanged:
+  **no unlimited fail-open + bounded local emergency admission + no exact
+  global quota guarantee during dependency failure/partition**.
+- Degraded mode prevents indefinite request-by-request alternation between
+  Redis and emergency admission sources.
 - The request that triggered the transition is itself served by the emergency
   limiter (single admission source per request).
 - Recovery may use hysteresis (see D9), entry never does.
@@ -279,9 +301,15 @@ Safety contract (no stronger claim):
   reload) are safe to retry, analyzed separately from command retry. This
   allows conservative double-charge (Redis may have charged + emergency
   charges) bounded by the emergency limit; it never allows unlimited
-  admission. go-redis retry behavior (command retry, dial retry, `Script.Run`
-  EVALSHA/NOSCRIPT, timeout/context semantics) is verified against the pinned
-  version, not assumed from a config field.
+  admission.
+- Mandatory Slice B acceptance requirement (not yet verified - this ADR
+  commit is docs-only): go-redis retry behavior (command retry, dial retry,
+  `Script.Run` EVALSHA/NOSCRIPT, timeout/context semantics) must be verified
+  against the pinned go-redis version during Slice B implementation before the
+  mutating admission path is considered safe - not assumed from a config
+  field. Core invariant (unchanged): **a mutating admission operation whose
+  execution outcome is ambiguous must never be automatically
+  retransmitted.**
 - Client cancellation after a successful Redis admission keeps the charge (no
   rollback; the key remains until TTL); subsequent provider/durable work stops
   per the existing cancellation contract.
@@ -293,10 +321,17 @@ Safety contract (no stronger claim):
 - After `K` consecutive successful probes the state moves to `recovering`
   (admissions still via the emergency limiter).
 - In `recovering`, the next real request performs one genuine distributed
-  admission (single-flight under the state lock): success -> `normal` (that
-  request's decision is the distributed one); failure -> stays `degraded`
-  (that request served by emergency). This validates the real Lua write path
-  before returning to normal.
+  admission to validate the real Lua write path before returning to normal.
+  **The state mutex protects only state transitions / counters /
+  recoveryAttemptInFlight ownership. It is never held across Redis network
+  I/O.** A recovering request: (1) acquires the lock; (2) claims the single
+  recovery-attempt flag; (3) releases the lock; (4) performs the real Redis
+  admission; (5) reacquires the lock; (6) commits the normal/degraded
+  transition; (7) releases the lock. If the attempt fails, the state stays
+  degraded and that request is served by the emergency limiter. Other
+  concurrent requests are not blocked by the Redis round-trip: while the
+  recovery attempt is in flight they continue to use the emergency limiter
+  (no new distributed admission may start - see D6).
 - No unlimited window on recovery: during degraded/recovering every admission
   is emergency-bounded; keys carry TTL (10m) far longer than the recovery hold
   time, so most keys retain near-current counts. Keys that expired during a
@@ -333,7 +368,11 @@ Safety contract (no stronger claim):
   rejected hot key never resets to full burst after > idle TTL; key
   expiration/bounded state; cancellation A/B/C cases (pre-execution cancel =
   no state, ambiguous = no retransmit + degraded, post-success cancel =
-  charge retained); race tests.
+  charge retained); **transition race: concurrent Redis admissions + one
+  dependency failure - the replica transitions to degraded exactly once, no
+  new Redis admission starts after the transition, already-in-flight attempts
+  may finish per the documented policy, no data race/deadlock, and subsequent
+  requests consistently use emergency**; race tests.
 
 ## Failure policy summary (degraded dependency)
 

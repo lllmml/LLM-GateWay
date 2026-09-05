@@ -102,7 +102,7 @@ Update this after major decisions, completed phases, or bugs that future agents 
 - [x] Pricing seed + estimated cost + requests/usage analytics API
 - [x] Overview / Usage & Cost / Requests console pages
 - [x] Week 8 Reliability Baseline: in-memory rate limiting, concurrency bounds, bounded retry + Retry-After + failure matrix (ADR-017)
-- [x] Week 9 Slice A: two-replica rate-limit inconsistency demonstrated (registry regression + HTTP/reverse-proxy evidence over shared PostgreSQL + mock provider); Evidence/Decision Gate PASSED; ADR-018 Accepted (gate-transition commit pending)
+- [x] Week 9 Slice A: two-replica rate-limit inconsistency demonstrated (registry regression + HTTP/reverse-proxy evidence over shared PostgreSQL + mock provider); Evidence/Decision Gate PASSED; ADR-018 Accepted (gate-transition commit 9b38266); Slice B implementation not started
 - [ ] Week 9 Slice B: Redis-backed distributed limiter + degraded local emergency limiter + Redis failure tests (ADR-018)
 - [ ] Core MVP flow
 - [ ] Launch checks
