@@ -324,10 +324,10 @@ func TestLoadRejectsReusedSecurityKeyMaterial(t *testing.T) {
 
 func TestLoadRejectsInvalidReliabilityOverrides(t *testing.T) {
 	tests := []struct {
-		name   string
-		key    string
-		value  string
-		want   string
+		name  string
+		key   string
+		value string
+		want  string
 	}{
 		{name: "key rpm negative", key: "RATE_LIMIT_KEY_REQUESTS_PER_MINUTE", value: "-1", want: "must be a non-negative integer"},
 		{name: "project rpm negative", key: "RATE_LIMIT_PROJECT_REQUESTS_PER_MINUTE", value: "-5", want: "must be a non-negative integer"},

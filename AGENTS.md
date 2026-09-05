@@ -4,7 +4,7 @@
 
 - **What this is:** A production-oriented Go LLM gateway and Web management console that centralizes multi-provider access, virtual keys, usage/cost attribution, streaming, and operational visibility.
 - **Who it is for:** Developers, small engineering teams, and backend/AI infrastructure engineers using OpenAI, Anthropic, and DeepSeek.
-- **Current phase:** Week 7 Usage/Cost/Dashboard complete; planning Week 8 Reliability Baseline (in-memory rate limiting, bounded retry orchestration, failure matrix).
+- **Current phase:** Week 8 Reliability Baseline complete; ready to plan Week 9 (Redis as a demonstrated distributed need).
 - **Working style:** The user is learning while building. AI leads bounded implementation; the user reviews decisions, verifies behavior, and must be able to explain every core mechanism.
 
 ## Commands
