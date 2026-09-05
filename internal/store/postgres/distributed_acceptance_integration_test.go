@@ -15,11 +15,13 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +49,64 @@ func redisRealAddr(t *testing.T) string {
 		t.Fatalf("parse REDIS_URL: %v", err)
 	}
 	return options.Addr
+}
+
+// postFull sends one chat-completions request and returns status, headers, and
+// a bounded body snippet (for HTTP rejection-contract assertions).
+func postFull(t *testing.T, client *http.Client, targetURL, rawKey string) (int, http.Header, string) {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, targetURL+"/v1/chat/completions", strings.NewReader(experimentRequestBody))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatalf("gateway request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 4096))
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	return response.StatusCode, response.Header.Clone(), string(body)
+}
+
+// assertRejectionContract pins the public HTTP rejection envelope for a
+// distributed (or degraded emergency) rate-limit rejection: 429,
+// error.type/code == rate_limited, a valid Retry-After header, and no raw
+// Redis/internal dependency error leaking into the body.
+func assertRejectionContract(t *testing.T, status int, headers http.Header, body string) {
+	t.Helper()
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("rejection status = %d, want 429", status)
+	}
+	retryAfter := headers.Get("Retry-After")
+	if retryAfter == "" {
+		t.Fatalf("rejection carried no Retry-After header")
+	}
+	if seconds, err := strconv.Atoi(retryAfter); err != nil || seconds < 1 {
+		t.Fatalf("Retry-After = %q, want a positive whole-second value", retryAfter)
+	}
+	var envelope struct {
+		Error struct {
+			Type string `json:"type"`
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &envelope); err != nil {
+		t.Fatalf("rejection body is not the gateway error envelope: %q", body)
+	}
+	if envelope.Error.Type != "rate_limited" || envelope.Error.Code != "rate_limited" {
+		t.Fatalf("rejection envelope = %+v, want type/code rate_limited", envelope.Error)
+	}
+	lower := strings.ToLower(body)
+	for _, forbidden := range []string{"redis", "could not be completed", "internal", "i/o timeout", "connection refused"} {
+		if strings.Contains(lower, forbidden) {
+			t.Fatalf("rejection body leaks internal detail %q: %q", forbidden, body)
+		}
+	}
 }
 
 // redisTestClient builds a go-redis client with the pinned production posture.
@@ -127,9 +187,12 @@ func TestDistributedAcceptanceTwoReplicasSharedRedisExactClusterQuota(t *testing
 	fixture := seedExperimentFixture(t, ctx, store, upstream.URL)
 	t.Cleanup(func() { deleteOwnedLimiterKeys(t, ctx, store) })
 
-	redisClient := redisTestClient(t, redisRealAddr(t))
-	limiterA := distributedWrapper(t, redisClient, 20, time.Minute, 3)
-	limiterB := distributedWrapper(t, redisClient, 20, time.Minute, 3)
+	// Production posture is one long-lived client PER gateway process: two
+	// independent clients (A and B) against the same Redis server.
+	clientA := redisTestClient(t, redisRealAddr(t))
+	clientB := redisTestClient(t, redisRealAddr(t))
+	limiterA := distributedWrapper(t, clientA, 20, time.Minute, 3)
+	limiterB := distributedWrapper(t, clientB, 20, time.Minute, 3)
 
 	providerRegistry, err := provider.NewRegistry(map[provider.Name]provider.Client{
 		provider.OpenAI: openai.New(upstream.Client()),
@@ -170,6 +233,17 @@ func TestDistributedAcceptanceTwoReplicasSharedRedisExactClusterQuota(t *testing
 	}
 	if rows != 20 {
 		t.Fatalf("durable rows = %d, want 20", rows)
+	}
+
+	// One extra request after the bucket is empty: normal distributed Redis
+	// rejection with the public HTTP contract (no provider call, no row).
+	status, header, snippet := postFull(t, client, proxy.URL, fixture.rawKey)
+	assertRejectionContract(t, status, header, snippet)
+	if providerCalls.Load() != 20 {
+		t.Fatalf("provider calls changed after a rejected request: %d, want 20", providerCalls.Load())
+	}
+	if rows := countExperimentRequests(t, ctx, store); rows != 20 {
+		t.Fatalf("durable rows changed after a rejected request: %d, want 20", rows)
 	}
 }
 
@@ -311,6 +385,17 @@ func TestDistributedAcceptanceDegradedThenRecoveryHTTP(t *testing.T) {
 	t.Logf("degraded evidence: emergency allowed=3, durable rows=%d", rowsDegraded)
 	if rowsDegraded != 4 { // 1 healthy + 3 emergency-allowed (the 4th was rejected)
 		t.Fatalf("durable rows after degraded phase = %d, want 4", rowsDegraded)
+	}
+	if providerCalls.Load() != 4 {
+		t.Fatalf("provider calls after degraded phase = %d, want 4 (1 healthy + 3 emergency)", providerCalls.Load())
+	}
+
+	// Degraded emergency-limiter rejection uses the same public HTTP contract
+	// and leaks nothing about the Redis outage.
+	status, header, snippet := postFull(t, client, gateway.URL, fixture.rawKey)
+	assertRejectionContract(t, status, header, snippet)
+	if providerCalls.Load() != 4 || countExperimentRequests(t, ctx, store) != 4 {
+		t.Fatalf("rejected degraded request created provider/durable work")
 	}
 
 	// Redis recovers. Probes qualify (interval 30ms, threshold 2) -> recovering

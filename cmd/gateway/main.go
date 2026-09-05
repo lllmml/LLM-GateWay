@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -27,28 +28,38 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/telemetry"
 )
 
-// newRedisClient creates the single long-lived process Redis client with the
-// pinned Week 9 posture (ADR-018 implementation notes): go-redis v9.22.0 with
-// MaxRetries=-1 (0 would normalize to the default 3 retries) so an ambiguous
-// mutating admission is never automatically retransmitted, ContextTimeoutEnabled
-// so the per-command CommandTimeout context bounds reads, and short dial/write/
-// read timeouts.
-func newRedisClient(cfg config.Config) (*redis.Client, error) {
+// redisClientOptions returns the go-redis options for the single long-lived
+// process Redis client with the pinned Week 9 posture (ADR-018 implementation
+// notes): MaxRetries=-1 (0 would normalize to the default 3 retries) so an
+// ambiguous mutating admission is never automatically retransmitted,
+// ContextTimeoutEnabled so the per-command CommandTimeout context bounds reads,
+// and short dial/write/read timeouts. Parsing is the only validation; a
+// malformed URL yields the stable sanitized error "invalid REDIS_URL" because
+// the underlying net/url error can embed the raw URL including credentials.
+func redisClientOptions(cfg config.Config) (*redis.Options, error) {
 	options, err := redis.ParseURL(cfg.RedisURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse REDIS_URL: %w", err)
+		return nil, errors.New("invalid REDIS_URL")
 	}
 	options.MaxRetries = -1
 	options.ContextTimeoutEnabled = true
 	options.DialTimeout = time.Second
 	options.WriteTimeout = cfg.RedisCommandTimeout
 	options.ReadTimeout = cfg.RedisCommandTimeout
-	client := redis.NewClient(options)
-	if err := client.Ping(context.Background()).Err(); err != nil {
-		client.Close()
-		return nil, fmt.Errorf("ping REDIS_URL: %w", err)
+	return options, nil
+}
+
+// newRedisClient creates the process Redis client WITHOUT a startup availability
+// probe: go-redis connects lazily, and Redis is intentionally not a startup or
+// readiness dependency (ADR-018 failure policy) - if Redis is temporarily
+// unavailable the first real admission observes the dependency failure and the
+// distributed wrapper degrades to the bounded emergency limiter.
+func newRedisClient(cfg config.Config) (*redis.Client, error) {
+	options, err := redisClientOptions(cfg)
+	if err != nil {
+		return nil, err
 	}
-	return client, nil
+	return redis.NewClient(options), nil
 }
 
 func main() {
@@ -178,7 +189,6 @@ func run() error {
 			Logger:         logger,
 		})
 		if err != nil {
-			redisClient.Close()
 			database.Close()
 			return fmt.Errorf("configure distributed limiter: %w", err)
 		}
