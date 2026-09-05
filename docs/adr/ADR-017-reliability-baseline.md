@@ -1,7 +1,7 @@
 # ADR-017: Reliability baseline - rate limiting, concurrency bounds, and bounded retry (Week 8)
 
 - Status: Accepted
-- Date: 2026-09-08
+- Date: 2026-09-05
 - Related: Tech Design §14 (Retry Semantics), §16 (Rate Limiting Evolution, Phase A), §37 (Failure Matrix), §15 (Circuit Breaker deferral); Week 8 roadmap entry; packages `internal/ratelimit`; migrations: none (the `retry_count` column already exists in `000004`).
 
 ## Context
@@ -42,9 +42,11 @@ cancelled.
 Retry only when the attempt failed with an explicit whitelisted condition:
 
 - provider 429 (`ProviderRateLimited` **and** HTTP status 429);
-- provider 5xx (`ProviderUnavailable` **and** HTTP status >= 500), which
-  structurally excludes upstream 401/402/403 (classified
-  `ProviderUnavailable` but < 500) - those never retry;
+- provider 429 (`ProviderRateLimited` **and** HTTP status 429);
+- provider transient 5xx / overload statuses (`ProviderUnavailable`) only from
+  the explicit list **500, 502, 503, 529** - not any 5xx: unlisted statuses
+  such as 501/505 are never replayed, and 401/402/403 (classified
+  `ProviderUnavailable` but not transient server failures) never retry;
 - transport failures with no HTTP response at all
   (`ProviderUnavailable`, status 0) whose error chain proves the request never
   reached the provider: a dial-phase `net.OpError` or a `net.DNSError`.
@@ -86,8 +88,11 @@ attempt loop only wraps the open call), not a boolean test.
 `*time.Duration`: nil when missing or malformed; present with 0 for
 `Retry-After: 0` or an already-past HTTP-date; present and positive otherwise.
 `provider.ParseRetryAfter(header, now)` is a deterministic pure function
-(delta-seconds or HTTP-date). Adapters parse the wire header; the executor
-decides whether to wait and retry. A terminal, un-retried provider 429 writes a
+(delta-seconds or HTTP-date) whose delta-seconds path is overflow-safe: it
+parses as unsigned with saturation, so a value beyond the representable
+`time.Duration` range clamps to the largest positive duration instead of
+wrapping negative (such a hint can never fit a normal retry budget). Adapters
+parse the wire header; the executor decides whether to wait and retry. A terminal, un-retried provider 429 writes a
 safe `Retry-After` header computed by the gateway; no raw provider headers are
 ever forwarded. Present hints are honored verbatim (clamped to the remaining
 budget); absent hints use a fixed internal 100ms base with bounded exponential
@@ -98,36 +103,52 @@ full-jitter, capped by `RETRY_BACKOFF_MAX`.
 Each scope is `golang.org/x/time/rate`. With N requests/minute the refill rate
 is N/60 tokens/second and the burst is N - one full minute of instant allowance
 - which is a **gateway policy choice**, not an x/time/rate default. Both the
-virtual-key and project scopes must pass. Every composite admission holds
-per-entry mutexes in a fixed order (key entry, then project entry - never the
-reverse, so no deadlock) across the whole decision: one snapshot `now`,
-`ReserveN(now, 1)` on each limiter, `DelayFrom(now)` (never `Delay()`), then
-commit both or `CancelAt(now)` both. With both entries locked, the
-reserve/cancel pair cannot interleave with another admission touching either
-limiter, so a rejected admission consumes nothing: no quota leakage in either
-direction, under concurrency. Retry-After for a rejection is the maximum
-reservation delay.
+virtual-key and project scopes must pass. A client-facing `Retry-After` is
+only emitted by the HTTP layer for the `rate_limited` and
+`provider_rate_limited` categories; upstream Retry-After metadata attached to
+any other error (invalid request, auth, provider_unavailable, ...) stays
+private and is never reinterpreted as a client directive.
+
+Each composite admission holds the registry write lock for the whole decision:
+entries are resolved/created under that lock and the same lock is held through
+`ReserveN(now, 1)` on each limiter, `DelayFrom(now)` (never `Delay()`), and
+the commit-both or `CancelAt(now)`-both step. This is the simplest
+lock-ordered (registry -> entry) way to keep both participating entries
+current for the entire operation: no sweep or eviction can detach a limb
+mid-admission, so an admission can never consume quota on a limiter the
+registry has already replaced with a full bucket. A rejected admission
+consumes nothing in either scope. Retry-After for a rejection is the maximum
+reservation delay and the binding scope (`virtual_key` or `project`) is
+reported for operational visibility.
 
 ### D7. Bounded limiter registry lifecycle
 
 The registry caps memory: a janitor goroutine (owned by the registry, stopped
 by `Close()`, wired to process shutdown) sweeps entries idle past
-`RATE_LIMITER_IDLE_TTL` every `RATE_LIMITER_SWEEP_INTERVAL`, and
-`RATE_LIMITER_ENTRY_CAP` bounds the map. When the cap is reached the
-least-recently-used entry is evicted before a new one is inserted. Eviction can
-only reset a bucket to a full burst (documented bounded over-admission window
-for that scope); it never corrupts counters.
+`RATE_LIMITER_IDLE_TTL` every `RATE_LIMITER_SWEEP_INTERVAL` under the registry
+write lock, and `RATE_LIMITER_ENTRY_CAP` bounds the map. Sweep and cap
+eviction therefore run only between admissions: while an admission holds the
+registry lock its two limbs stay current, and eviction additionally skips the
+limbs the in-flight admission already resolved. `EntryCap` is validated to be
+at least one per enabled scope, so both enabled scopes can always coexist.
+Eviction can only reset a bucket to a full burst (documented bounded
+over-admission window for the evicted scope only); it never corrupts counters
+or detaches an entry mid-admission.
 
 ### D8. Rejection persistence contract and category distinction
 
 Rate-limit and concurrency rejections happen before any provider call and
 before `CreateGatewayRequest`: no durable row, no upstream work, stable HTTP
-429 with the `rate_limited` category and `Retry-After` where applicable.
-Operational visibility stays in bounded log lines now; Prometheus counters
-(`gateway_rate_limit_rejections_total{scope}` etc.) land with the Week 10
-Observability milestone. Local rejections remain `rate_limited`; a provider 429
-whose retries are exhausted remains `provider_rate_limited` (both are HTTP 429
-but the stable categories are never merged).
+429 with the `rate_limited` category and a gateway-formatted `Retry-After`
+where applicable. Operational visibility now comes from a bounded structured
+slog event (`event=admission_rejected`, `reason`, `scope` where applicable,
+`project_id`, `virtual_key_id`, `retry_after_seconds`; never raw keys,
+authorization material, credentials, prompt/response bodies, or provider
+headers); Prometheus counters (`gateway_rate_limit_rejections_total{scope}`
+etc.) land with the Week 10 Observability milestone. Local rejections remain
+`rate_limited`; a provider 429 whose retries are exhausted remains
+`provider_rate_limited` (both are HTTP 429 but the stable categories are never
+merged).
 
 ### D9. Concurrency bounds
 
@@ -161,6 +182,8 @@ admission controls, documented accordingly.
 - Retry whenever `!sink.Committed()` - rejected: replays requests the provider
   may already be billing after `ChatStream` establishment.
 - Retry on `ProviderUnavailable` category - rejected: includes 401/402/403.
+- Any `>= 500` provider status - rejected: replays unlisted statuses such as
+  501/505; only the explicit 500/502/503/529 list is retried.
 - Two `Allow()` calls in sequence - rejected: leaks quota when the second scope
   rejects.
 - Custom token-bucket implementation - rejected: `x/time/rate` is specified by

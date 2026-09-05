@@ -180,7 +180,15 @@ func writeGatewayError(response http.ResponseWriter, record GatewayRequest, err 
 		response.Header().Set("X-Gateway-Provider", string(record.Provider))
 		response.Header().Set("X-Gateway-Retry-Count", strconv.FormatInt(int64(record.RetryCount), 10))
 	}
-	if gatewayErr.RetryAfter != nil {
+	// A client-facing Retry-After is only part of the Week 8 response contract
+	// for the gateway's own rate_limited category and a terminal
+	// provider_rate_limited category (ADR-017 D5/D8). Upstream Retry-After
+	// metadata carried on any other error (invalid request, auth,
+	// provider_unavailable, ...) stays private: raw provider headers are never
+	// forwarded and the gateway does not reinterpret a provider hint as a
+	// client retry directive for unrelated categories.
+	if gatewayErr.RetryAfter != nil &&
+		(gatewayErr.Category == provider.RateLimited || gatewayErr.Category == provider.ProviderRateLimited) {
 		response.Header().Set("Retry-After", formatRetryAfter(*gatewayErr.RetryAfter))
 	}
 	status := http.StatusInternalServerError
@@ -295,15 +303,13 @@ func (s *httpStreamSink) Committed() bool {
 	return s.committed
 }
 
-// formatRetryAfter renders a Retry-After header value (whole seconds, ceil,
-// never negative). A present zero hint renders "0" so the header stays
-// meaningful ("retry immediately") rather than disappearing.
+// formatRetryAfter renders a Retry-After header value (whole seconds, ceiled
+// without overflow). A present zero hint renders "0" so the header stays
+// meaningful ("retry immediately") rather than disappearing. Values near the
+// time.Duration maximum cannot wrap negative because the ceiling is computed
+// by division and remainder rather than by duration + (second - 1).
 func formatRetryAfter(duration time.Duration) string {
-	if duration <= 0 {
-		return "0"
-	}
-	seconds := (duration + time.Second - 1) / time.Second
-	return strconv.FormatInt(int64(seconds), 10)
+	return strconv.FormatInt(int64(formatRetryAfterSeconds(duration)), 10)
 }
 
 func cleanSSEEventName(name string) string {

@@ -171,6 +171,11 @@ type Service struct {
 	retryBackoffMax       time.Duration
 	jitter                func(int64) int64
 	now                   func() time.Time
+	// onRetryWait is an unexported test hook invoked immediately before the
+	// retry loop blocks on its backoff/Retry-After wait. Tests use it to
+	// cancel the request context at a known point (the loop is provably inside
+	// the wait) instead of racing real sleeps.
+	onRetryWait func()
 }
 
 func NewService(options Options) (*Service, error) {
@@ -348,6 +353,9 @@ func (s *Service) completeChat(ctx context.Context, auth AuthContext, traceID st
 		if wait == nil {
 			break
 		}
+		if s.onRetryWait != nil {
+			s.onRetryWait()
+		}
 		if !s.waitWithContext(ctx, *wait) {
 			break
 		}
@@ -467,6 +475,9 @@ func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID stri
 		if wait == nil {
 			break
 		}
+		if s.onRetryWait != nil {
+			s.onRetryWait()
+		}
 		if !s.waitWithContext(ctx, *wait) {
 			break
 		}
@@ -536,13 +547,17 @@ func classifyStreamOpenError(ctx context.Context, gatewayErr *GatewayError) *Gat
 // admit applies the Week 8 admission controls in order: in-memory rate
 // limiting (per virtual key and per project), then the concurrency slots. A
 // rejected request returns a stable rate_limited gateway error (never a
-// provider call, never a durable gateway_requests row). The returned release
-// function must be called exactly once when the admitted operation finishes;
-// it is safe under early returns and panics when deferred.
+// provider call, never a durable gateway_requests row) and is visible through
+// a bounded structured slog event, because Week 8 rejections intentionally
+// create no durable record and Prometheus metrics land with the Week 10
+// observability milestone. The returned release function must be called
+// exactly once when the admitted operation finishes; it is safe under early
+// returns and panics when deferred.
 func (s *Service) admit(ctx context.Context, auth AuthContext, stream bool) (func(), *GatewayError) {
 	if s.rateLimiter != nil {
 		decision := s.rateLimiter.Admit(auth.VirtualKeyID, auth.ProjectID)
 		if !decision.Allowed {
+			s.logAdmissionRejection(auth, "rate_limit", string(decision.BlockingScope), decision.RetryAfter)
 			retryAfter := decision.RetryAfter
 			return nil, &GatewayError{
 				Category:   provider.RateLimited,
@@ -558,6 +573,7 @@ func (s *Service) admit(ctx context.Context, auth AuthContext, stream bool) (fun
 		case s.requestSlots <- struct{}{}:
 			releaseGeneral = func() { <-s.requestSlots }
 		default:
+			s.logAdmissionRejection(auth, "concurrent_requests", "", 0)
 			return nil, NewError(provider.RateLimited, "concurrent request limit reached")
 		}
 	}
@@ -568,6 +584,7 @@ func (s *Service) admit(ctx context.Context, auth AuthContext, stream bool) (fun
 	case s.streamSlots <- struct{}{}:
 	default:
 		releaseGeneral() // never leak the general slot when the stream slot is full
+		s.logAdmissionRejection(auth, "concurrent_streams", "", 0)
 		return nil, NewError(provider.RateLimited, "concurrent stream limit reached")
 	}
 	// The composite release is deferred by the caller and therefore runs
@@ -576,6 +593,40 @@ func (s *Service) admit(ctx context.Context, auth AuthContext, stream bool) (fun
 		releaseGeneral()
 		<-s.streamSlots
 	}, nil
+}
+
+// logAdmissionRejection emits the bounded, non-secret visibility event for a
+// Week 8 admission rejection. Fields never include raw virtual keys,
+// authorization material, credentials, prompt/response bodies, or provider
+// headers. scope is empty for concurrency rejections; retryAfter is only set
+// where the gateway computed a client wait hint.
+func (s *Service) logAdmissionRejection(auth AuthContext, reason, scope string, retryAfter time.Duration) {
+	fields := []any{
+		slog.String("event", "admission_rejected"),
+		slog.String("reason", reason),
+		slog.String("project_id", auth.ProjectID),
+		slog.String("virtual_key_id", auth.VirtualKeyID),
+	}
+	if scope != "" {
+		fields = append(fields, slog.String("scope", scope))
+	}
+	if retryAfter > 0 {
+		fields = append(fields, slog.Int64("retry_after_seconds", int64(formatRetryAfterSeconds(retryAfter))))
+	}
+	s.logger.Info("admission rejected", fields...)
+}
+
+// formatRetryAfterSeconds returns the whole-second ceiling used for the
+// Retry-After response header and the rejection log field.
+func formatRetryAfterSeconds(duration time.Duration) time.Duration {
+	if duration <= 0 {
+		return 0
+	}
+	seconds := duration / time.Second
+	if duration%time.Second != 0 {
+		seconds++
+	}
+	return seconds
 }
 
 // retryAllowed reports whether ANOTHER retry attempt may start after the given
@@ -647,10 +698,23 @@ func (s *Service) waitWithContext(ctx context.Context, duration time.Duration) b
 	}
 }
 
+// retryableProviderStatuses is the explicit transient-failure whitelist for
+// provider HTTP responses (ADR-017 D2). It is deliberately not "any 5xx":
+// only statuses the three adapters classify as transient overload/server
+// failures may be replayed. 504 stays under ProviderTimeout's no-retry policy.
+func retryableProviderStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, 529:
+		return true
+	}
+	return false
+}
+
 // isRetryableGatewayError is the Week 8 retry whitelist. It never retries on
 // category alone: provider 401/402/403 are provider_unavailable yet must never
 // retry, so the decision always considers the category together with the
-// upstream HTTP status (or the absence of any HTTP response).
+// upstream HTTP status (or the absence of any HTTP response). Unknown 5xx
+// statuses such as 501/505 are not whitelisted and are not retried.
 func isRetryableGatewayError(gatewayErr *GatewayError) bool {
 	if gatewayErr == nil {
 		return false
@@ -661,10 +725,10 @@ func isRetryableGatewayError(gatewayErr *GatewayError) bool {
 		// present).
 		return gatewayErr.StatusCode == http.StatusTooManyRequests
 	case provider.ProviderUnavailable:
-		if gatewayErr.StatusCode >= 500 {
-			// Selected provider 5xx: a real HTTP response was received, so
-			// 401/402/403 (also classified provider_unavailable but <500) are
-			// excluded structurally.
+		// A real HTTP response was received: retry only the explicit transient
+		// status whitelist, which structurally excludes 401/402/403 (also
+		// classified provider_unavailable) and unlisted 5xx.
+		if gatewayErr.StatusCode != 0 && retryableProviderStatus(gatewayErr.StatusCode) {
 			return true
 		}
 		if gatewayErr.StatusCode == 0 {

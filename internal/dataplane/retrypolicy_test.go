@@ -3,7 +3,10 @@ package dataplane
 import (
 	"context"
 	"errors"
+	"math"
 	"net"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,11 +47,16 @@ func TestIsRetryableGatewayErrorWhitelist(t *testing.T) {
 		{name: "provider 429", err: &GatewayError{Category: provider.ProviderRateLimited, StatusCode: 429}, want: true},
 		{name: "provider rate limited without 429 status", err: &GatewayError{Category: provider.ProviderRateLimited, StatusCode: 500}, want: false},
 		{name: "provider 500", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 500}, want: true},
+		{name: "provider 502", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 502}, want: true},
 		{name: "provider 503", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 503}, want: true},
+		{name: "provider 529 overload", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 529}, want: true},
+		{name: "provider 501 not whitelisted", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 501}, want: false},
+		{name: "provider 505 not whitelisted", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 505}, want: false},
+		{name: "provider 508 unknown not whitelisted", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 508}, want: false},
 		{name: "provider 401 must never retry", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 401}, want: false},
 		{name: "provider 402 must never retry", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 402}, want: false},
 		{name: "provider 403 must never retry", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 403}, want: false},
-		{name: "provider 504 timeout", err: &GatewayError{Category: provider.ProviderTimeout, StatusCode: 504}, want: false},
+		{name: "provider 504 stays under no-retry timeout", err: &GatewayError{Category: provider.ProviderTimeout, StatusCode: 504}, want: false},
 		{name: "provider invalid request 400", err: &GatewayError{Category: provider.ProviderInvalidReq, StatusCode: 400}, want: false},
 		{name: "stream interrupted", err: &GatewayError{Category: provider.StreamInterrupted}, want: false},
 		{name: "local rate limited", err: &GatewayError{Category: provider.RateLimited, StatusCode: 429}, want: false},
@@ -65,6 +73,19 @@ func TestIsRetryableGatewayErrorWhitelist(t *testing.T) {
 				t.Fatalf("isRetryableGatewayError(%+v) = %t, want %t", test.err, got, test.want)
 			}
 		})
+	}
+}
+
+func TestRetryableProviderStatus(t *testing.T) {
+	for _, status := range []int{500, 502, 503, 529} {
+		if !retryableProviderStatus(status) {
+			t.Fatalf("retryableProviderStatus(%d) = false, want true", status)
+		}
+	}
+	for _, status := range []int{501, 504, 505, 507, 508, 599, 429, 400, 401, 403} {
+		if retryableProviderStatus(status) {
+			t.Fatalf("retryableProviderStatus(%d) = true, want false", status)
+		}
 	}
 }
 
@@ -134,6 +155,11 @@ func TestRetryDelayPolicy(t *testing.T) {
 }
 
 func TestFormatRetryAfter(t *testing.T) {
+	maxDuration := time.Duration(math.MaxInt64)
+	maxSeconds := maxDuration / time.Second
+	if maxDuration%time.Second != 0 {
+		maxSeconds++
+	}
 	tests := []struct {
 		duration time.Duration
 		want     string
@@ -143,10 +169,16 @@ func TestFormatRetryAfter(t *testing.T) {
 		{duration: time.Second, want: "1"},
 		{duration: 1500 * time.Millisecond, want: "2"},
 		{duration: time.Hour, want: "3600"},
+		// Near-MaxInt64 must ceil without wrapping negative or overflowing.
+		{duration: maxDuration, want: strconv.FormatInt(int64(maxSeconds), 10)},
 	}
 	for _, test := range tests {
-		if got := formatRetryAfter(test.duration); got != test.want {
+		got := formatRetryAfter(test.duration)
+		if got != test.want {
 			t.Fatalf("formatRetryAfter(%v) = %q, want %q", test.duration, got, test.want)
+		}
+		if strings.HasPrefix(got, "-") {
+			t.Fatalf("formatRetryAfter(%v) emitted a negative header %q", test.duration, got)
 		}
 	}
 }

@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -279,53 +282,79 @@ func TestRetryAfterHintRespectedAndBudgetClamped(t *testing.T) {
 	})
 }
 
-// sleeperClient sleeps for the given duration on every attempt regardless of
-// context, then reports a retryable 500. With a 600ms overall phase budget and
-// a 200ms per-attempt sleep, a budget-sharing retry loop attempts at ~0ms,
-// ~200ms and ~400ms and stops after the ~600ms deadline: exactly 3 calls and 2
-// retries. Multiplying the timeout by attempts would instead allow 6 calls.
-type sleeperClient struct {
-	calls int
-	sleep time.Duration
-	err   error
+// stepClock is an injectable monotonic clock that tests advance deterministically.
+type stepClock struct {
+	mu  sync.Mutex
+	now time.Time
 }
 
-func (c *sleeperClient) CompleteChat(context.Context, provider.ChatRequest, provider.Credential) (provider.Result, error) {
+func newStepClock(at time.Time) *stepClock {
+	return &stepClock{now: at}
+}
+
+func (c *stepClock) current() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *stepClock) advance(duration time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(duration)
+}
+
+// clockAdvancingClient advances the injected service clock by step on every
+// attempt and returns a retryable 500. The attempt loop fixes its phase
+// deadline from the clock when the first attempt starts; because the client
+// moves the clock forward by more than the remaining budget after the second
+// attempt, the budget-sharing decision is fully deterministic with no real
+// sleeps. If each attempt were granted a fresh timeout (attempts x timeout),
+// the decision would keep passing and far more attempts would run.
+type clockAdvancingClient struct {
+	clock *stepClock
+	step  time.Duration
+	err   error
+	calls int
+}
+
+func (c *clockAdvancingClient) CompleteChat(context.Context, provider.ChatRequest, provider.Credential) (provider.Result, error) {
 	c.calls++
-	time.Sleep(c.sleep)
+	c.clock.advance(c.step)
 	return provider.Result{}, c.err
 }
 
 func TestRetriesShareOverallBudgetNeverMultiplyTimeout(t *testing.T) {
+	clock := newStepClock(time.Now())
 	store, rawKey := newAuthorizedStore(t)
-	client := &sleeperClient{sleep: 200 * time.Millisecond, err: errProviderUnavailable500()}
+	client := &clockAdvancingClient{clock: clock, step: 700 * time.Millisecond, err: errProviderUnavailable500()}
 	service := newServiceWithReliability(t, store, map[provider.Name]provider.Client{provider.OpenAI: client}, func(options *Options) {
-		options.UpstreamRequestTimeout = 600 * time.Millisecond
+		options.UpstreamRequestTimeout = time.Second
 		options.RetryMaxRetries = 5
 		options.RetryBackoffMax = time.Nanosecond
 	})
 	service.jitter = zeroJitter
+	service.now = clock.current
 
 	auth, err := service.Authenticate(context.Background(), rawKey)
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	started := time.Now()
 	_, _, err = service.CompleteChat(context.Background(), auth, "", chatRequest())
-	elapsed := time.Since(started)
 
 	gatewayErr, ok := err.(*GatewayError)
 	if !ok || gatewayErr.Category != provider.ProviderUnavailable {
 		t.Fatalf("error = %#v, want provider_unavailable", err)
 	}
-	if client.calls != 3 {
-		t.Fatalf("provider calls = %d, want 3 (budget-shared attempts)", client.calls)
+	// Attempt 1 fails at t0+700ms (clock advanced); the shared phase deadline
+	// (t0+1s) still has 300ms left, so one retry runs. Attempt 2 advances the
+	// clock to t0+1.4s, past the deadline, so no third attempt starts. A
+	// per-attempt fresh timeout would have allowed ~5 further attempts.
+	if client.calls != 2 {
+		t.Fatalf("provider calls = %d, want 2 (budget-shared attempts)", client.calls)
 	}
-	if int(store.lastFinalize.RetryCount) != 2 {
-		t.Fatalf("persisted retry count = %d, want 2", store.lastFinalize.RetryCount)
-	}
-	if elapsed > 1200*time.Millisecond {
-		t.Fatalf("elapsed = %v, want near the single 600ms budget, not attempts*timeout", elapsed)
+	if int(store.lastFinalize.RetryCount) != 1 {
+		t.Fatalf("persisted retry count = %d, want 1", store.lastFinalize.RetryCount)
 	}
 }
 
@@ -334,26 +363,37 @@ func TestClientCancellationStopsRetriesDuringBackoff(t *testing.T) {
 	client := &retryProbeClient{errors: []error{errProviderUnavailable500()}, result: okResult()}
 	service := newServiceWithReliability(t, store, map[provider.Name]provider.Client{provider.OpenAI: client}, func(options *Options) {
 		options.RetryMaxRetries = 5
-		options.RetryBackoffMax = time.Hour // a backoff far beyond the test window
 	})
-	// Fixed non-trivial wait so the retry loop is provably inside its backoff
-	// when the client cancels.
-	service.jitter = func(int64) int64 { return int64(500 * time.Millisecond) }
+	// A fixed non-trivial wait that still fits the ~1s phase budget, so the
+	// retry loop provably blocks in its backoff wait before any cancellation.
+	service.jitter = func(int64) int64 { return int64(900 * time.Millisecond) }
+
+	// Synchronize on the loop entering the wait instead of sleeping and
+	// guessing: the hook fires immediately before waitWithContext blocks.
+	enteredBackoff := make(chan struct{})
+	var once sync.Once
+	service.onRetryWait = func() {
+		once.Do(func() { close(enteredBackoff) })
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-enteredBackoff
+		cancel()
+	}()
 
 	auth, err := service.Authenticate(context.Background(), rawKey)
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		// Cancel shortly after the first attempt returns, while the retry
-		// loop is waiting out its backoff.
-		time.Sleep(10 * time.Millisecond)
-		cancel()
-	}()
 	_, _, err = service.CompleteChat(ctx, auth, "", chatRequest())
+	if err == nil {
+		t.Fatal("complete chat returned nil error after cancellation")
+	}
 	if client.calls != 1 {
 		t.Fatalf("provider calls = %d, want 1 (cancellation during backoff must not retry)", client.calls)
+	}
+	if int(store.lastFinalize.RetryCount) != 0 {
+		t.Fatalf("persisted retry count = %d, want 0", store.lastFinalize.RetryCount)
 	}
 }
 
@@ -725,4 +765,265 @@ func streamChatRequest() provider.ChatRequest {
 
 func chatJSON() string {
 	return `{"model":"openai/gpt-test","messages":[{"role":"user","content":"hello"}]}`
+}
+
+func TestHandlerRetryAfterOnlyForIntendedCategories(t *testing.T) {
+	t.Run("local rate limit emits retry-after", func(t *testing.T) {
+		store, rawKey := newAuthorizedStore(t)
+		client := &retryProbeClient{result: okResult()}
+		limiter, err := ratelimit.NewRegistry(ratelimit.Config{
+			KeyRPM:        1,
+			EntryCap:      10,
+			IdleTTL:       time.Minute,
+			SweepInterval: time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("new limiter: %v", err)
+		}
+		t.Cleanup(limiter.Close)
+		service := newServiceWithReliability(t, store, map[provider.Name]provider.Client{provider.OpenAI: client}, func(options *Options) {
+			options.RateLimiter = limiter
+		})
+		handler := NewHandler(service)
+
+		first := httptest.NewRecorder()
+		handler.chatCompletions(first, chatHTTPRequest(rawKey))
+		if first.Code != http.StatusOK {
+			t.Fatalf("first status = %d, want 200; body=%s", first.Code, first.Body.String())
+		}
+		second := httptest.NewRecorder()
+		handler.chatCompletions(second, chatHTTPRequest(rawKey))
+		if second.Code != http.StatusTooManyRequests {
+			t.Fatalf("second status = %d, want 429; body=%s", second.Code, second.Body.String())
+		}
+		if !bytes.Contains(second.Body.Bytes(), []byte(`"type":"rate_limited"`)) {
+			t.Fatalf("body missing local rate_limited category: %s", second.Body.String())
+		}
+		retryAfter := second.Header().Get("Retry-After")
+		if retryAfter == "" {
+			t.Fatal("local rate limit rejection did not emit Retry-After")
+		}
+		seconds, err := strconv.Atoi(retryAfter)
+		if err != nil || seconds <= 0 {
+			t.Fatalf("Retry-After = %q, want a positive whole second count", retryAfter)
+		}
+		if second.Header().Get("X-Gateway-Request-ID") != "" {
+			t.Fatal("rate-limited request unexpectedly carried a gateway request ID")
+		}
+		if store.createCalls != 1 || client.calls != 1 {
+			t.Fatalf("create=%d provider=%d, want 1 each (rejection before row/provider)", store.createCalls, client.calls)
+		}
+	})
+
+	t.Run("provider invalid request with retry-after hint must not emit header", func(t *testing.T) {
+		store, rawKey := newAuthorizedStore(t)
+		hint := 120 * time.Second
+		client := &retryProbeClient{errors: []error{
+			&provider.Error{Category: provider.ProviderInvalidReq, StatusCode: http.StatusBadRequest, RetryAfter: &hint},
+		}}
+		service := newServiceWithReliability(t, store, map[provider.Name]provider.Client{provider.OpenAI: client}, func(options *Options) {
+			options.RetryMaxRetries = 3
+		})
+		service.jitter = zeroJitter
+		handler := NewHandler(service)
+
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(chatJSON()))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+rawKey)
+		response := httptest.NewRecorder()
+		handler.chatCompletions(response, request)
+
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", response.Code, response.Body.String())
+		}
+		if got := response.Header().Get("Retry-After"); got != "" {
+			t.Fatalf("Retry-After = %q leaked on a provider invalid-request response", got)
+		}
+		if client.calls != 1 {
+			t.Fatalf("provider calls = %d, want 1", client.calls)
+		}
+	})
+
+	t.Run("provider unavailable with retry-after hint must not emit header", func(t *testing.T) {
+		store, rawKey := newAuthorizedStore(t)
+		hint := 2 * time.Hour
+		client := &retryProbeClient{errors: []error{
+			&provider.Error{Category: provider.ProviderUnavailable, StatusCode: http.StatusServiceUnavailable, RetryAfter: &hint},
+		}}
+		service := newServiceWithReliability(t, store, map[provider.Name]provider.Client{provider.OpenAI: client}, func(options *Options) {
+			options.RetryMaxRetries = 3
+		})
+		service.jitter = zeroJitter
+		handler := NewHandler(service)
+
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(chatJSON()))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+rawKey)
+		response := httptest.NewRecorder()
+		handler.chatCompletions(response, request)
+
+		// 503 is retryable but the 2h hint cannot fit the ~1s phase budget, so
+		// the single attempt is terminal with a provider hint attached; the
+		// response must not forward it as a client directive.
+		if response.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502; body=%s", response.Code, response.Body.String())
+		}
+		if got := response.Header().Get("Retry-After"); got != "" {
+			t.Fatalf("Retry-After = %q leaked on a provider-unavailable response", got)
+		}
+		if client.calls != 1 {
+			t.Fatalf("provider calls = %d, want 1", client.calls)
+		}
+	})
+}
+
+// captureHandler collects slog records in memory for admission-visibility tests.
+type captureHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *captureHandler) Handle(_ context.Context, record slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, record.Clone())
+	return nil
+}
+
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h *captureHandler) WithGroup(string) slog.Handler { return h }
+
+func (h *captureHandler) attrs() map[string]string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	result := map[string]string{}
+	for _, record := range h.records {
+		record.Attrs(func(attr slog.Attr) bool {
+			result[attr.Key] = attr.Value.String()
+			return true
+		})
+	}
+	return result
+}
+
+func (h *captureHandler) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.records)
+}
+
+func TestAdmissionRejectionVisibility(t *testing.T) {
+	t.Run("rate limit rejection logs bounded fields", func(t *testing.T) {
+		store, rawKey := newAuthorizedStore(t)
+		client := &retryProbeClient{result: okResult()}
+		limiter, err := ratelimit.NewRegistry(ratelimit.Config{
+			ProjectRPM:    1,
+			EntryCap:      10,
+			IdleTTL:       time.Minute,
+			SweepInterval: time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("new limiter: %v", err)
+		}
+		t.Cleanup(limiter.Close)
+		capture := &captureHandler{}
+		service := newServiceWithReliability(t, store, map[provider.Name]provider.Client{provider.OpenAI: client}, func(options *Options) {
+			options.RateLimiter = limiter
+		})
+		service.logger = slog.New(capture)
+
+		auth, err := service.Authenticate(context.Background(), rawKey)
+		if err != nil {
+			t.Fatalf("authenticate: %v", err)
+		}
+		if _, _, err := service.CompleteChat(context.Background(), auth, "", chatRequest()); err != nil {
+			t.Fatalf("first request: %v", err)
+		}
+		if _, _, err := service.CompleteChat(context.Background(), auth, "", chatRequest()); err == nil {
+			t.Fatal("second request unexpectedly allowed")
+		}
+		attrs := capture.attrs()
+		if attrs["reason"] != "rate_limit" {
+			t.Fatalf("log reason = %q, want rate_limit (attrs=%v)", attrs["reason"], attrs)
+		}
+		if attrs["scope"] != "project" {
+			t.Fatalf("log scope = %q, want project (attrs=%v)", attrs["scope"], attrs)
+		}
+		if attrs["project_id"] != testProjectID || attrs["virtual_key_id"] != testVirtualKeyID {
+			t.Fatalf("log ids = project %q key %q (attrs=%v)", attrs["project_id"], attrs["virtual_key_id"], attrs)
+		}
+		if _, ok := attrs["retry_after_seconds"]; !ok {
+			t.Fatalf("log missing retry_after_seconds (attrs=%v)", attrs)
+		}
+		for _, secret := range []string{"sk-", "Authorization", "Bearer", "hello"} {
+			for _, value := range attrs {
+				if containsFold(value, secret) {
+					t.Fatalf("log leaked %q via value %q", secret, value)
+				}
+			}
+		}
+	})
+
+	t.Run("concurrency rejection logs reason and no provider call", func(t *testing.T) {
+		store, rawKey := newAuthorizedStore(t)
+		client := &blockingClient{started: make(chan struct{}, 8), release: make(chan struct{})}
+		capture := &captureHandler{}
+		service := newServiceWithReliability(t, store, map[provider.Name]provider.Client{provider.OpenAI: client}, func(options *Options) {
+			options.MaxConcurrentRequests = 1
+		})
+		service.logger = slog.New(capture)
+
+		auth, err := service.Authenticate(context.Background(), rawKey)
+		if err != nil {
+			t.Fatalf("authenticate: %v", err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			_, _, err := service.CompleteChat(context.Background(), auth, "", chatRequest())
+			done <- err
+		}()
+		<-client.started
+		defer func() {
+			close(client.release)
+			<-done
+		}()
+
+		if _, _, err := service.CompleteChat(context.Background(), auth, "", chatRequest()); err == nil {
+			t.Fatal("second request unexpectedly allowed")
+		}
+		attrs := capture.attrs()
+		if attrs["reason"] != "concurrent_requests" {
+			t.Fatalf("log reason = %q, want concurrent_requests (attrs=%v)", attrs["reason"], attrs)
+		}
+		if attrs["scope"] != "" {
+			t.Fatalf("log scope = %q, want empty for concurrency (attrs=%v)", attrs["scope"], attrs)
+		}
+		client.mu.Lock()
+		calls := client.calls
+		client.mu.Unlock()
+		if calls != 1 {
+			t.Fatalf("provider calls = %d, want 1", calls)
+		}
+	})
+}
+
+func containsFold(value, substring string) bool {
+	return len(value) >= len(substring) && (func() bool {
+		for index := 0; index+len(substring) <= len(value); index++ {
+			if strings.EqualFold(value[index:index+len(substring)], substring) {
+				return true
+			}
+		}
+		return false
+	}())
+}
+
+func chatHTTPRequest(rawKey string) *http.Request {
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(chatJSON()))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	return request
 }

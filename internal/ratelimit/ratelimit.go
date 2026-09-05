@@ -3,18 +3,26 @@
 //
 // The registry holds one token bucket per virtual key and one per project
 // (golang.org/x/time/rate). Admission for a request is composite: the virtual
-// key scope and the project scope must BOTH have a token available. To keep
-// that two-limb decision free of quota leakage under concurrency, every
-// composite admission serializes the two involved entries with per-entry
-// mutexes in a fixed order (virtual key first, then project) and holds both
-// locks while reserving and while committing or cancelling, so the two limiter
-// states can never interleave with another admission touching either of them.
+// key scope and the project scope must BOTH have a token available, and both
+// decisions are made against the same clock snapshot.
+//
+// Concurrency model: the registry write lock is held for the whole composite
+// decision (entry resolution/creation, eviction, reservation, and
+// commit-or-cancel). This is the simplest deadlock-free way to keep the two
+// participating entries current for the entire operation: while the lock is
+// held no sweep or cap eviction can detach either entry, so an admission can
+// never reserve against a limiter the registry has already replaced with a
+// fresh full bucket. Eviction never targets an entry that the in-flight
+// admission itself resolved (the earlier limb is protected), so both enabled
+// scopes always coexist for one admission. Sweep and LRU eviction use the same
+// registry-lock ordering and therefore skip nothing mid-admission; entries are
+// only ever evicted between admissions.
 //
 // Registry growth is bounded: entries idle past a TTL are removed by a janitor
 // goroutine, and when the entry cap is reached the least-recently-used entry
 // is evicted before a new one is inserted. Eviction can only reset a bucket to
 // a full burst (never corrupt counters), which is a documented, bounded
-// over-admission window for that scope.
+// over-admission window for the evicted scope only.
 package ratelimit
 
 import (
@@ -56,17 +64,20 @@ type Decision struct {
 	// communicate to the client before it retries. It is computed from the
 	// binding limiter's reservation delay, so it is never negative.
 	RetryAfter time.Duration
+	// BlockingScope names the enabled scope whose quota rejected the
+	// admission, or "" when Allowed is true. It is a bounded, non-secret label
+	// for operational visibility (key vs project rate limiting).
+	BlockingScope Scope
 }
 
 type entry struct {
-	mu       sync.Mutex // serializes every reserve/commit-or-cancel touching this limiter
 	lim      *rate.Limiter
-	lastSeen time.Time // guarded by mu
+	lastSeen time.Time // guarded by Registry.mu
 }
 
 type Registry struct {
 	cfg     Config
-	mu      sync.RWMutex // guards entries
+	mu      sync.RWMutex // guards entries and every entry field
 	entries map[string]*entry
 	stop    chan struct{}
 	wg      sync.WaitGroup
@@ -75,7 +86,9 @@ type Registry struct {
 
 // NewRegistry validates the configuration and starts the janitor goroutine.
 // Call Close to stop the janitor. A configuration with both scopes disabled is
-// valid and admits everything.
+// valid and admits everything. EntryCap must be large enough for every enabled
+// scope to coexist (at least one per enabled scope), otherwise composite
+// admissions could never keep both limbs current.
 func NewRegistry(cfg Config) (*Registry, error) {
 	cfg = normalize(cfg)
 	if err := validate(cfg); err != nil {
@@ -98,6 +111,17 @@ func normalize(cfg Config) Config {
 	return cfg
 }
 
+func enabledScopes(cfg Config) int {
+	enabled := 0
+	if cfg.KeyRPM > 0 {
+		enabled++
+	}
+	if cfg.ProjectRPM > 0 {
+		enabled++
+	}
+	return enabled
+}
+
 func validate(cfg Config) error {
 	for _, scope := range []struct {
 		name string
@@ -112,6 +136,13 @@ func validate(cfg Config) error {
 	}
 	if cfg.EntryCap < 1 {
 		return errors.New("ratelimit entry cap must be positive")
+	}
+	// Every enabled scope needs a live entry during a composite admission.
+	// A cap smaller than the enabled-scope count would force the registry to
+	// evict one limb while resolving the other, which can never keep both
+	// buckets current.
+	if cfg.EntryCap < enabledScopes(cfg) {
+		return fmt.Errorf("ratelimit entry cap %d is too small for %d enabled scopes; it must be at least 1 per enabled scope", cfg.EntryCap, enabledScopes(cfg))
 	}
 	if cfg.IdleTTL <= 0 {
 		return errors.New("ratelimit idle TTL must be positive")
@@ -134,108 +165,105 @@ func (r *Registry) now() time.Time {
 }
 
 // Admit checks that one token is available in both the virtual-key and the
-// project scope for this request and consumes it when it is. Fixed lock order:
-// key entry first, then project entry, never the reverse, so composite
-// admissions cannot deadlock. A rejected admission cancels every reservation,
-// so neither scope loses a token.
+// project scope for this request and consumes it when it is. The registry
+// write lock is held across resolution, reservation and commit-or-cancel, so
+// the two participating entries stay current for the whole operation and a
+// rejected admission cancels every reservation (no token is lost in either
+// scope).
 func (r *Registry) Admit(keyID, projectID string) Decision {
 	now := r.now()
-	keyEntry := r.getOrCreate(ScopeVirtualKey, keyID, now, r.cfg.KeyRPM)
-	projectEntry := r.getOrCreate(ScopeProject, projectID, now, r.cfg.ProjectRPM)
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	locked := make([]*entry, 0, 2)
-	if keyEntry != nil {
-		keyEntry.mu.Lock()
-		locked = append(locked, keyEntry)
+	type limb struct {
+		entry *entry
+		scope Scope
 	}
-	if projectEntry != nil {
-		projectEntry.mu.Lock()
-		locked = append(locked, projectEntry)
+	limbs := make([]limb, 0, 2)
+	if r.cfg.KeyRPM > 0 {
+		key := scopeKey(ScopeVirtualKey, keyID)
+		limbs = append(limbs, limb{entry: r.getOrCreateLocked(key, now, r.cfg.KeyRPM, nil), scope: ScopeVirtualKey})
 	}
-	defer func() {
-		for index := len(locked) - 1; index >= 0; index-- {
-			locked[index].mu.Unlock()
+	if r.cfg.ProjectRPM > 0 {
+		// The project resolution must never evict the key limb resolved above:
+		// both limbs of this admission must stay current for its whole
+		// decision.
+		protected := map[string]struct{}{}
+		if r.cfg.KeyRPM > 0 {
+			protected[scopeKey(ScopeVirtualKey, keyID)] = struct{}{}
 		}
-	}()
+		key := scopeKey(ScopeProject, projectID)
+		limbs = append(limbs, limb{entry: r.getOrCreateLocked(key, now, r.cfg.ProjectRPM, protected), scope: ScopeProject})
+	}
 
-	if len(locked) == 0 {
+	if len(limbs) == 0 {
 		return Decision{Allowed: true}
 	}
-	for _, current := range locked {
-		current.lastSeen = now
-	}
 
-	reservations := make([]*rate.Reservation, 0, len(locked))
-	var maxDelay time.Duration
-	for _, current := range locked {
-		reservation := current.lim.ReserveN(now, 1)
+	reservations := make([]*rate.Reservation, 0, len(limbs))
+	var (
+		maxDelay      time.Duration
+		blockingScope Scope
+	)
+	for _, current := range limbs {
+		reservation := current.entry.lim.ReserveN(now, 1)
 		reservations = append(reservations, reservation)
 		// DelayFrom(now) is used instead of Delay() so the decision is made
 		// against the single clock snapshot taken for this admission.
 		if delay := reservation.DelayFrom(now); delay > maxDelay {
 			maxDelay = delay
+			blockingScope = current.scope
 		}
 	}
 	if maxDelay > 0 {
 		for _, reservation := range reservations {
 			reservation.CancelAt(now)
 		}
-		return Decision{Allowed: false, RetryAfter: maxDelay}
+		return Decision{Allowed: false, RetryAfter: maxDelay, BlockingScope: blockingScope}
 	}
 	return Decision{Allowed: true}
 }
 
-// getOrCreate returns the entry for a scope/id, creating it (with a full
-// bucket) when it does not exist. A disabled scope returns nil. When the entry
-// cap is reached the least-recently-used entry is evicted first so the map
-// stays bounded.
-func (r *Registry) getOrCreate(scope Scope, id string, now time.Time, rpm float64) *entry {
-	if rpm <= 0 {
-		return nil
-	}
-	key := scopeKey(scope, id)
-	r.mu.RLock()
-	current := r.entries[key]
-	r.mu.RUnlock()
-	if current != nil {
-		return current
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// getOrCreateLocked returns the entry for a scope/id, creating it (with a full
+// bucket) when it does not exist. It must be called with r.mu held for
+// writing. Creating an entry when the cap is reached evicts the
+// least-recently-used entry first, excluding the protected keys (limbs of the
+// in-flight admission that must stay current), so the map stays bounded.
+func (r *Registry) getOrCreateLocked(key string, now time.Time, rpm float64, protected map[string]struct{}) *entry {
 	if current := r.entries[key]; current != nil {
+		current.lastSeen = now
 		return current
 	}
 	if len(r.entries) >= r.cfg.EntryCap {
-		r.evictLongestIdleLocked(now)
+		r.evictLongestIdleLocked(protected)
 	}
 	created := &entry{lim: newLimiter(rpm), lastSeen: now}
 	r.entries[key] = created
 	return created
 }
 
-// evictLongestIdleLocked removes the single least-recently-used entry. It must
-// be called with r.mu held for writing. The victim's mutex is taken so an
-// in-flight admission on that entry finishes before it is discarded.
-func (r *Registry) evictLongestIdleLocked(now time.Time) {
+// evictLongestIdleLocked removes the single least-recently-used entry that is
+// not protected. It must be called with r.mu held for writing. The protected
+// set contains the scope keys resolved earlier in the same composite
+// admission; evicting one of those mid-admission would detach a limb the
+// admission is about to charge.
+func (r *Registry) evictLongestIdleLocked(protected map[string]struct{}) {
 	var (
 		victimKey string
 		victim    *entry
 		oldest    time.Time
 	)
 	for candidateKey, candidate := range r.entries {
-		candidate.mu.Lock()
-		idleSince := candidate.lastSeen
-		candidate.mu.Unlock()
-		if victim == nil || idleSince.Before(oldest) {
-			victimKey, victim, oldest = candidateKey, candidate, idleSince
+		if _, skip := protected[candidateKey]; skip {
+			continue
+		}
+		if victim == nil || candidate.lastSeen.Before(oldest) {
+			victimKey, victim, oldest = candidateKey, candidate, candidate.lastSeen
 		}
 	}
-	if victim == nil {
-		return
+	if victim != nil {
+		delete(r.entries, victimKey)
 	}
-	victim.mu.Lock()
-	delete(r.entries, victimKey)
-	victim.mu.Unlock()
 }
 
 func (r *Registry) runJanitor() {
@@ -252,37 +280,17 @@ func (r *Registry) runJanitor() {
 	}
 }
 
-// sweep removes entries idle for longer than IdleTTL. It snapshots candidates
-// under a read lock and re-checks each one under its entry mutex before
-// deleting, so an entry refreshed between the snapshot and the delete survives.
+// sweep removes entries idle for longer than IdleTTL. It runs under the
+// registry write lock so it can never detach an entry while an admission is
+// resolving or charging it.
 func (r *Registry) sweep(now time.Time) {
 	idleBefore := now.Add(-r.cfg.IdleTTL)
-	candidates := make([]string, 0)
-	r.mu.RLock()
-	for candidateKey, candidate := range r.entries {
-		candidate.mu.Lock()
-		idle := candidate.lastSeen.Before(idleBefore)
-		candidate.mu.Unlock()
-		if idle {
-			candidates = append(candidates, candidateKey)
-		}
-	}
-	r.mu.RUnlock()
-	if len(candidates) == 0 {
-		return
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, candidateKey := range candidates {
-		candidate, ok := r.entries[candidateKey]
-		if !ok {
-			continue
-		}
-		candidate.mu.Lock()
+	for key, candidate := range r.entries {
 		if candidate.lastSeen.Before(idleBefore) {
-			delete(r.entries, candidateKey)
+			delete(r.entries, key)
 		}
-		candidate.mu.Unlock()
 	}
 }
 
