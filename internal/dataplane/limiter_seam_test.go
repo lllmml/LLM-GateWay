@@ -25,17 +25,17 @@ func (s *stubLimiter) Admit(ctx context.Context, keyID, projectID string) (ratel
 	return s.fn(ctx, keyID, projectID)
 }
 
-func newSeamService(t *testing.T, limiter ratelimit.Limiter) *Service {
+func newSeamService(t *testing.T, limiter ratelimit.Limiter, store Store, client provider.Client) *Service {
 	t.Helper()
 	cipher, err := security.NewCredentialCipher(bytes.Repeat([]byte{8}, 32))
 	if err != nil {
 		t.Fatalf("new cipher: %v", err)
 	}
 	registry := newTestProviderRegistry(t, map[provider.Name]provider.Client{
-		provider.OpenAI: &fakeProviderClient{},
+		provider.OpenAI: client,
 	})
 	service, err := NewService(Options{
-		Store:                     &fakeStore{},
+		Store:                     store,
 		VirtualKeyPepper:          bytes.Repeat([]byte{9}, 32),
 		CredentialCipher:          cipher,
 		UpstreamRequestTimeout:    time.Second,
@@ -62,10 +62,11 @@ func seamChat() provider.ChatRequest {
 // row or provider work.
 func TestServiceConsumesLimiterRejectionBeforeAnyRowOrProvider(t *testing.T) {
 	store := &fakeStore{}
+	providerClient := &fakeProviderClient{}
 	limiter := &stubLimiter{fn: func(context.Context, string, string) (ratelimit.Decision, error) {
 		return ratelimit.Decision{Allowed: false, RetryAfter: 2 * time.Second, BlockingScope: ratelimit.ScopeVirtualKey}, nil
 	}}
-	service := newSeamService(t, limiter)
+	service := newSeamService(t, limiter, store, providerClient)
 
 	_, _, err := service.CompleteChat(context.Background(), AuthContext{VirtualKeyID: "k1", ProjectID: "p1"}, "trace-1", seamChat())
 	if err == nil {
@@ -84,6 +85,9 @@ func TestServiceConsumesLimiterRejectionBeforeAnyRowOrProvider(t *testing.T) {
 	if store.createCalls != 0 {
 		t.Fatalf("durable row created after a limiter rejection (createCalls = %d)", store.createCalls)
 	}
+	if providerClient.calls != 0 {
+		t.Fatalf("provider called after a limiter rejection (calls = %d)", providerClient.calls)
+	}
 }
 
 // TestServicePropagatesLimiterCancellation proves cancellation surfaced by the
@@ -91,13 +95,14 @@ func TestServiceConsumesLimiterRejectionBeforeAnyRowOrProvider(t *testing.T) {
 // is never converted into an admission rejection.
 func TestServicePropagatesLimiterCancellation(t *testing.T) {
 	store := &fakeStore{}
+	providerClient := &fakeProviderClient{}
 	limiter := &stubLimiter{fn: func(ctx context.Context, _, _ string) (ratelimit.Decision, error) {
 		if err := ctx.Err(); err != nil {
 			return ratelimit.Decision{}, err
 		}
 		return ratelimit.Decision{Allowed: true}, nil
 	}}
-	service := newSeamService(t, limiter)
+	service := newSeamService(t, limiter, store, providerClient)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -105,11 +110,18 @@ func TestServicePropagatesLimiterCancellation(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled request error = %v, want context.Canceled", err)
 	}
+	var gatewayErr *GatewayError
+	if errors.As(err, &gatewayErr) {
+		t.Fatalf("cancellation was converted into a GatewayError %+v", gatewayErr)
+	}
 	if limiter.calls != 1 {
 		t.Fatalf("limiter consulted %d times, want 1", limiter.calls)
 	}
 	if store.createCalls != 0 {
 		t.Fatalf("durable row created after cancellation (createCalls = %d)", store.createCalls)
+	}
+	if providerClient.calls != 0 {
+		t.Fatalf("provider called after cancellation (calls = %d)", providerClient.calls)
 	}
 }
 
@@ -117,17 +129,29 @@ func TestServicePropagatesLimiterCancellation(t *testing.T) {
 // request continue into the normal lifecycle (here: missing credential is
 // reported by the store boundary, not by the limiter).
 func TestServiceAllowsThroughLimiter(t *testing.T) {
+	store := &fakeStore{}
+	providerClient := &fakeProviderClient{}
 	limiter := &stubLimiter{fn: func(context.Context, string, string) (ratelimit.Decision, error) {
 		return ratelimit.Decision{Allowed: true}, nil
 	}}
-	service := newSeamService(t, limiter)
+	service := newSeamService(t, limiter, store, providerClient)
 
 	_, _, err := service.CompleteChat(context.Background(), AuthContext{VirtualKeyID: "k-missing", ProjectID: "p-missing"}, "trace-3", seamChat())
 	if limiter.calls != 1 {
 		t.Fatalf("limiter consulted %d times, want 1", limiter.calls)
 	}
+	// The request passed the limiter seam (allowed) and reached the next
+	// lifecycle boundary (credential resolution), which fails here because the
+	// injected store has no credential. The provider must not have been called
+	// and no durable row may exist yet.
 	var gatewayErr *GatewayError
 	if !errors.As(err, &gatewayErr) || gatewayErr.Category != provider.ProviderNotConfigured {
 		t.Fatalf("error after allow = %v, want ProviderNotConfigured (flow proceeded past admission)", err)
+	}
+	if providerClient.calls != 0 {
+		t.Fatalf("provider called before credential resolution (calls = %d)", providerClient.calls)
+	}
+	if store.createCalls != 0 {
+		t.Fatalf("durable row created before credential resolution (createCalls = %d)", store.createCalls)
 	}
 }
