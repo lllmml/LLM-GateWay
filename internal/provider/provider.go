@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 type Name string
@@ -161,8 +162,14 @@ type Error struct {
 	Category          ErrorCategory
 	StatusCode        int
 	UpstreamRequestID string
-	Message           string
-	Err               error
+	// RetryAfter is the provider-supplied wait hint from a Retry-After header
+	// (Week 8). It is a pointer so presence is preserved: nil means the
+	// provider gave no usable hint, while a present value of 0 means "retry
+	// immediately". The adapter parses the wire header; the executor decides
+	// whether to wait and retry.
+	RetryAfter *time.Duration
+	Message    string
+	Err        error
 }
 
 func (e *Error) Error() string {

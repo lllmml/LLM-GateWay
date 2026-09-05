@@ -18,6 +18,7 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/anthropic"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/deepseek"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/openai"
+	"github.com/lllmml/production-go-llm-gateway/internal/ratelimit"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
 	"github.com/lllmml/production-go-llm-gateway/internal/store/postgres"
 	"github.com/lllmml/production-go-llm-gateway/internal/telemetry"
@@ -83,8 +84,17 @@ func run() error {
 	openAITransport := openai.NewTransport()
 	defer openAITransport.CloseIdleConnections()
 	// One long-lived transport is shared by every provider adapter; no
-	// transport or client is ever created per request.
-	providerHTTPClient := &http.Client{Transport: openAITransport}
+	// transport or client is ever created per request. Automatic redirect
+	// following is disabled (same policy as every adapter default) so a
+	// provider POST is never transparently replayed to a redirect target and a
+	// redirect-chain dial/DNS failure can never masquerade as a safe
+	// pre-provider transport error eligible for retry.
+	providerHTTPClient := &http.Client{
+		Transport: openAITransport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	providerRegistry, err := provider.NewRegistry(map[provider.Name]provider.Client{
 		provider.OpenAI:    openai.New(providerHTTPClient),
 		provider.DeepSeek:  deepseek.New(providerHTTPClient),
@@ -94,6 +104,24 @@ func run() error {
 		database.Close()
 		return fmt.Errorf("configure provider registry: %w", err)
 	}
+	// Week 8 in-memory rate limiting. The registry owns a janitor goroutine,
+	// so it is created only when at least one scope is enabled and is closed
+	// when the process exits.
+	var rateLimiter *ratelimit.Registry
+	if cfg.RateLimitKeyRequestsPerMinute > 0 || cfg.RateLimitProjectRequestsPerMinute > 0 {
+		rateLimiter, err = ratelimit.NewRegistry(ratelimit.Config{
+			KeyRPM:        float64(cfg.RateLimitKeyRequestsPerMinute),
+			ProjectRPM:    float64(cfg.RateLimitProjectRequestsPerMinute),
+			EntryCap:      cfg.RateLimiterEntryCap,
+			IdleTTL:       cfg.RateLimiterIdleTTL,
+			SweepInterval: cfg.RateLimiterSweepInterval,
+		})
+		if err != nil {
+			database.Close()
+			return fmt.Errorf("configure rate limiter: %w", err)
+		}
+		defer rateLimiter.Close()
+	}
 	dataPlaneService, err := dataplane.NewService(dataplane.Options{
 		Store:                     database,
 		VirtualKeyPepper:          cfg.VirtualKeyPepper,
@@ -102,6 +130,11 @@ func run() error {
 		UpstreamStreamMaxDuration: cfg.UpstreamStreamMaxDuration,
 		ProviderRegistry:          providerRegistry,
 		Logger:                    logger,
+		RateLimiter:               rateLimiter,
+		MaxConcurrentRequests:     cfg.MaxConcurrentRequests,
+		MaxConcurrentStreams:      cfg.MaxConcurrentStreams,
+		RetryMaxRetries:           cfg.RetryMaxRetries,
+		RetryBackoffMax:           cfg.RetryBackoffMax,
 	})
 	if err != nil {
 		database.Close()

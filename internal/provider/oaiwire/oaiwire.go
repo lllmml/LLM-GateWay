@@ -54,7 +54,19 @@ func NewTransport() *http.Transport {
 }
 
 func NewHTTPClient() *http.Client {
-	return &http.Client{Transport: NewTransport()}
+	return &http.Client{Transport: NewTransport(), CheckRedirect: noRedirects}
+}
+
+// noRedirects disables automatic redirect following (RFC 9110 semantics) for
+// the OpenAI-compatible shared client. Provider chat POSTs must never be
+// transparently re-sent to a redirect target: a redirect that fails to dial
+// could otherwise look like a pre-request transport failure, while the retry
+// policy treats dial/DNS failures as provably pre-provider only because this
+// policy guarantees the provider request itself was never replayed elsewhere.
+// A 3xx is instead returned to the adapter and classified with its real
+// status, which is not in the retry whitelist.
+func noRedirects(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 // Endpoint validates that baseURL is an http(s) origin without credentials,

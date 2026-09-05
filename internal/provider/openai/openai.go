@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/oaiwire"
@@ -237,6 +238,7 @@ func classifyResponseError(response *http.Response, upstreamRequestID string) er
 		Category:          openAIErrorCategory(response.StatusCode),
 		StatusCode:        response.StatusCode,
 		UpstreamRequestID: upstreamRequestID,
+		RetryAfter:        provider.ParseRetryAfter(response.Header.Get("Retry-After"), time.Now()),
 		Message:           message,
 	}
 }

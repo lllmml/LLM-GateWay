@@ -38,6 +38,30 @@ func TestLoadUsesDefaults(t *testing.T) {
 	if cfg.UpstreamStreamMaxDuration != defaultUpstreamStreamMaxDuration {
 		t.Fatalf("UpstreamStreamMaxDuration = %v, want %v", cfg.UpstreamStreamMaxDuration, defaultUpstreamStreamMaxDuration)
 	}
+	if cfg.RateLimitKeyRequestsPerMinute != 0 {
+		t.Fatalf("RateLimitKeyRequestsPerMinute = %d, want 0 (disabled)", cfg.RateLimitKeyRequestsPerMinute)
+	}
+	if cfg.RateLimitProjectRequestsPerMinute != 0 {
+		t.Fatalf("RateLimitProjectRequestsPerMinute = %d, want 0 (disabled)", cfg.RateLimitProjectRequestsPerMinute)
+	}
+	if cfg.RateLimiterEntryCap != defaultRateLimiterEntryCap {
+		t.Fatalf("RateLimiterEntryCap = %d, want %d", cfg.RateLimiterEntryCap, defaultRateLimiterEntryCap)
+	}
+	if cfg.RateLimiterIdleTTL != defaultRateLimiterIdleTTL {
+		t.Fatalf("RateLimiterIdleTTL = %v, want %v", cfg.RateLimiterIdleTTL, defaultRateLimiterIdleTTL)
+	}
+	if cfg.MaxConcurrentRequests != 0 {
+		t.Fatalf("MaxConcurrentRequests = %d, want 0 (disabled)", cfg.MaxConcurrentRequests)
+	}
+	if cfg.MaxConcurrentStreams != 0 {
+		t.Fatalf("MaxConcurrentStreams = %d, want 0 (disabled)", cfg.MaxConcurrentStreams)
+	}
+	if cfg.RetryMaxRetries != defaultRetryMaxRetries {
+		t.Fatalf("RetryMaxRetries = %d, want %d", cfg.RetryMaxRetries, defaultRetryMaxRetries)
+	}
+	if cfg.RetryBackoffMax != defaultRetryBackoffMax {
+		t.Fatalf("RetryBackoffMax = %v, want %v", cfg.RetryBackoffMax, defaultRetryBackoffMax)
+	}
 	if len(cfg.CredentialMasterKey) != 32 {
 		t.Fatalf("CredentialMasterKey length = %d, want 32", len(cfg.CredentialMasterKey))
 	}
@@ -105,6 +129,15 @@ func TestLoadParsesOverrides(t *testing.T) {
 	values["SHUTDOWN_TIMEOUT"] = "11s"
 	values["UPSTREAM_REQUEST_TIMEOUT"] = "13s"
 	values["UPSTREAM_STREAM_MAX_DURATION"] = "17m"
+	values["RATE_LIMIT_KEY_REQUESTS_PER_MINUTE"] = "60"
+	values["RATE_LIMIT_PROJECT_REQUESTS_PER_MINUTE"] = "600"
+	values["RATE_LIMITER_ENTRY_CAP"] = "1234"
+	values["RATE_LIMITER_IDLE_TTL"] = "9m"
+	values["RATE_LIMITER_SWEEP_INTERVAL"] = "45s"
+	values["DATA_PLANE_MAX_CONCURRENT_REQUESTS"] = "8"
+	values["DATA_PLANE_MAX_CONCURRENT_STREAMS"] = "3"
+	values["RETRY_MAX_RETRIES"] = "2"
+	values["RETRY_BACKOFF_MAX"] = "250ms"
 
 	cfg, err := load(mapLookup(values))
 	if err != nil {
@@ -128,6 +161,33 @@ func TestLoadParsesOverrides(t *testing.T) {
 	}
 	if cfg.UpstreamStreamMaxDuration != 17*time.Minute {
 		t.Fatalf("UpstreamStreamMaxDuration = %v, want 17m", cfg.UpstreamStreamMaxDuration)
+	}
+	if cfg.RateLimitKeyRequestsPerMinute != 60 {
+		t.Fatalf("RateLimitKeyRequestsPerMinute = %d, want 60", cfg.RateLimitKeyRequestsPerMinute)
+	}
+	if cfg.RateLimitProjectRequestsPerMinute != 600 {
+		t.Fatalf("RateLimitProjectRequestsPerMinute = %d, want 600", cfg.RateLimitProjectRequestsPerMinute)
+	}
+	if cfg.RateLimiterEntryCap != 1234 {
+		t.Fatalf("RateLimiterEntryCap = %d, want 1234", cfg.RateLimiterEntryCap)
+	}
+	if cfg.RateLimiterIdleTTL != 9*time.Minute {
+		t.Fatalf("RateLimiterIdleTTL = %v, want 9m", cfg.RateLimiterIdleTTL)
+	}
+	if cfg.RateLimiterSweepInterval != 45*time.Second {
+		t.Fatalf("RateLimiterSweepInterval = %v, want 45s", cfg.RateLimiterSweepInterval)
+	}
+	if cfg.MaxConcurrentRequests != 8 {
+		t.Fatalf("MaxConcurrentRequests = %d, want 8", cfg.MaxConcurrentRequests)
+	}
+	if cfg.MaxConcurrentStreams != 3 {
+		t.Fatalf("MaxConcurrentStreams = %d, want 3", cfg.MaxConcurrentStreams)
+	}
+	if cfg.RetryMaxRetries != 2 {
+		t.Fatalf("RetryMaxRetries = %d, want 2", cfg.RetryMaxRetries)
+	}
+	if cfg.RetryBackoffMax != 250*time.Millisecond {
+		t.Fatalf("RetryBackoffMax = %v, want 250ms", cfg.RetryBackoffMax)
 	}
 }
 
@@ -257,6 +317,39 @@ func TestLoadRejectsReusedSecurityKeyMaterial(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), sharedKey) {
 				t.Fatalf("load error leaked key material: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidReliabilityOverrides(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+		want  string
+	}{
+		{name: "key rpm negative", key: "RATE_LIMIT_KEY_REQUESTS_PER_MINUTE", value: "-1", want: "must be a non-negative integer"},
+		{name: "project rpm negative", key: "RATE_LIMIT_PROJECT_REQUESTS_PER_MINUTE", value: "-5", want: "must be a non-negative integer"},
+		{name: "entry cap zero", key: "RATE_LIMITER_ENTRY_CAP", value: "0", want: "must be a positive integer"},
+		{name: "entry cap not an integer", key: "RATE_LIMITER_ENTRY_CAP", value: "many", want: "must be a positive integer"},
+		{name: "idle ttl zero", key: "RATE_LIMITER_IDLE_TTL", value: "0s", want: "must be positive"},
+		{name: "sweep interval zero", key: "RATE_LIMITER_SWEEP_INTERVAL", value: "0s", want: "must be positive"},
+		{name: "concurrent requests negative", key: "DATA_PLANE_MAX_CONCURRENT_REQUESTS", value: "-2", want: "must be a non-negative integer"},
+		{name: "concurrent streams negative", key: "DATA_PLANE_MAX_CONCURRENT_STREAMS", value: "-1", want: "must be a non-negative integer"},
+		{name: "retry max retries above bound", key: "RETRY_MAX_RETRIES", value: "6", want: "RETRY_MAX_RETRIES must be between 0 and 5"},
+		{name: "retry max retries negative", key: "RETRY_MAX_RETRIES", value: "-1", want: "RETRY_MAX_RETRIES must be between 0 and 5"},
+		{name: "retry backoff zero", key: "RETRY_BACKOFF_MAX", value: "0s", want: "must be positive"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			values := requiredTestValues()
+			values[test.key] = test.value
+
+			_, err := load(mapLookup(values))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("load error = %v, want error containing %q", err, test.want)
 			}
 		})
 	}

@@ -106,7 +106,15 @@ func New(httpClient *http.Client) *Client {
 // transport and injects the resulting client, so the tuning below must stay in
 // lockstep with oaiwire.NewTransport (the Week 5 source of truth).
 func NewHTTPClient() *http.Client {
-	return &http.Client{Transport: NewTransport()}
+	return &http.Client{Transport: NewTransport(), CheckRedirect: noRedirects}
+}
+
+// noRedirects disables automatic redirect following for the adapter client.
+// See oaiwire.NewHTTPClient for the full rationale; main.go applies the same
+// policy to its single shared transport-backed client so production and
+// adapter defaults never disagree.
+func noRedirects(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 func NewTransport() *http.Transport {
@@ -352,6 +360,7 @@ func classifyResponseError(response *http.Response, upstreamRequestID string) er
 		Category:          anthropicErrorCategory(response.StatusCode),
 		StatusCode:        response.StatusCode,
 		UpstreamRequestID: upstreamRequestID,
+		RetryAfter:        provider.ParseRetryAfter(response.Header.Get("Retry-After"), time.Now()),
 		Message:           message,
 	}
 }
