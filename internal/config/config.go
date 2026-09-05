@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,6 +23,25 @@ const (
 	defaultShutdownTimeout           = 10 * time.Second
 	defaultUpstreamRequestTimeout    = time.Minute
 	defaultUpstreamStreamMaxDuration = 10 * time.Minute
+
+	// Rate limiting and reliability defaults (Week 8). Rate limits and
+	// concurrency caps default to 0 = disabled and are enabled explicitly
+	// through .env.example; retries default to a single bounded retry and can
+	// be disabled by setting RETRY_MAX_RETRIES=0.
+	defaultRateLimitKeyRequestsPerMinute     = 0
+	defaultRateLimitProjectRequestsPerMinute = 0
+	defaultRateLimiterEntryCap               = 10000
+	defaultRateLimiterIdleTTL                = 10 * time.Minute
+	defaultRateLimiterSweepInterval          = time.Minute
+	defaultMaxConcurrentRequests             = 0
+	defaultMaxConcurrentStreams              = 0
+	defaultRetryMaxRetries                   = 1
+	defaultRetryBackoffMax                   = 2 * time.Second
+
+	// maxRetryMaxRetries bounds RETRY_MAX_RETRIES so a misconfiguration can
+	// never produce a large replay of paid upstream attempts (Tech Design
+	// §14.4: very small bounded attempt count).
+	maxRetryMaxRetries = 5
 )
 
 type Config struct {
@@ -42,6 +62,18 @@ type Config struct {
 	ShutdownTimeout           time.Duration
 	UpstreamRequestTimeout    time.Duration
 	UpstreamStreamMaxDuration time.Duration
+
+	// Week 8 Reliability Baseline: in-memory rate limiting (0 = disabled),
+	// in-process concurrency caps (0 = disabled), and bounded retry policy.
+	RateLimitKeyRequestsPerMinute     int
+	RateLimitProjectRequestsPerMinute int
+	RateLimiterEntryCap               int
+	RateLimiterIdleTTL                time.Duration
+	RateLimiterSweepInterval          time.Duration
+	MaxConcurrentRequests             int
+	MaxConcurrentStreams              int
+	RetryMaxRetries                   int
+	RetryBackoffMax                   time.Duration
 }
 
 func Load() (Config, error) {
@@ -124,6 +156,43 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		return Config{}, err
 	}
 
+	rateLimitKeyRPM, err := nonNegativeInt(lookup, "RATE_LIMIT_KEY_REQUESTS_PER_MINUTE", defaultRateLimitKeyRequestsPerMinute)
+	if err != nil {
+		return Config{}, err
+	}
+	rateLimitProjectRPM, err := nonNegativeInt(lookup, "RATE_LIMIT_PROJECT_REQUESTS_PER_MINUTE", defaultRateLimitProjectRequestsPerMinute)
+	if err != nil {
+		return Config{}, err
+	}
+	rateLimiterEntryCap, err := positiveInt(lookup, "RATE_LIMITER_ENTRY_CAP", defaultRateLimiterEntryCap)
+	if err != nil {
+		return Config{}, err
+	}
+	rateLimiterIdleTTL, err := positiveDuration(lookup, "RATE_LIMITER_IDLE_TTL", defaultRateLimiterIdleTTL)
+	if err != nil {
+		return Config{}, err
+	}
+	rateLimiterSweepInterval, err := positiveDuration(lookup, "RATE_LIMITER_SWEEP_INTERVAL", defaultRateLimiterSweepInterval)
+	if err != nil {
+		return Config{}, err
+	}
+	maxConcurrentRequests, err := nonNegativeInt(lookup, "DATA_PLANE_MAX_CONCURRENT_REQUESTS", defaultMaxConcurrentRequests)
+	if err != nil {
+		return Config{}, err
+	}
+	maxConcurrentStreams, err := nonNegativeInt(lookup, "DATA_PLANE_MAX_CONCURRENT_STREAMS", defaultMaxConcurrentStreams)
+	if err != nil {
+		return Config{}, err
+	}
+	retryMaxRetries, err := retryMaxRetriesValue(lookup)
+	if err != nil {
+		return Config{}, err
+	}
+	retryBackoffMax, err := positiveDuration(lookup, "RETRY_BACKOFF_MAX", defaultRetryBackoffMax)
+	if err != nil {
+		return Config{}, err
+	}
+
 	return Config{
 		DataPlaneAddr:             dataPlaneAddr,
 		ControlPlaneAddr:          controlPlaneAddr,
@@ -142,6 +211,16 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		ShutdownTimeout:           shutdownTimeout,
 		UpstreamRequestTimeout:    upstreamRequestTimeout,
 		UpstreamStreamMaxDuration: upstreamStreamMaxDuration,
+
+		RateLimitKeyRequestsPerMinute:     rateLimitKeyRPM,
+		RateLimitProjectRequestsPerMinute: rateLimitProjectRPM,
+		RateLimiterEntryCap:               rateLimiterEntryCap,
+		RateLimiterIdleTTL:                rateLimiterIdleTTL,
+		RateLimiterSweepInterval:          rateLimiterSweepInterval,
+		MaxConcurrentRequests:             maxConcurrentRequests,
+		MaxConcurrentStreams:              maxConcurrentStreams,
+		RetryMaxRetries:                   retryMaxRetries,
+		RetryBackoffMax:                   retryBackoffMax,
 	}, nil
 }
 
@@ -211,6 +290,42 @@ func required(lookup func(string) (string, bool), key string) (string, error) {
 		return "", fmt.Errorf("%s is required", key)
 	}
 	return strings.TrimSpace(value), nil
+}
+
+func nonNegativeInt(lookup func(string) (string, bool), key string, fallback int) (int, error) {
+	value, ok := lookup(key)
+	if !ok || strings.TrimSpace(value) == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer", key)
+	}
+	return parsed, nil
+}
+
+func positiveInt(lookup func(string) (string, bool), key string, fallback int) (int, error) {
+	value, ok := lookup(key)
+	if !ok || strings.TrimSpace(value) == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", key)
+	}
+	return parsed, nil
+}
+
+func retryMaxRetriesValue(lookup func(string) (string, bool)) (int, error) {
+	value, ok := lookup("RETRY_MAX_RETRIES")
+	if !ok || strings.TrimSpace(value) == "" {
+		return defaultRetryMaxRetries, nil
+	}
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || parsed < 0 || parsed > maxRetryMaxRetries {
+		return 0, fmt.Errorf("RETRY_MAX_RETRIES must be between 0 and %d", maxRetryMaxRetries)
+	}
+	return parsed, nil
 }
 
 func positiveDuration(lookup func(string) (string, bool), key string, fallback time.Duration) (time.Duration, error) {

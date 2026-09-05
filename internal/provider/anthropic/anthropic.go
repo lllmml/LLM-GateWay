@@ -352,6 +352,7 @@ func classifyResponseError(response *http.Response, upstreamRequestID string) er
 		Category:          anthropicErrorCategory(response.StatusCode),
 		StatusCode:        response.StatusCode,
 		UpstreamRequestID: upstreamRequestID,
+		RetryAfter:        provider.ParseRetryAfter(response.Header.Get("Retry-After"), time.Now()),
 		Message:           message,
 	}
 }
