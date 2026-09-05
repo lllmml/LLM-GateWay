@@ -59,8 +59,8 @@ func (e *DependencyError) Is(target error) bool { return target == ErrDependency
 // exact-integer safe range (MaxSafeRPM). IdleTTL (>= 1ms) drives the per-key
 // PEXPIRE refresh on every admission (allow and reject). CommandTimeout bounds
 // one Redis command context; the parent context cancellation is never confused
-// with a dependency timeout (ADR-018 D8 classification is applied here so the
-// Slice B2 wrapper can reuse it).
+// with a dependency timeout (ADR-018 D8 classification; the wrapper relies on
+// it).
 type Config struct {
 	KeyRPM         int
 	ProjectRPM     int
@@ -83,10 +83,12 @@ func (c Config) validate() error {
 	return nil
 }
 
-// Core is the Slice B1 Redis token-bucket admission core: one atomic Lua
-// composite admission over key + project scopes (ADR-018 D3/D4). It is NOT a
-// ratelimit.Limiter (see AdmitCore) and is NOT wired to the data plane; Slice
-// B2 adds the degraded/emergency wrapper that exposes the public Limiter.
+// Core is the Redis token-bucket admission core: one atomic Lua composite
+// admission over key + project scopes (ADR-018 D3/D4). It deliberately does
+// NOT implement ratelimit.Limiter (its method is AdmitCore, so dependency
+// errors can never escape through the public seam). The production
+// distributed.Limiter wrapper implements ratelimit.Limiter and owns degraded /
+// emergency / recovery handling.
 type Core struct {
 	client *redis.Client
 	cfg    Config

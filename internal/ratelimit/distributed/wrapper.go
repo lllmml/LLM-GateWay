@@ -55,8 +55,8 @@ func (s state) String() string {
 type ProbeFunc func(ctx context.Context) error
 
 // WrapperConfig extends the core configuration with the wrapper state-machine
-// parameters. These fields are NOT yet wired to user-facing configuration or
-// cmd/gateway (that is a later slice).
+// parameters. It is produced from user-facing configuration in cmd/gateway
+// (RATE_LIMITER_MODE=distributed and the REDIS_* / RATE_LIMITER_* fields).
 type WrapperConfig struct {
 	// Core limits and lifecycle (see Core).
 	KeyRPM         int
