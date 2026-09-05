@@ -335,33 +335,78 @@ func TestCapEvictionNeverDetachesCurrentAdmissionLimb(t *testing.T) {
 
 // TestNoSilentBurstResetWithoutEviction verifies quota persists under cap
 // pressure until a documented LRU eviction actually resets that scope's entry.
+// TestNoSilentBurstResetWithoutEviction verifies quota persists under cap
+// pressure until a documented LRU eviction actually resets that scope's entry.
+//
+// The fake clock is advanced between k1 and k2 creation so their lastSeen
+// timestamps never tie: the LRU victim assertion below requires k1 to be
+// STRICTLY older than k2. Under the current contract two entries with equal
+// lastSeen have no meaningful LRU ordering (Go map iteration order is
+// unspecified), so a victim assertion must never depend on tied timestamps.
 func TestNoSilentBurstResetWithoutEviction(t *testing.T) {
 	clock := newFakeClock(time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC))
 	cfg := testConfig()
 	cfg.KeyRPM = 2 // burst 2
 	cfg.ProjectRPM = 0
-	cfg.EntryCap = 2 // room for exactly two keys, so k1/k2 never churn
+	cfg.EntryCap = 2 // room for exactly two keys, so the first pair never churns
 	registry := testRegistry(t, cfg, clock)
 
-	// Deplete k1 and k2 fully.
-	for _, key := range []string{testKeyID, testOtherKey} {
-		if !registry.Admit(key, testProjID).Allowed || !registry.Admit(key, testProjID).Allowed {
-			t.Fatalf("expected two allowed admissions for %s", key)
-		}
-		if registry.Admit(key, testProjID).Allowed {
-			t.Fatalf("third admission for %s allowed, want denied", key)
+	// Create and fully deplete k1 at t0.
+	for _, attempt := range []int{1, 2} {
+		if !registry.Admit(testKeyID, testProjID).Allowed {
+			t.Fatalf("k1 admission %d denied, want allowed", attempt)
 		}
 	}
-
-	// Neither entry was evicted (no third key inserted), so the depleted
-	// buckets persist: no silent fresh burst.
+	if registry.Admit(testKeyID, testProjID).Allowed {
+		t.Fatal("k1 third admission allowed, want denied")
+	}
+	// A resident, depleted entry must not regain quota without an eviction.
+	// This check happens at t0: an admission also refreshes lastSeen, so doing
+	// it later would tie k1's timestamp with k2's and destroy the strict LRU
+	// ordering the eviction assertion below needs.
 	if registry.Admit(testKeyID, testProjID).Allowed {
 		t.Fatal("k1 regained a fresh burst without being evicted")
 	}
 
-	// Inserting a third key evicts the LRU (k1, oldest), which is the
-	// documented reset path: k1's next admission is against a fresh bucket.
+	// Advance the clock by one second, then create and fully deplete k2 at t1:
+	// k1 is now strictly older than k2, so the later LRU victim assertion is
+	// deterministic. k1 is NOT touched at t1 (any admission would refresh its
+	// lastSeen and re-tie the timestamps). The one-second stagger keeps k1's
+	// time-based refill below one token (KeyRPM 2 refills one token every 30s),
+	// so no refill can make k2's depletion assertions ambiguous.
+	clock.advance(time.Second)
+	for _, attempt := range []int{1, 2} {
+		if !registry.Admit(testOtherKey, testProjID).Allowed {
+			t.Fatalf("k2 admission %d denied, want allowed", attempt)
+		}
+	}
+	if registry.Admit(testOtherKey, testProjID).Allowed {
+		t.Fatal("k2 third admission allowed, want denied")
+	}
+	// k2 stays resident and depleted at t1 (no eviction has run yet).
+	if registry.Admit(testOtherKey, testProjID).Allowed {
+		t.Fatal("k2 regained a fresh burst without being evicted")
+	}
+	if !registry.has(ScopeVirtualKey, testKeyID) || !registry.has(ScopeVirtualKey, testOtherKey) {
+		t.Fatal("expected both k1 and k2 to still be resident")
+	}
+
+	// Inserting a third key forces an eviction. k1 is strictly older than k2
+	// (lastSeen t0 vs t1), so k1 is the deterministic LRU victim, which is the
+	// documented reset path: the evicted scope's next admission is against a
+	// fresh bucket.
 	registry.Admit(testThirdKey, "proj-3")
+	if registry.has(ScopeVirtualKey, testKeyID) {
+		t.Fatal("k1 should have been evicted as the strictly-oldest LRU entry")
+	}
+	if !registry.has(ScopeVirtualKey, testOtherKey) || !registry.has(ScopeVirtualKey, testThirdKey) {
+		t.Fatal("expected k2 and k3 to remain resident after the k1 eviction")
+	}
+
+	// The evicted k1 scope is recreated with a full bucket (documented reset).
+	// (Its readmission may evict whichever of k2/k3 is LRU at that instant;
+	// the test only asserts the documented fresh-burst grant, never a specific
+	// tied victim.)
 	if !registry.Admit(testKeyID, testProjID).Allowed {
 		t.Fatal("k1 was evicted, so the documented reset must grant a fresh burst")
 	}
