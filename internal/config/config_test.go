@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"encoding/base64"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -389,4 +390,85 @@ func bytesOf(value byte, size int) []byte {
 func withoutKey(values map[string]string, key string) map[string]string {
 	delete(values, key)
 	return values
+}
+
+func TestDistributedRateLimiterConfigDefaultsAreLocal(t *testing.T) {
+	base := map[string]string{}
+	for key, value := range map[string]string{
+		"DATA_PLANE_ADDR": ":8080", "CONTROL_PLANE_ADDR": ":8081", "OPS_ADDR": ":9090",
+		"DATABASE_URL": "postgres://x", "CREDENTIAL_MASTER_KEY": rawKey32("master"),
+		"PUBLIC_CONSOLE_URL": "http://127.0.0.1:5173", "GITHUB_CLIENT_ID": "id",
+		"GITHUB_CLIENT_SECRET": "secret", "SESSION_TOKEN_PEPPER": rawKey32("session"),
+		"VIRTUAL_KEY_PEPPER": rawKey32("vk"),
+	} {
+		base[key] = value
+	}
+	cfg, err := load(func(key string) (string, bool) { value, ok := base[key]; return value, ok })
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.RateLimiterMode != "local" {
+		t.Fatalf("RateLimiterMode = %q, want local", cfg.RateLimiterMode)
+	}
+	if cfg.RedisURL != "" || cfg.RedisCommandTimeout != defaultRedisCommandTimeout || cfg.RedisProbeInterval != defaultRedisProbeInterval ||
+		cfg.RedisProbeThreshold != defaultRedisProbeThreshold || cfg.RateLimiterReplicaFactor != defaultRateLimiterReplicaFactor {
+		t.Fatalf("distributed defaults not applied: %+v", cfg)
+	}
+}
+
+func rawKey32(prefix string) string {
+	return base64.StdEncoding.EncodeToString(bytes.Repeat([]byte(prefix), 32/len(prefix)+1)[:32])
+}
+
+func loadWithDistributed(t *testing.T, overrides map[string]string, keyRPM, projectRPM int) (Config, error) {
+	t.Helper()
+	base := map[string]string{
+		"DATA_PLANE_ADDR": ":8080", "CONTROL_PLANE_ADDR": ":8081", "OPS_ADDR": ":9090",
+		"DATABASE_URL": "postgres://x", "CREDENTIAL_MASTER_KEY": rawKey32("master"),
+		"PUBLIC_CONSOLE_URL": "http://127.0.0.1:5173", "GITHUB_CLIENT_ID": "id",
+		"GITHUB_CLIENT_SECRET": "secret", "SESSION_TOKEN_PEPPER": rawKey32("session"),
+		"VIRTUAL_KEY_PEPPER": rawKey32("vk"),
+		"RATE_LIMITER_MODE":  "distributed", "REDIS_URL": "redis://127.0.0.1:6379/0",
+		"RATE_LIMIT_KEY_REQUESTS_PER_MINUTE": fmt.Sprint(keyRPM), "RATE_LIMIT_PROJECT_REQUESTS_PER_MINUTE": fmt.Sprint(projectRPM),
+	}
+	for key, value := range overrides {
+		base[key] = value
+	}
+	return load(func(key string) (string, bool) { value, ok := base[key]; return value, ok })
+}
+
+func TestDistributedConfigParses(t *testing.T) {
+	cfg, err := loadWithDistributed(t, map[string]string{
+		"REDIS_COMMAND_TIMEOUT": "250ms", "REDIS_PROBE_INTERVAL": "2s",
+		"REDIS_PROBE_THRESHOLD": "5", "RATE_LIMITER_REPLICA_FACTOR": "3",
+	}, 20, 0)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.RedisCommandTimeout != 250*time.Millisecond || cfg.RedisProbeInterval != 2*time.Second ||
+		cfg.RedisProbeThreshold != 5 || cfg.RateLimiterReplicaFactor != 3 {
+		t.Fatalf("distributed values = %+v", cfg)
+	}
+}
+
+func TestDistributedConfigValidation(t *testing.T) {
+	cases := []struct {
+		name       string
+		overrides  map[string]string
+		keyRPM     int
+		projectRPM int
+	}{
+		{"missing redis url", map[string]string{"REDIS_URL": ""}, 20, 0},
+		{"no scope enabled", nil, 0, 0},
+		{"factor zero", map[string]string{"RATE_LIMITER_REPLICA_FACTOR": "0"}, 20, 0},
+		{"threshold zero", map[string]string{"REDIS_PROBE_THRESHOLD": "0"}, 20, 0},
+		{"command timeout zero", map[string]string{"REDIS_COMMAND_TIMEOUT": "0"}, 20, 0},
+		{"probe interval zero", map[string]string{"REDIS_PROBE_INTERVAL": "0"}, 20, 0},
+		{"bad mode", map[string]string{"RATE_LIMITER_MODE": "hybrid"}, 20, 0},
+	}
+	for _, tc := range cases {
+		if _, err := loadWithDistributed(t, tc.overrides, tc.keyRPM, tc.projectRPM); err == nil {
+			t.Fatalf("config %q accepted", tc.name)
+		}
+	}
 }

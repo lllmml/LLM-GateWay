@@ -136,9 +136,11 @@ type Options struct {
 	Logger                    *slog.Logger
 
 	// Week 8 Reliability Baseline. All admission controls default to disabled
-	// (nil / 0). RateLimit is the shared in-memory registry (owned by the
-	// caller, closed by the caller); when nil no rate limiting runs.
-	RateLimiter *ratelimit.Registry
+	// (nil / 0). RateLimiter is the admission limiter (local in-memory registry
+	// or, from Week 9 Slice B2 onward, the distributed wrapper); when nil no
+	// rate limiting runs. Dependency failures never escape a Limiter
+	// implementation (ADR-018 D1).
+	RateLimiter ratelimit.Limiter
 	// MaxConcurrentRequests bounds total in-flight chat operations (stream and
 	// non-stream); 0 disables it. MaxConcurrentStreams additionally bounds
 	// in-flight streams; stream requests must satisfy both caps.
@@ -162,7 +164,7 @@ type Service struct {
 	providers                 *provider.Registry
 	logger                    *slog.Logger
 
-	rateLimiter           *ratelimit.Registry
+	rateLimiter           ratelimit.Limiter
 	maxConcurrentRequests int
 	maxConcurrentStreams  int
 	requestSlots          chan struct{}
@@ -550,18 +552,23 @@ func classifyStreamOpenError(ctx context.Context, gatewayErr *GatewayError) *Gat
 	return NewError(provider.StreamInterrupted, "stream interrupted")
 }
 
-// admit applies the Week 8 admission controls in order: in-memory rate
-// limiting (per virtual key and per project), then the concurrency slots. A
-// rejected request returns a stable rate_limited gateway error (never a
-// provider call, never a durable gateway_requests row) and is visible through
-// a bounded structured slog event, because Week 8 rejections intentionally
-// create no durable record and Prometheus metrics land with the Week 10
-// observability milestone. The returned release function must be called
-// exactly once when the admitted operation finishes; it is safe under early
-// returns and panics when deferred.
-func (s *Service) admit(ctx context.Context, auth AuthContext, stream bool) (func(), *GatewayError) {
+// admit applies the Week 8 admission controls in order: rate limiting (per
+// virtual key and per project, local registry or an external Limiter), then
+// the concurrency slots. A rejected request returns a stable rate_limited
+// gateway error (never a provider call, never a durable gateway_requests row)
+// and is visible through a bounded structured slog event, because Week 8
+// rejections intentionally create no durable record and Prometheus metrics
+// land with the Week 10 observability milestone. A cancelled/deadline-exceeded
+// context propagates from the limiter as-is (no quota is consumed by a
+// cancelled request, ADR-018 D1). The returned release function must be
+// called exactly once when the admitted operation finishes; it is safe under
+// early returns and panics when deferred.
+func (s *Service) admit(ctx context.Context, auth AuthContext, stream bool) (func(), error) {
 	if s.rateLimiter != nil {
-		decision := s.rateLimiter.Admit(auth.VirtualKeyID, auth.ProjectID)
+		decision, err := s.rateLimiter.Admit(ctx, auth.VirtualKeyID, auth.ProjectID)
+		if err != nil {
+			return nil, err
+		}
 		if !decision.Allowed {
 			s.logAdmissionRejection(auth, "rate_limit", string(decision.BlockingScope), decision.RetryAfter)
 			retryAfter := decision.RetryAfter

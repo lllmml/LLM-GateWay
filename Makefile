@@ -4,6 +4,7 @@ GO ?= go
 NPM ?= npm
 COMPOSE ?= docker compose
 DATABASE_URL ?= postgres://gateway:gateway@localhost:5432/gateway?sslmode=disable
+REDIS_URL ?= redis://127.0.0.1:6379/0
 GOCACHE ?= $(CURDIR)/.cache/go-build
 GOMODCACHE ?= $(CURDIR)/.cache/go-mod
 TOOLS_BIN := $(CURDIR)/.tools/bin
@@ -14,6 +15,7 @@ SQLC_VERSION := v1.31.1
 WEB_DIR := web
 
 export DATABASE_URL
+export REDIS_URL
 export GOCACHE
 export GOMODCACHE
 
@@ -25,7 +27,7 @@ endif
 .PHONY: bootstrap web-install dev dev-backend dev-web test test-backend test-web test-dev-supervisor \
 	typecheck typecheck-backend typecheck-web format lint lint-backend lint-web \
 	build build-backend build-web integration race bench generate \
-	postgres-up postgres-down migrate-version migrate-up migrate-down-one
+	postgres-up postgres-down redis-up redis-stop migrate-version migrate-up migrate-down-one
 
 bootstrap: $(MIGRATE) $(SQLC) web-install
 	@command -v $(GO) >/dev/null
@@ -103,7 +105,7 @@ build-backend:
 build-web:
 	cd $(WEB_DIR) && $(NPM) run build
 
-integration: postgres-up
+integration: postgres-up redis-up
 	$(GO) test -tags=integration ./...
 
 race:
@@ -117,6 +119,12 @@ postgres-up:
 
 postgres-down:
 	$(COMPOSE) down
+
+redis-up:
+	$(COMPOSE) up -d --wait redis
+
+redis-stop:
+	$(COMPOSE) stop redis
 
 migrate-version:
 	$(MIGRATE) -database '$(DATABASE_URL)' -path db/migrations version

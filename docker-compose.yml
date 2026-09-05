@@ -17,5 +17,22 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql
 
+  # Week 9 Slice B local Redis, pinned to the exact image the distributed
+  # rate-limiter integration tests run against (ADR-018 D3: Redis TIME +
+  # writes inside the mutating Lua are verified on this version). Ephemeral
+  # (no persistence): Redis is never a source of truth in this project.
+  redis:
+    image: redis:7.4.11-alpine
+    # --enable-debug-command yes is required by the deterministic command-level
+    # context-interruption integration test (DEBUG SLEEP). Local/dev only.
+    command: ["redis-server", "--appendonly", "no", "--enable-debug-command", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 2s
+      retries: 20
+
 volumes:
   postgres-data:

@@ -26,6 +26,7 @@
 package ratelimit
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -175,9 +176,20 @@ func (r *Registry) now() time.Time {
 // carry a stale (earlier) timestamp into ReserveN/CancelAt after another
 // admission has already advanced the limiter, which would move its accounting
 // time backward and double-count refill.
-func (r *Registry) Admit(keyID, projectID string) Decision {
+//
+// ctx is checked before entering the critical section and again after the
+// lock is acquired, so a request that is cancelled while waiting for the lock
+// never consumes a token (ADR-018 D1/D8: cancellation must not consume quota).
+// The Week 8 token-bucket admission semantics are otherwise unchanged.
+func (r *Registry) Admit(ctx context.Context, keyID, projectID string) (Decision, error) {
+	if err := ctx.Err(); err != nil {
+		return Decision{}, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Decision{}, err
+	}
 
 	// now is the single snapshot for this admission's creation, lastSeen
 	// refresh, reservation, DelayFrom, and cancellation decisions.
@@ -205,7 +217,7 @@ func (r *Registry) Admit(keyID, projectID string) Decision {
 	}
 
 	if len(limbs) == 0 {
-		return Decision{Allowed: true}
+		return Decision{Allowed: true}, nil
 	}
 
 	reservations := make([]*rate.Reservation, 0, len(limbs))
@@ -227,9 +239,9 @@ func (r *Registry) Admit(keyID, projectID string) Decision {
 		for _, reservation := range reservations {
 			reservation.CancelAt(now)
 		}
-		return Decision{Allowed: false, RetryAfter: maxDelay, BlockingScope: blockingScope}
+		return Decision{Allowed: false, RetryAfter: maxDelay, BlockingScope: blockingScope}, nil
 	}
-	return Decision{Allowed: true}
+	return Decision{Allowed: true}, nil
 }
 
 // getOrCreateLocked returns the entry for a scope/id, creating it (with a full
