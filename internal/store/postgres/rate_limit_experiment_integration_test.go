@@ -193,7 +193,7 @@ func experimentRegistry(t *testing.T, limitRPM float64) *ratelimit.Registry {
 // PostgreSQL store, the shared mock provider (through the real OpenAI adapter),
 // the seed cipher/pepper, and the given per-replica limiter. Retries are
 // disabled so one allowed request is exactly one provider call.
-func experimentService(t *testing.T, store *Store, cipher *security.CredentialCipher, providerRegistry *provider.Registry, limiter *ratelimit.Registry) *dataplane.Service {
+func experimentService(t *testing.T, store *Store, cipher *security.CredentialCipher, providerRegistry *provider.Registry, limiter ratelimit.Limiter) *dataplane.Service {
 	t.Helper()
 	service, err := dataplane.NewService(dataplane.Options{
 		Store:                     store,

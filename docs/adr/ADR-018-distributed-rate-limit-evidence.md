@@ -559,6 +559,29 @@ Deterministic tests cover: probes blocked while old claims are in-flight,
 pre-claimed failure/success draining the last in-flight attempt before
 qualification, probe cancellation on Close, and the CommandTimeout probe bound.
 
+## Implementation notes (Slice B2b - production wiring + HTTP acceptance)
+
+- Opt-in configuration (default unchanged: local in-memory mode never needs
+  Redis): `RATE_LIMITER_MODE` ("local"/"distributed"), `REDIS_URL`,
+  `REDIS_COMMAND_TIMEOUT`, `REDIS_PROBE_INTERVAL`, `REDIS_PROBE_THRESHOLD`,
+  `RATE_LIMITER_REPLICA_FACTOR` (reuses `RATE_LIMIT_*_REQUESTS_PER_MINUTE`
+  and `RATE_LIMITER_IDLE_TTL`). Config validation rejects invalid distributed
+  combinations at startup (missing REDIS_URL, no enabled scope, factor < 1,
+  threshold < 1, timeouts <= 0, unknown mode).
+- One long-lived go-redis client per process with the pinned B1 posture
+  (MaxRetries -1, ContextTimeoutEnabled true, short dial/write/read
+  timeouts); shutdown order is distributed Limiter.Close() then
+  redis.Client.Close(). Both limiter modes enter the data plane through
+  `ratelimit.Limiter`.
+- HTTP-level acceptance against real PostgreSQL + pinned Redis + deterministic
+  mock provider: two replicas sharing Redis allow exactly 20 of 24 (4 x HTTP
+  429 rate_limited, 20 provider calls, 20 durable rows) - the Slice A
+  over-admission is gone. Redis outage degrades the replica behind the bounded
+  emergency limiter with no Redis error leaked to clients; recovery through
+  non-mutating probes + one real admission restores the exact distributed
+  quota. Wrapper emits bounded `rate_limiter_state_transition` slog events
+  (never per-request, never secrets).
+
 ## Migration / rollback
 
 No schema change. Rollback per commit slice: distributed mode is opt-in via

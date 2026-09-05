@@ -38,6 +38,14 @@ const (
 	defaultRetryMaxRetries                   = 1
 	defaultRetryBackoffMax                   = 2 * time.Second
 
+	// Week 9 distributed rate limiter (ADR-018). Distributed mode is opt-in;
+	// the default local in-memory mode is unchanged.
+	defaultRateLimiterMode          = "local"
+	defaultRedisCommandTimeout      = 500 * time.Millisecond
+	defaultRedisProbeInterval       = time.Second
+	defaultRedisProbeThreshold      = 3
+	defaultRateLimiterReplicaFactor = 2
+
 	// maxRetryMaxRetries bounds RETRY_MAX_RETRIES so a misconfiguration can
 	// never produce a large replay of paid upstream attempts (Tech Design
 	// §14.4: very small bounded attempt count).
@@ -74,6 +82,16 @@ type Config struct {
 	MaxConcurrentStreams              int
 	RetryMaxRetries                   int
 	RetryBackoffMax                   time.Duration
+
+	// Week 9 distributed rate limiter (ADR-018). RateLimiterMode is "local"
+	// (default, unchanged Week 8 behavior) or "distributed" (opt-in; requires
+	// REDIS_URL). The Redis fields reuse KeyRPM/ProjectRPM/IdleTTL above.
+	RateLimiterMode          string
+	RedisURL                 string
+	RedisCommandTimeout      time.Duration
+	RedisProbeInterval       time.Duration
+	RedisProbeThreshold      int
+	RateLimiterReplicaFactor int
 }
 
 func Load() (Config, error) {
@@ -193,6 +211,39 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		return Config{}, err
 	}
 
+	// Week 9 distributed rate limiting (opt-in). Reuses the Week 8 scope and
+	// lifecycle values above. The Redis configuration is validated only when
+	// distributed mode is enabled so local development never needs Redis.
+	rateLimiterMode := valueOrDefault(lookup, "RATE_LIMITER_MODE", defaultRateLimiterMode)
+	if rateLimiterMode != "local" && rateLimiterMode != "distributed" {
+		return Config{}, fmt.Errorf("RATE_LIMITER_MODE must be %q or %q, got %q", "local", "distributed", rateLimiterMode)
+	}
+	redisURL := valueOrDefault(lookup, "REDIS_URL", "")
+	redisCommandTimeout, err := positiveDuration(lookup, "REDIS_COMMAND_TIMEOUT", defaultRedisCommandTimeout)
+	if err != nil {
+		return Config{}, err
+	}
+	redisProbeInterval, err := positiveDuration(lookup, "REDIS_PROBE_INTERVAL", defaultRedisProbeInterval)
+	if err != nil {
+		return Config{}, err
+	}
+	redisProbeThreshold, err := positiveInt(lookup, "REDIS_PROBE_THRESHOLD", defaultRedisProbeThreshold)
+	if err != nil {
+		return Config{}, err
+	}
+	replicaFactor, err := positiveInt(lookup, "RATE_LIMITER_REPLICA_FACTOR", defaultRateLimiterReplicaFactor)
+	if err != nil {
+		return Config{}, err
+	}
+	if rateLimiterMode == "distributed" {
+		if redisURL == "" {
+			return Config{}, errors.New("REDIS_URL is required when RATE_LIMITER_MODE=distributed")
+		}
+		if rateLimitKeyRPM == 0 && rateLimitProjectRPM == 0 {
+			return Config{}, errors.New("at least one of RATE_LIMIT_KEY_REQUESTS_PER_MINUTE or RATE_LIMIT_PROJECT_REQUESTS_PER_MINUTE must be enabled when RATE_LIMITER_MODE=distributed")
+		}
+	}
+
 	return Config{
 		DataPlaneAddr:             dataPlaneAddr,
 		ControlPlaneAddr:          controlPlaneAddr,
@@ -221,6 +272,13 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		MaxConcurrentStreams:              maxConcurrentStreams,
 		RetryMaxRetries:                   retryMaxRetries,
 		RetryBackoffMax:                   retryBackoffMax,
+
+		RateLimiterMode:          rateLimiterMode,
+		RedisURL:                 redisURL,
+		RedisCommandTimeout:      redisCommandTimeout,
+		RedisProbeInterval:       redisProbeInterval,
+		RedisProbeThreshold:      redisProbeThreshold,
+		RateLimiterReplicaFactor: replicaFactor,
 	}, nil
 }
 

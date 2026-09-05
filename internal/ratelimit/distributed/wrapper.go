@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -78,6 +79,11 @@ type WrapperConfig struct {
 	// Probe is the injectable non-mutating health probe (tests). Nil means
 	// the production PING probe.
 	Probe ProbeFunc
+	// Logger receives bounded transition events (normal->degraded,
+	// degraded->recovering, recovering->normal, recovering->degraded). It
+	// never logs per-request admission outcomes and never includes keys,
+	// credentials, or Redis connection material.
+	Logger *slog.Logger
 }
 
 // admissionCore is the internal seam around the raw Redis admission core so the
@@ -328,7 +334,7 @@ func (l *Limiter) Admit(ctx context.Context, keyID, projectID string) (ratelimit
 		// Redis decision (never an emergency fallback after a valid rejection).
 		l.recoveryAttemptInFlight = false
 		l.probeSuccess = 0
-		l.state = stateNormal
+		l.setStateLocked(stateNormal)
 		l.mu.Unlock()
 		return decision, nil
 	}
@@ -340,15 +346,32 @@ func (l *Limiter) Admit(ctx context.Context, keyID, projectID string) (ratelimit
 	return decision, nil
 }
 
-// enterDegradedLocked transitions normal -> degraded exactly once; later calls
-// are no-ops. Must hold l.mu.
+// enterDegradedLocked transitions normal/recovering -> degraded exactly once;
+// later calls are no-ops. Must hold l.mu.
 func (l *Limiter) enterDegradedLocked() {
 	if l.state == stateDegraded {
 		return
 	}
-	l.state = stateDegraded
+	l.setStateLocked(stateDegraded)
 	l.probeSuccess = 0
 	l.lastProbe = time.Time{}
+}
+
+// setStateLocked assigns the next state and emits the bounded transition event
+// when it changed. Must hold l.mu.
+func (l *Limiter) setStateLocked(next state) {
+	if l.state == next {
+		return
+	}
+	from := l.state
+	l.state = next
+	if l.cfg.Logger != nil {
+		l.cfg.Logger.Info("limiter_state_transition",
+			slog.String("event", "rate_limiter_state_transition"),
+			slog.String("from", from.String()),
+			slog.String("to", next.String()),
+		)
+	}
 }
 
 // emergencyAdmit admits via the bounded local emergency Registry. Cancellation
@@ -411,6 +434,6 @@ func (l *Limiter) probeCycle(ctx context.Context) {
 	l.probeSuccess++
 	if l.probeSuccess >= l.cfg.ProbeThreshold {
 		l.probeSuccess = 0
-		l.state = stateRecovering
+		l.setStateLocked(stateRecovering)
 	}
 }
