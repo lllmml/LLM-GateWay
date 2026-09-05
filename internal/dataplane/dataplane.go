@@ -16,6 +16,7 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
 	"github.com/lllmml/production-go-llm-gateway/internal/ratelimit"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
+	"github.com/lllmml/production-go-llm-gateway/internal/telemetry"
 )
 
 var (
@@ -153,6 +154,11 @@ type Options struct {
 	// RetryBackoffMax caps the default exponential backoff window used when
 	// the provider sends no Retry-After hint.
 	RetryBackoffMax time.Duration
+
+	// Metrics is the app-owned Week 10 telemetry value (ADR-019 D2/D3). It is
+	// optional: when nil every metric call is a no-op, so existing tests and
+	// embedded uses run unchanged.
+	Metrics *telemetry.Metrics
 }
 
 type Service struct {
@@ -171,6 +177,7 @@ type Service struct {
 	streamSlots           chan struct{}
 	retryMaxRetries       int
 	retryBackoffMax       time.Duration
+	metrics               *telemetry.Metrics
 	jitter                func(int64) int64
 	now                   func() time.Time
 	// onRetryWait is an unexported test hook invoked immediately before the
@@ -229,6 +236,7 @@ func NewService(options Options) (*Service, error) {
 		maxConcurrentStreams:      options.MaxConcurrentStreams,
 		retryMaxRetries:           options.RetryMaxRetries,
 		retryBackoffMax:           retryBackoffMax,
+		metrics:                   options.Metrics,
 		jitter:                    rand.Int64N,
 		now:                       time.Now,
 	}
@@ -281,6 +289,11 @@ func (s *Service) completeChat(ctx context.Context, auth AuthContext, traceID st
 		return provider.Result{}, GatewayRequest{}, admissionErr
 	}
 	defer release()
+	// ADR-019 D4: the in-flight gauge is a separate release closure created
+	// only after admission succeeded; it never touches the admission seam and
+	// is released exactly once when the operation completes.
+	endInFlight := s.trackInFlight(modelRef.Provider, false)
+	defer endInFlight()
 	client, ok := s.providers.Lookup(modelRef.Provider)
 	if !ok {
 		return provider.Result{}, GatewayRequest{}, NewError(provider.ProviderNotConfigured, "provider is not configured")
@@ -403,6 +416,10 @@ func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID stri
 		return GatewayRequest{}, admissionErr
 	}
 	defer release()
+	// ADR-019 D4: same separate in-flight release as the non-stream path;
+	// streaming additionally increments gateway_active_streams{provider}.
+	endInFlight := s.trackInFlight(modelRef.Provider, true)
+	defer endInFlight()
 	credential, err := s.store.ResolveProviderCredential(ctx, auth.ProjectID, modelRef.Provider)
 	if errors.Is(err, ErrNotFound) {
 		return GatewayRequest{}, NewError(provider.ProviderNotConfigured, "provider is not configured")
@@ -563,6 +580,16 @@ func classifyStreamOpenError(ctx context.Context, gatewayErr *GatewayError) *Gat
 // cancelled request, ADR-018 D1). The returned release function must be
 // called exactly once when the admitted operation finishes; it is safe under
 // early returns and panics when deferred.
+// trackInFlight returns a no-op when no metrics are wired; otherwise it
+// delegates to telemetry.Metrics.TrackInFlight so the in-flight gauges stay
+// decoupled from the admit() seam (ADR-019 D4).
+func (s *Service) trackInFlight(providerName provider.Name, stream bool) func() {
+	if s.metrics == nil {
+		return func() {}
+	}
+	return s.metrics.TrackInFlight(string(providerName), stream)
+}
+
 func (s *Service) admit(ctx context.Context, auth AuthContext, stream bool) (func(), error) {
 	if s.rateLimiter != nil {
 		decision, err := s.rateLimiter.Admit(ctx, auth.VirtualKeyID, auth.ProjectID)
@@ -828,6 +855,12 @@ func (s *Service) finalizeStream(ctx context.Context, record GatewayRequest, res
 	status := "succeeded"
 	if category != nil {
 		status = "failed"
+	}
+	// ADR-019 D3 counting semantics: the durable lifecycle metric is observed
+	// the moment the business terminal state is determined, before the durable
+	// write - a finalize persistence failure never changes the request count.
+	if s.metrics != nil {
+		s.metrics.ObserveRequest(string(record.Provider), record.Model, record.IsStream, status, completedAt.Sub(record.StartedAt))
 	}
 	var upstreamStatus *int32
 	var upstreamRequestID *string

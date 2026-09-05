@@ -77,6 +77,15 @@ func run() error {
 
 	logger := telemetry.NewLogger(os.Stdout, cfg.LogLevel)
 
+	// Week 10 (ADR-019 D2): one app-owned Metrics value with its own
+	// Prometheus registry. The private Operations Plane serves it at /metrics;
+	// the data and control planes never do. Creating it before any
+	// database/provider wiring keeps this failure independent of them.
+	metrics, err := telemetry.NewMetrics()
+	if err != nil {
+		return fmt.Errorf("configure metrics: %w", err)
+	}
+
 	connectCtx, cancelConnect := context.WithTimeout(context.Background(), cfg.DatabaseConnectTime)
 	database, err := postgres.Open(connectCtx, cfg.DatabaseURL)
 	cancelConnect()
@@ -213,6 +222,7 @@ func run() error {
 		MaxConcurrentStreams:      cfg.MaxConcurrentStreams,
 		RetryMaxRetries:           cfg.RetryMaxRetries,
 		RetryBackoffMax:           cfg.RetryBackoffMax,
+		Metrics:                   metrics,
 	})
 	if err != nil {
 		database.Close()
@@ -229,6 +239,7 @@ func run() error {
 		ShutdownTimeout:     cfg.ShutdownTimeout,
 		DataPlaneHandler:    dataPlaneMux,
 		ControlPlaneHandler: controlPlaneHandler,
+		MetricsHandler:      metrics.Handler(),
 	}, database, logger)
 
 	runCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
