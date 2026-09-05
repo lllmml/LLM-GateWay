@@ -1,6 +1,7 @@
 package ratelimit
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sync"
@@ -37,6 +38,15 @@ func (c *fakeClock) advance(duration time.Duration) {
 	c.t = c.t.Add(duration)
 }
 
+func admitTest(t *testing.T, registry *Registry, keyID, projectID string) Decision {
+	t.Helper()
+	decision, err := registry.Admit(context.Background(), keyID, projectID)
+	if err != nil {
+		t.Fatalf("admit key=%s project=%s: %v", keyID, projectID, err)
+	}
+	return decision
+}
+
 func testRegistry(t *testing.T, cfg Config, clock *fakeClock) *Registry {
 	t.Helper()
 	cfg.Now = clock.now
@@ -70,13 +80,13 @@ func TestAdmitsUpToBurstThenRejectsWithRetryAfter(t *testing.T) {
 	cfg.ProjectRPM = 0
 	registry := testRegistry(t, cfg, clock)
 
-	if decision := registry.Admit(testKeyID, testProjID); !decision.Allowed {
+	if decision := admitTest(t, registry, testKeyID, testProjID); !decision.Allowed {
 		t.Fatalf("first admission = %+v, want allowed", decision)
 	}
-	if decision := registry.Admit(testKeyID, testProjID); !decision.Allowed {
+	if decision := admitTest(t, registry, testKeyID, testProjID); !decision.Allowed {
 		t.Fatalf("second admission = %+v, want allowed (burst)", decision)
 	}
-	decision := registry.Admit(testKeyID, testProjID)
+	decision := admitTest(t, registry, testKeyID, testProjID)
 	if decision.Allowed {
 		t.Fatal("third admission allowed, want rejected")
 	}
@@ -88,7 +98,7 @@ func TestAdmitsUpToBurstThenRejectsWithRetryAfter(t *testing.T) {
 	}
 
 	clock.advance(30 * time.Second)
-	if decision := registry.Admit(testKeyID, testProjID); !decision.Allowed {
+	if decision := admitTest(t, registry, testKeyID, testProjID); !decision.Allowed {
 		t.Fatalf("admission after refill = %+v, want allowed", decision)
 	}
 }
@@ -98,7 +108,7 @@ func TestDisabledScopesAdmitEverything(t *testing.T) {
 	registry := testRegistry(t, testConfig(), clock)
 
 	for index := 0; index < 1000; index++ {
-		if decision := registry.Admit(testKeyID, testProjID); !decision.Allowed {
+		if decision := admitTest(t, registry, testKeyID, testProjID); !decision.Allowed {
 			t.Fatalf("admission %d = %+v, want allowed with both scopes disabled", index, decision)
 		}
 	}
@@ -111,7 +121,7 @@ func TestProjectRejectDoesNotConsumeKeyQuota(t *testing.T) {
 	cfg.ProjectRPM = 1 // burst 1, binding constraint
 	registry := testRegistry(t, cfg, clock)
 
-	if decision := registry.Admit(testKeyID, testProjID); !decision.Allowed {
+	if decision := admitTest(t, registry, testKeyID, testProjID); !decision.Allowed {
 		t.Fatalf("first admission = %+v, want allowed", decision)
 	}
 
@@ -120,7 +130,7 @@ func TestProjectRejectDoesNotConsumeKeyQuota(t *testing.T) {
 
 	// Second admission is rejected by the empty project scope. Its key-limb
 	// reservation must have been cancelled: the key bucket keeps the token.
-	decision := registry.Admit(testKeyID, testProjID)
+	decision := admitTest(t, registry, testKeyID, testProjID)
 	if decision.Allowed {
 		t.Fatal("second admission allowed, want project-scope rejection")
 	}
@@ -145,13 +155,13 @@ func TestKeyRejectDoesNotConsumeProjectQuota(t *testing.T) {
 	cfg.ProjectRPM = 6 // burst 6
 	registry := testRegistry(t, cfg, clock)
 
-	if decision := registry.Admit(testKeyID, testProjID); !decision.Allowed {
+	if decision := admitTest(t, registry, testKeyID, testProjID); !decision.Allowed {
 		t.Fatalf("first admission = %+v, want allowed", decision)
 	}
 
 	projectBefore := registry.limiterTokens(ScopeProject, testProjID)
 
-	decision := registry.Admit(testKeyID, testProjID)
+	decision := admitTest(t, registry, testKeyID, testProjID)
 	if decision.Allowed {
 		t.Fatal("second admission allowed, want key-scope rejection")
 	}
@@ -177,7 +187,7 @@ func TestConcurrentAdmissionsLeakNothingAcrossScopes(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if registry.Admit(testKeyID, testProjID).Allowed {
+			if admitTest(t, registry, testKeyID, testProjID).Allowed {
 				allowed.add(1)
 			}
 		}()
@@ -205,8 +215,8 @@ func TestSweepRemovesIdleEntriesAndKeepsHotEntries(t *testing.T) {
 	cfg.ProjectRPM = 0
 	registry := testRegistry(t, cfg, clock)
 
-	registry.Admit(testKeyID, testProjID)
-	registry.Admit(testOtherKey, testOtherProj)
+	admitTest(t, registry, testKeyID, testProjID)
+	admitTest(t, registry, testOtherKey, testOtherProj)
 
 	// Still within IdleTTL: nothing is removed.
 	clock.advance(5 * time.Minute)
@@ -216,7 +226,7 @@ func TestSweepRemovesIdleEntriesAndKeepsHotEntries(t *testing.T) {
 	}
 
 	// testKeyID is refreshed by another admission, testOtherKey stays idle.
-	registry.Admit(testKeyID, testProjID)
+	admitTest(t, registry, testKeyID, testProjID)
 	clock.advance(6 * time.Minute) // testOtherKey now idle 11m, testKeyID idle 6m
 	registry.sweep(clock.now())
 	if registry.len() != 1 {
@@ -238,13 +248,13 @@ func TestEntryCapEvictsLongestIdle(t *testing.T) {
 	cfg.EntryCap = 2
 	registry := testRegistry(t, cfg, clock)
 
-	registry.Admit(testKeyID, testProjID)
+	admitTest(t, registry, testKeyID, testProjID)
 	clock.advance(time.Minute)
-	registry.Admit(testOtherKey, testOtherProj)
+	admitTest(t, registry, testOtherKey, testOtherProj)
 	clock.advance(time.Minute)
 
 	// Inserting a third key evicts the least-recently-used (testKeyID).
-	registry.Admit(testThirdKey, "proj-3")
+	admitTest(t, registry, testThirdKey, "proj-3")
 	if registry.len() != cfg.EntryCap {
 		t.Fatalf("entries = %d, want cap %d", registry.len(), cfg.EntryCap)
 	}
@@ -304,8 +314,8 @@ func TestCapEvictionNeverDetachesCurrentAdmissionLimb(t *testing.T) {
 	registry := testRegistry(t, cfg, clock)
 
 	// Two admissions fill the registry with {k1, p1}; k1 has 3 tokens left.
-	registry.Admit(testKeyID, testProjID)
-	registry.Admit(testKeyID, testProjID)
+	admitTest(t, registry, testKeyID, testProjID)
+	admitTest(t, registry, testKeyID, testProjID)
 	if got := registry.limiterTokens(ScopeVirtualKey, testKeyID); !nearTokens(got, 3) {
 		t.Fatalf("k1 tokens before third admission = %v, want 3", got)
 	}
@@ -313,7 +323,7 @@ func TestCapEvictionNeverDetachesCurrentAdmissionLimb(t *testing.T) {
 	// Third admission needs project p2, which forces an eviction. The only
 	// non-protected candidate is p1 (k1 is protected as the key limb of this
 	// very admission), so p1 is evicted and k1 stays current.
-	decision := registry.Admit(testKeyID, testOtherProj)
+	decision := admitTest(t, registry, testKeyID, testOtherProj)
 	if !decision.Allowed {
 		t.Fatalf("third admission = %+v, want allowed", decision)
 	}
@@ -351,18 +361,18 @@ func TestNoSilentBurstResetWithoutEviction(t *testing.T) {
 
 	// Create and fully deplete k1 at t0.
 	for _, attempt := range []int{1, 2} {
-		if !registry.Admit(testKeyID, testProjID).Allowed {
+		if !admitTest(t, registry, testKeyID, testProjID).Allowed {
 			t.Fatalf("k1 admission %d denied, want allowed", attempt)
 		}
 	}
-	if registry.Admit(testKeyID, testProjID).Allowed {
+	if admitTest(t, registry, testKeyID, testProjID).Allowed {
 		t.Fatal("k1 third admission allowed, want denied")
 	}
 	// A resident, depleted entry must not regain quota without an eviction.
 	// This check happens at t0: an admission also refreshes lastSeen, so doing
 	// it later would tie k1's timestamp with k2's and destroy the strict LRU
 	// ordering the eviction assertion below needs.
-	if registry.Admit(testKeyID, testProjID).Allowed {
+	if admitTest(t, registry, testKeyID, testProjID).Allowed {
 		t.Fatal("k1 regained a fresh burst without being evicted")
 	}
 
@@ -374,15 +384,15 @@ func TestNoSilentBurstResetWithoutEviction(t *testing.T) {
 	// so no refill can make k2's depletion assertions ambiguous.
 	clock.advance(time.Second)
 	for _, attempt := range []int{1, 2} {
-		if !registry.Admit(testOtherKey, testProjID).Allowed {
+		if !admitTest(t, registry, testOtherKey, testProjID).Allowed {
 			t.Fatalf("k2 admission %d denied, want allowed", attempt)
 		}
 	}
-	if registry.Admit(testOtherKey, testProjID).Allowed {
+	if admitTest(t, registry, testOtherKey, testProjID).Allowed {
 		t.Fatal("k2 third admission allowed, want denied")
 	}
 	// k2 stays resident and depleted at t1 (no eviction has run yet).
-	if registry.Admit(testOtherKey, testProjID).Allowed {
+	if admitTest(t, registry, testOtherKey, testProjID).Allowed {
 		t.Fatal("k2 regained a fresh burst without being evicted")
 	}
 	if !registry.has(ScopeVirtualKey, testKeyID) || !registry.has(ScopeVirtualKey, testOtherKey) {
@@ -393,7 +403,7 @@ func TestNoSilentBurstResetWithoutEviction(t *testing.T) {
 	// (lastSeen t0 vs t1), so k1 is the deterministic LRU victim, which is the
 	// documented reset path: the evicted scope's next admission is against a
 	// fresh bucket.
-	registry.Admit(testThirdKey, "proj-3")
+	admitTest(t, registry, testThirdKey, "proj-3")
 	if registry.has(ScopeVirtualKey, testKeyID) {
 		t.Fatal("k1 should have been evicted as the strictly-oldest LRU entry")
 	}
@@ -405,7 +415,7 @@ func TestNoSilentBurstResetWithoutEviction(t *testing.T) {
 	// (Its readmission may evict whichever of k2/k3 is LRU at that instant;
 	// the test only asserts the documented fresh-burst grant, never a specific
 	// tied victim.)
-	if !registry.Admit(testKeyID, testProjID).Allowed {
+	if !admitTest(t, registry, testKeyID, testProjID).Allowed {
 		t.Fatal("k1 was evicted, so the documented reset must grant a fresh burst")
 	}
 	if registry.len() != 2 {
@@ -447,7 +457,7 @@ func TestConcurrentAdmitSweepEviction(t *testing.T) {
 			defer wg.Done()
 			key := fmt.Sprintf("key-%d", index%8)
 			project := fmt.Sprintf("proj-%d", index%4)
-			registry.Admit(key, project)
+			admitTest(t, registry, key, project)
 		}(index)
 	}
 	wg.Wait()
@@ -501,7 +511,7 @@ func TestConcurrentAdmissionsKeepTimestampsSerialized(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if registry.Admit(testKeyID, testProjID).Allowed {
+			if admitTest(t, registry, testKeyID, testProjID).Allowed {
 				allowed.add(1)
 			}
 		}()

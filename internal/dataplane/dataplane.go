@@ -550,18 +550,23 @@ func classifyStreamOpenError(ctx context.Context, gatewayErr *GatewayError) *Gat
 	return NewError(provider.StreamInterrupted, "stream interrupted")
 }
 
-// admit applies the Week 8 admission controls in order: in-memory rate
-// limiting (per virtual key and per project), then the concurrency slots. A
-// rejected request returns a stable rate_limited gateway error (never a
-// provider call, never a durable gateway_requests row) and is visible through
-// a bounded structured slog event, because Week 8 rejections intentionally
-// create no durable record and Prometheus metrics land with the Week 10
-// observability milestone. The returned release function must be called
-// exactly once when the admitted operation finishes; it is safe under early
-// returns and panics when deferred.
-func (s *Service) admit(ctx context.Context, auth AuthContext, stream bool) (func(), *GatewayError) {
+// admit applies the Week 8 admission controls in order: rate limiting (per
+// virtual key and per project, local registry or an external Limiter), then
+// the concurrency slots. A rejected request returns a stable rate_limited
+// gateway error (never a provider call, never a durable gateway_requests row)
+// and is visible through a bounded structured slog event, because Week 8
+// rejections intentionally create no durable record and Prometheus metrics
+// land with the Week 10 observability milestone. A cancelled/deadline-exceeded
+// context propagates from the limiter as-is (no quota is consumed by a
+// cancelled request, ADR-018 D1). The returned release function must be
+// called exactly once when the admitted operation finishes; it is safe under
+// early returns and panics when deferred.
+func (s *Service) admit(ctx context.Context, auth AuthContext, stream bool) (func(), error) {
 	if s.rateLimiter != nil {
-		decision := s.rateLimiter.Admit(auth.VirtualKeyID, auth.ProjectID)
+		decision, err := s.rateLimiter.Admit(ctx, auth.VirtualKeyID, auth.ProjectID)
+		if err != nil {
+			return nil, err
+		}
 		if !decision.Allowed {
 			s.logAdmissionRejection(auth, "rate_limit", string(decision.BlockingScope), decision.RetryAfter)
 			retryAfter := decision.RetryAfter

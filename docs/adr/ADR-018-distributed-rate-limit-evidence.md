@@ -441,6 +441,76 @@ requests continue within the emergency bound. There is no unlimited fail-open
 and no hard total fail-closed. Redis is not a readiness dependency when the
 local degraded limiter is available.
 
+## Implementation notes (Slice B1 - foundation: seam + Redis algorithm core)
+
+Slice B1 (this commit) delivered: the `ratelimit.Limiter` seam with the local
+`Registry` adapted (ctx cancellation never consumes tokens, D1); the
+`internal/ratelimit/distributed` composite Lua admission core (D2-D5); and the
+pinned-version runtime verification below. The degraded/emergency wrapper
+(D6/D7/D9) and data-plane wiring (D10) are the next slice and are NOT in this
+commit; `distributed.Limiter` currently surfaces dependency failures as a
+`*DependencyError` for that wrapper to consume.
+
+### Pinned versions
+
+- go-redis `v9.22.0` (go.mod).
+- Redis image `redis:7.4.11-alpine` (docker-compose service, ephemeral,
+  `--enable-debug-command yes` for one deterministic command-interruption
+  probe; local/dev only).
+
+### Runtime facts verified against the pinned versions (not assumed)
+
+1. **MaxRetries normalization**: go-redis v9.22.0 normalizes `MaxRetries: 0` to
+   the default **3** retries; only `MaxRetries: -1` disables retries. The
+   production client must set `-1` (a naive `0` would silently enable
+   retransmission). Pinned by `TestGoRedisMaxRetriesNormalization`.
+2. **No retransmission of ambiguous mutating commands**: with retries disabled,
+   a command whose server consumed it without replying (outcome ambiguous) is
+   never retransmitted - exactly one connection attempt is observed against a
+   swallowing test server; the default posture retries (>1 attempt, shown by
+   `TestDefaultRetryWouldRetransmit`).
+3. **EVALSHA -> NOSCRIPT -> EVAL fallback is a provably pre-execution path**: a
+   NOSCRIPT reply proves the script never ran, so the EVAL fallback executes
+   exactly once (pinned by `TestScriptRunEvalshaFallsBackToEvalAndExecutesOnce`).
+4. **Context does not interrupt an in-flight read**: empirically, a ctx deadline
+   does NOT bound a blocking server reply (DEBUG SLEEP / BLPop); the effective
+   in-flight bound is the connection `ReadTimeout` (net i/o timeout).
+   Consequence: the production client must set a tight `ReadTimeout` (comparable
+   to the per-command budget) and keep the Lua admission command fast and
+   non-blocking; per-command contexts are kept for outcome classification, not
+   relied on to interrupt reads. Pinned by
+   `TestCommandReadBoundedByReadTimeoutNotContext`.
+5. **Cancellation != dependency failure at the core**: a cancelled parent
+   context propagates as a context error (never `*DependencyError`); a live
+   parent with an unreachable Redis surfaces `ErrDependency`. Pinned by
+   `TestAdmitPropagatesParentCancellationNotDependency` and
+   `TestAdmitSurfacesDependencyErrorWhenRedisUnreachable`.
+
+Point 4 is an implementation nuance (how a short timeout is enforced), not a
+change to the D8 decision; it will be reflected in the Slice B2 client
+configuration rather than an ADR amendment.
+
+### Lua state representation and numeric bounds (as built)
+
+- Per scope: one Redis hash `gwrl:v1:{project}:vk:<virtualKeyUUID>` or
+  `gwrl:v1:{project}:project` with fields `t` (token units) and `s` (logical
+  time ms). Keys carry internal UUIDs only. `PEXPIRE` refreshes on every
+  admission, allow and reject.
+- Integer fixed point: `1 token = 60000 units`, capacity = `rpm*60000`, request
+  cost 60000, refill = `elapsed_ms*rpm` with `elapsed <= 60000` and the
+  addition capped by `capacity - tokens`; stored timestamp never moves
+  backward (`effective_now = max(server_now, stored_last)`); retry-after is an
+  integer ceiling computed with floor + remainder so the division stays exact.
+- `MaxSafeRPM = floor((2^53 - 1) / 60000) = 150119987579`; every Lua integer
+  stays below 2^53; config validation rejects anything above the bound
+  (`ValidateScopeRPM`, `TestMaxSafeRPMLuaExactIntegerBoundary`).
+- Admission matrix tests (single scope, composite all-or-none, max
+  Retry-After/blocking scope, refill, monotonic step-back, TTL refresh on
+  reject, rejected hot key never resets before idle TTL, large-elapsed clamp
+  with exact no-drift tokens, per-key/per-project isolation, concurrent
+  admission atomicity) pass on the pinned Redis under `make integration` and
+  with `-race`.
+
 ## Migration / rollback
 
 No schema change. Rollback per commit slice: distributed mode is opt-in via

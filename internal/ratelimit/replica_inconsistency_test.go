@@ -42,14 +42,14 @@ func TestReplicaInconsistencyTwoRegistriesAllowBeyondClusterLimit(t *testing.T) 
 	for i := 0; i < replicaTotal; i++ {
 		var decision Decision
 		if i%2 == 0 {
-			decision = registryA.Admit(testKeyID, testProjID)
+			decision = admitTest(t, registryA, testKeyID, testProjID)
 			if decision.Allowed {
 				allowedA++
 			} else {
 				rejectedA++
 			}
 		} else {
-			decision = registryB.Admit(testKeyID, testProjID)
+			decision = admitTest(t, registryB, testKeyID, testProjID)
 			if decision.Allowed {
 				allowedB++
 			} else {
@@ -87,7 +87,7 @@ func TestReplicaInconsistencySingleRegistryControlRejectsBeyondBurst(t *testing.
 
 	allowed, rejected := 0, 0
 	for i := 0; i < replicaTotal; i++ {
-		decision := registry.Admit(testKeyID, testProjID)
+		decision := admitTest(t, registry, testKeyID, testProjID)
 		if decision.Allowed {
 			allowed++
 			continue
