@@ -21,10 +21,10 @@ func cfgWith(keyRPM, projectRPM int) Config {
 }
 
 // admitResult runs one admission and cleans up the two scope keys afterwards.
-func admitResult(t *testing.T, limiter *Limiter, projectID, keyID string) ratelimit.Decision {
+func admitResult(t *testing.T, limiter *Core, projectID, keyID string) ratelimit.Decision {
 	t.Helper()
 	ctx := context.Background()
-	decision, err := limiter.Admit(ctx, keyID, projectID)
+	decision, err := limiter.AdmitCore(ctx, keyID, projectID)
 	if err != nil {
 		t.Fatalf("admit: %v", err)
 	}
@@ -292,7 +292,7 @@ func TestConcurrentAdmissionsAtomicExactlyBurst(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			decision, err := limiter.Admit(ctx, keyID, projectID)
+			decision, err := limiter.AdmitCore(ctx, keyID, projectID)
 			if err != nil {
 				t.Errorf("concurrent admit: %v", err)
 				return
@@ -319,5 +319,62 @@ func TestConcurrentAdmissionsAtomicExactlyBurst(t *testing.T) {
 	}
 	if tokens < 0 || tokens >= UnitsPerToken {
 		t.Fatalf("post-concurrency tokens = %d, want 0 <= tokens < %d", tokens, UnitsPerToken)
+	}
+}
+
+// TestMaxSafeRPMLiveStoresExactDecimalState (P1-1) exercises the largest
+// accepted RPM on the pinned Redis. Lua tostring would corrupt this value into
+// scientific notation (9.00719925474e+15); passing the integer Lua number
+// directly must store an exact base-10 integer the Go side can parse and
+// compare exactly.
+func TestMaxSafeRPMLiveStoresExactDecimalState(t *testing.T) {
+	cfg := Config{KeyRPM: MaxSafeRPM(), IdleTTL: time.Minute, CommandTimeout: 5 * time.Second}
+	core, client := newTestLimiter(t, cfg)
+	projectID, keyID := uniqueIDs(t)
+	ctx := context.Background()
+
+	if decision := admitResult(t, core, projectID, keyID); !decision.Allowed {
+		t.Fatalf("first admission at max safe RPM was rejected")
+	}
+	want := int64(MaxSafeRPM())*UnitsPerToken - UnitsPerToken
+	tokens, ts, present := readScopeState(t, ctx, client, ScopeKey(projectID, keyID))
+	if !present {
+		t.Fatal("key scope missing after max-RPM admission")
+	}
+	if tokens != want {
+		t.Fatalf("stored tokens = %d, want exactly %d (base-10 parse, no scientific drift)", tokens, want)
+	}
+	if ts <= 0 {
+		t.Fatalf("stored timestamp not a valid positive integer: %d", ts)
+	}
+	// The high-value path keeps working (no HINCRBY integer error): the bucket
+	// still has capacity far above one token.
+	if decision := admitResult(t, core, projectID, keyID); !decision.Allowed {
+		t.Fatal("second admission at max safe RPM was rejected")
+	}
+}
+
+// TestRetryAfterCeilingKeepsRemainder (P2-4) pins the integer ceiling: a
+// deficit of 40 units at rpm 7 needs ceil(40/7) = 6ms, NOT floor = 5ms. The
+// stored timestamp is placed slightly in the future so the monotonic clamp
+// freezes refill at exactly 0 and the deficit stays deterministic.
+func TestRetryAfterCeilingKeepsRemainder(t *testing.T) {
+	core, client := newTestLimiter(t, cfgWith(7, 0))
+	projectID, keyID := uniqueIDs(t)
+	ctx := context.Background()
+
+	now := serverNowMS(t, ctx, client)
+	const deficit = 40
+	setScopeState(t, ctx, client, ScopeKey(projectID, keyID), UnitsPerToken-deficit, now+60000)
+
+	decision := admitResult(t, core, projectID, keyID)
+	if decision.Allowed {
+		t.Fatal("deficient bucket was allowed")
+	}
+	if want := 6 * time.Millisecond; decision.RetryAfter != want {
+		t.Fatalf("retry-after = %v, want exactly %v (ceil(40/7)=6, not floor 5)", decision.RetryAfter, want)
+	}
+	if decision.BlockingScope != ratelimit.ScopeVirtualKey {
+		t.Fatalf("blocking scope = %q, want virtual_key", decision.BlockingScope)
 	}
 }

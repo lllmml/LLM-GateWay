@@ -33,11 +33,12 @@ func ProjectScopeKey(projectID string) string {
 	return keyPrefix + projectID + "}:project"
 }
 
-// ErrDependency is the sentinel wrapping Redis dependency failures surfaced by
-// Limiter.Admit in this foundation slice. Slice B2's degraded/emergency
-// wrapper converts these into the ratelimit.Limiter contract (dependency
-// failures never reach the data plane); until then no production path uses
-// this type and callers must treat it as an internal algorithm-core error.
+// ErrDependency is the sentinel wrapped around Redis dependency failures
+// surfaced by Core.AdmitCore. This raw core deliberately does NOT implement
+// ratelimit.Limiter (its admission method is named AdmitCore, not Admit): the
+// Slice B2 degraded/emergency wrapper owns the public Admit and converts these
+// dependency errors into the ratelimit.Limiter contract (dependency failures
+// never reach the data plane). Until then no production path uses this type.
 var ErrDependency = errors.New("distributed rate limiter dependency failure")
 
 // DependencyError wraps the concrete Redis/go-redis cause of a dependency
@@ -53,12 +54,13 @@ func (e *DependencyError) Unwrap() error { return e.Err }
 // dependency failure with errors.Is without unwrapping the concrete cause.
 func (e *DependencyError) Is(target error) bool { return target == ErrDependency }
 
-// Config defines the composite scopes for the Redis-backed limiter. RPM values
-// of 0 disable that scope; an enabled scope must fit the Lua exact-integer
-// safe range (MaxSafeRPM). IdleTTL drives the per-key PEXPIRE refresh on every
-// admission (allow and reject). CommandTimeout bounds one Redis command; the
-// parent context cancellation is never confused with a dependency timeout
-// (ADR-018 D8 classification is applied here so Slice B2 can reuse it).
+// Config defines the composite scopes for the Redis-backed limiter core. RPM
+// values of 0 disable that scope; an enabled scope must fit the Lua
+// exact-integer safe range (MaxSafeRPM). IdleTTL (>= 1ms) drives the per-key
+// PEXPIRE refresh on every admission (allow and reject). CommandTimeout bounds
+// one Redis command context; the parent context cancellation is never confused
+// with a dependency timeout (ADR-018 D8 classification is applied here so the
+// Slice B2 wrapper can reuse it).
 type Config struct {
 	KeyRPM         int
 	ProjectRPM     int
@@ -72,8 +74,8 @@ func (c Config) validate() error {
 			return fmt.Errorf("distributed ratelimit %s: %w", scope, err)
 		}
 	}
-	if c.IdleTTL <= 0 {
-		return errors.New("distributed ratelimit idle TTL must be positive")
+	if c.IdleTTL < time.Millisecond {
+		return errors.New("distributed ratelimit idle TTL must be at least 1ms (it is passed to Lua PEXPIRE as an integer ms value)")
 	}
 	if c.CommandTimeout <= 0 {
 		return errors.New("distributed ratelimit command timeout must be positive")
@@ -81,52 +83,57 @@ func (c Config) validate() error {
 	return nil
 }
 
-// Limiter is the Slice B1 Redis token-bucket admission core: one atomic Lua
-// composite admission over key + project scopes (ADR-018 D3/D4). It is NOT yet
-// wired to the data plane and does not yet implement degraded/emergency
-// handling; Slice B2 adds the wrapper that turns it into a ratelimit.Limiter
-// for the service.
-type Limiter struct {
+// Core is the Slice B1 Redis token-bucket admission core: one atomic Lua
+// composite admission over key + project scopes (ADR-018 D3/D4). It is NOT a
+// ratelimit.Limiter (see AdmitCore) and is NOT wired to the data plane; Slice
+// B2 adds the degraded/emergency wrapper that exposes the public Limiter.
+type Core struct {
 	client *redis.Client
 	cfg    Config
 	script *redis.Script
 }
 
 // New validates the configuration and prepares the Lua admission script.
-func New(client *redis.Client, cfg Config) (*Limiter, error) {
+func New(client *redis.Client, cfg Config) (*Core, error) {
 	if client == nil {
 		return nil, errors.New("distributed ratelimit redis client is required")
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	return &Limiter{
+	return &Core{
 		client: client,
 		cfg:    cfg,
 		script: redis.NewScript(admissionScript),
 	}, nil
 }
 
-// Admit performs one composite distributed admission. It returns ctx errors
-// (cancellation/deadline) as-is so a cancelled request consumes nothing and
-// never triggers degraded behavior; Redis dependency failures are wrapped as
-// *DependencyError for the future degraded wrapper. This mirrors ADR-018 D8.
-func (l *Limiter) Admit(ctx context.Context, keyID, projectID string) (ratelimit.Decision, error) {
-	if l.cfg.KeyRPM == 0 && l.cfg.ProjectRPM == 0 {
+// AdmitCore performs one composite distributed admission. It returns ctx
+// errors (cancellation/deadline) as-is so a cancelled request consumes nothing
+// and never triggers degraded behavior; Redis dependency failures are wrapped
+// as *DependencyError for the future degraded wrapper. This mirrors ADR-018
+// D8. The method is deliberately NOT named Admit: the raw core must not
+// structurally satisfy ratelimit.Limiter (dependency errors must never escape
+// through the public seam).
+func (c *Core) AdmitCore(ctx context.Context, keyID, projectID string) (ratelimit.Decision, error) {
+	// Cancellation is checked before the all-disabled fast path and before any
+	// Redis command: a cancelled request never consumes quota and never issues
+	// a Redis command.
+	if err := ctx.Err(); err != nil {
+		return ratelimit.Decision{}, err
+	}
+	if c.cfg.KeyRPM == 0 && c.cfg.ProjectRPM == 0 {
 		// No enabled scope: admit without any dependency (Week 8 semantics for
 		// an all-disabled registry).
 		return ratelimit.Decision{Allowed: true}, nil
 	}
-	if err := ctx.Err(); err != nil {
-		return ratelimit.Decision{}, err
-	}
 
 	keys := []string{ScopeKey(projectID, keyID), ProjectScopeKey(projectID)}
-	args := l.args()
-	commandCtx, cancel := context.WithTimeout(ctx, l.cfg.CommandTimeout)
+	args := c.args()
+	commandCtx, cancel := context.WithTimeout(ctx, c.cfg.CommandTimeout)
 	defer cancel()
 
-	raw, err := l.script.Run(commandCtx, l.client, keys, args...).Result()
+	raw, err := c.script.Run(commandCtx, c.client, keys, args...).Result()
 	if err != nil {
 		// Parent cancellation/deadline wins over a dependency classification:
 		// a cancelled request must never be treated as a Redis dependency
@@ -143,11 +150,11 @@ func (l *Limiter) Admit(ctx context.Context, keyID, projectID string) (ratelimit
 //
 //	[1] cost units | [2] key enabled | [3] key rpm | [4] key ttl ms
 //	[5] proj enabled | [6] proj rpm | [7] proj ttl ms
-func (l *Limiter) args() []any {
+func (c *Core) args() []any {
 	return []any{
 		strconv.Itoa(UnitsPerToken),
-		boolFlag(l.cfg.KeyRPM > 0), strconv.Itoa(l.cfg.KeyRPM), strconv.Itoa(int(l.cfg.IdleTTL / time.Millisecond)),
-		boolFlag(l.cfg.ProjectRPM > 0), strconv.Itoa(l.cfg.ProjectRPM), strconv.Itoa(int(l.cfg.IdleTTL / time.Millisecond)),
+		boolFlag(c.cfg.KeyRPM > 0), strconv.Itoa(c.cfg.KeyRPM), strconv.Itoa(int(c.cfg.IdleTTL / time.Millisecond)),
+		boolFlag(c.cfg.ProjectRPM > 0), strconv.Itoa(c.cfg.ProjectRPM), strconv.Itoa(int(c.cfg.IdleTTL / time.Millisecond)),
 	}
 }
 
@@ -159,8 +166,13 @@ func boolFlag(enabled bool) string {
 }
 
 // parseDecision converts the Lua reply {allowed, retry_after_ms, blocking}
-// into a ratelimit.Decision. Numbers arrive as int64 from the Redis integer
-// protocol; the blocking scope is one of "vk", "proj", or "".
+// into a ratelimit.Decision and enforces its internal consistency (P2-5):
+//
+//	allowed=true  -> retry_after_ms == 0 and blocking scope == ""
+//	allowed=false -> retry_after_ms >  0 and blocking scope is vk or proj
+//
+// The bundled Lua always satisfies this; an inconsistent reply is a bug and is
+// rejected rather than silently producing an impossible Decision.
 func parseDecision(raw any) (ratelimit.Decision, error) {
 	row, ok := raw.([]any)
 	if !ok || len(row) != 3 {
@@ -189,8 +201,15 @@ func parseDecision(raw any) (ratelimit.Decision, error) {
 	default:
 		return ratelimit.Decision{}, fmt.Errorf("unexpected distributed admission blocking scope %q", scope)
 	}
-	if !decision.Allowed {
-		decision.RetryAfter = time.Duration(retryMS) * time.Millisecond
+	if decision.Allowed {
+		if retryMS != 0 || decision.BlockingScope != "" {
+			return ratelimit.Decision{}, fmt.Errorf("inconsistent allowed decision: retry=%d scope=%q", retryMS, scope)
+		}
+		return decision, nil
 	}
+	if retryMS <= 0 || (decision.BlockingScope != ratelimit.ScopeVirtualKey && decision.BlockingScope != ratelimit.ScopeProject) {
+		return ratelimit.Decision{}, fmt.Errorf("inconsistent rejected decision: retry=%d scope=%q", retryMS, scope)
+	}
+	decision.RetryAfter = time.Duration(retryMS) * time.Millisecond
 	return decision, nil
 }

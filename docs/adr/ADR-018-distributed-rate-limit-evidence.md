@@ -443,13 +443,15 @@ local degraded limiter is available.
 
 ## Implementation notes (Slice B1 - foundation: seam + Redis algorithm core)
 
-Slice B1 (this commit) delivered: the `ratelimit.Limiter` seam with the local
-`Registry` adapted (ctx cancellation never consumes tokens, D1); the
-`internal/ratelimit/distributed` composite Lua admission core (D2-D5); and the
-pinned-version runtime verification below. The degraded/emergency wrapper
-(D6/D7/D9) and data-plane wiring (D10) are the next slice and are NOT in this
-commit; `distributed.Limiter` currently surfaces dependency failures as a
-`*DependencyError` for that wrapper to consume.
+Slice B1 delivered: the `ratelimit.Limiter` seam with the local `Registry`
+adapted (ctx cancellation never consumes tokens, D1, `var _ Limiter =
+(*Registry)(nil)`, and the data plane's `Options.RateLimiter`/`Service.rateLimiter`
+are the interface); the `internal/ratelimit/distributed` composite Lua
+admission core (D2-D5); and the pinned-version runtime verification below. The
+raw Redis core is named `Core.AdmitCore` and deliberately does NOT satisfy
+`ratelimit.Limiter` (no structural footgun); the Slice B2 degraded/emergency
+wrapper (D6/D7/D9/D10) will own the public `Admit` and consume the core's
+`*DependencyError`.
 
 ### Pinned versions
 
@@ -464,31 +466,45 @@ commit; `distributed.Limiter` currently surfaces dependency failures as a
    the default **3** retries; only `MaxRetries: -1` disables retries. The
    production client must set `-1` (a naive `0` would silently enable
    retransmission). Pinned by `TestGoRedisMaxRetriesNormalization`.
-2. **No retransmission of ambiguous mutating commands**: with retries disabled,
-   a command whose server consumed it without replying (outcome ambiguous) is
-   never retransmitted - exactly one connection attempt is observed against a
-   swallowing test server; the default posture retries (>1 attempt, shown by
-   `TestDefaultRetryWouldRetransmit`).
+2. **No retransmission of ambiguous mutating commands**: verified against the
+   REAL pinned Redis through a test-only drop proxy (a unique script forces
+   EVALSHA -> NOSCRIPT -> EVAL; the proxy relays the NOSCRIPT error then drops
+   the connection after the EVAL reaches Redis, so the real Redis executed the
+   mutation while the reply was never delivered). With the production
+   `MaxRetries: -1` posture the mutating EVAL executes exactly once and one
+   connection is observed (`TestZeroRetryNeverRetransmitsAmbiguousMutatingEval`);
+   with the go-redis default posture it executes >= 2 times
+   (`TestDefaultRetryRetransmitsAmbiguousMutatingEval`) - the double-charge
+   ADR-018 D8 forbids.
 3. **EVALSHA -> NOSCRIPT -> EVAL fallback is a provably pre-execution path**: a
    NOSCRIPT reply proves the script never ran, so the EVAL fallback executes
-   exactly once (pinned by `TestScriptRunEvalshaFallsBackToEvalAndExecutesOnce`).
-4. **Context does not interrupt an in-flight read**: empirically, a ctx deadline
-   does NOT bound a blocking server reply (DEBUG SLEEP / BLPop); the effective
-   in-flight bound is the connection `ReadTimeout` (net i/o timeout).
-   Consequence: the production client must set a tight `ReadTimeout` (comparable
-   to the per-command budget) and keep the Lua admission command fast and
-   non-blocking; per-command contexts are kept for outcome classification, not
-   relied on to interrupt reads. Pinned by
-   `TestCommandReadBoundedByReadTimeoutNotContext`.
+   exactly once. Pinned with a per-run unique script body plus a
+   `SCRIPT EXISTS == false` precondition so the SHA cannot be pre-loaded
+   (`TestScriptRunEvalshaFallsBackToEvalAndExecutesOnce`).
+4. **Read-bound semantics depend on ContextTimeoutEnabled**: with the go-redis
+   default (`ContextTimeoutEnabled=false`) a ctx deadline does NOT interrupt an
+   in-flight read - ReadTimeout is the effective bound (net i/o timeout). With
+   `ContextTimeoutEnabled=true` the per-command context deadline DOES bound the
+   read (~ctx deadline, surfaced as a net i/o timeout whose source is the
+   context). Chosen production posture: `ContextTimeoutEnabled=true` with a
+   tight ReadTimeout fallback, so the core's per-command `CommandTimeout`
+   context is a true whole-command cap (dial = DialTimeout, write =
+   WriteTimeout, read = min(ctx deadline, ReadTimeout) while enabled). Pinned by
+   `TestContextDoesNotInterruptReadByDefault` and
+   `TestContextInterruptsReadWhenEnabled`. This is an implementation nuance (how
+   a short timeout is enforced), not a change to D8; Slice B2 configures the
+   client accordingly.
 5. **Cancellation != dependency failure at the core**: a cancelled parent
    context propagates as a context error (never `*DependencyError`); a live
-   parent with an unreachable Redis surfaces `ErrDependency`. Pinned by
-   `TestAdmitPropagatesParentCancellationNotDependency` and
-   `TestAdmitSurfacesDependencyErrorWhenRedisUnreachable`.
-
-Point 4 is an implementation nuance (how a short timeout is enforced), not a
-change to the D8 decision; it will be reflected in the Slice B2 client
-configuration rather than an ADR amendment.
+   parent with an unreachable Redis surfaces `ErrDependency`. The cancellation
+   check also precedes the all-scopes-disabled fast path. Pinned by
+   `TestAdmitPropagatesParentCancellationNotDependency`,
+   `TestAdmitSurfacesDependencyErrorWhenRedisUnreachable`, and
+   `TestCoreAllScopesDisabledAdmitsWithoutRedis`.
+6. **Integration Redis version is asserted**: the shared integration helper
+   fails when `REDIS_URL` does not point at the pinned `redis_version:7.4.11`
+   (`assertPinnedRedisVersion`), so the runtime assumptions are never verified
+   against a different Redis by accident.
 
 ### Lua state representation and numeric bounds (as built)
 
@@ -500,10 +516,18 @@ configuration rather than an ADR amendment.
   cost 60000, refill = `elapsed_ms*rpm` with `elapsed <= 60000` and the
   addition capped by `capacity - tokens`; stored timestamp never moves
   backward (`effective_now = max(server_now, stored_last)`); retry-after is an
-  integer ceiling computed with floor + remainder so the division stays exact.
+  integer ceiling computed with floor + remainder so the division stays exact
+  (regression test pins ceil(40/7) = 6ms, not floor 5ms).
+- **State writes pass integer Lua numbers directly to Redis commands (never
+  `tostring`)**: verified on the pinned Redis that Lua `tostring` renders
+  9007199254740000 as `9.00719925474e+15` (HINCRBY then fails), while direct
+  numbers serialize exactly. A live test at `RPM = MaxSafeRPM()` asserts the
+  stored tokens parse and equal `MaxSafeRPM*60000 - 60000` exactly
+  (`TestMaxSafeRPMLiveStoresExactDecimalState`).
 - `MaxSafeRPM = floor((2^53 - 1) / 60000) = 150119987579`; every Lua integer
   stays below 2^53; config validation rejects anything above the bound
-  (`ValidateScopeRPM`, `TestMaxSafeRPMLuaExactIntegerBoundary`).
+  (`ValidateScopeRPM`, `TestMaxSafeRPMLuaExactIntegerBoundary`), and `IdleTTL`
+  is required to be >= 1ms so PEXPIRE is never truncated to a no-op.
 - Admission matrix tests (single scope, composite all-or-none, max
   Retry-After/blocking scope, refill, monotonic step-back, TTL refresh on
   reject, rejected hot key never resets before idle TTL, large-elapsed clamp

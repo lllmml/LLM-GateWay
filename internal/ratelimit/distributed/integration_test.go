@@ -7,8 +7,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,49 +19,50 @@ import (
 // redis:7.4.11-alpine), reached through REDIS_URL (Makefile default
 // redis://127.0.0.1:6379/0). Redis is used as an ephemeral, shared local
 // instance; tests use unique key namespaces and only DEL/UNLINK their own
-// keys - never an unconditional FLUSHDB (ADR-018 D11).
+// keys - never an unconditional FLUSHDB (ADR-018 D11). The helper refuses to
+// run against any Redis that is not the pinned 7.4.11 (P2-2).
 
-// testRedisClient dials the pinned Redis, applies the production retry posture
-// (MaxRetries: -1 disables command retransmission in go-redis v9.22.0 - 0
-// would normalize to the default 3 retries), and closes on cleanup.
+// testRedisClient dials the pinned Redis with the production client posture
+// (MaxRetries: -1, ContextTimeoutEnabled: true) and FAILS when the server is
+// not the pinned 7.4.11.
 func testRedisClient(t *testing.T) *redis.Client {
 	t.Helper()
-	url := os.Getenv("REDIS_URL")
-	if url == "" {
-		t.Fatal("REDIS_URL is required for distributed integration tests (make redis-up)")
-	}
-	options, err := redis.ParseURL(url)
-	if err != nil {
-		t.Fatalf("parse REDIS_URL: %v", err)
-	}
-	options.MaxRetries = -1
-	options.DialTimeout = 2 * time.Second
-	options.ReadTimeout = 2 * time.Second
-	options.WriteTimeout = 2 * time.Second
-	client := redis.NewClient(options)
-	pingCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := client.Ping(pingCtx).Err(); err != nil {
-		client.Close()
-		t.Fatalf("ping pinned Redis %s: %v (run `make redis-up`)", options.Addr, err)
-	}
+	client := pinnedRedisClient(t, func(options *redis.Options) {
+		options.ContextTimeoutEnabled = true
+	})
+	assertPinnedRedisVersion(t, client)
 	t.Cleanup(func() { _ = client.Close() })
 	return client
 }
 
-// newTestLimiter builds a limiter on the shared test Redis with a command
+// assertPinnedRedisVersion fails the test when the reachable Redis is not the
+// pinned Week 9 version.
+func assertPinnedRedisVersion(t *testing.T, client *redis.Client) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	info, err := client.Info(ctx, "server").Result()
+	if err != nil {
+		t.Fatalf("read redis INFO: %v", err)
+	}
+	if !strings.Contains(info, "redis_version:7.4.11") {
+		t.Fatalf("integration tests pin Redis 7.4.11 but REDIS_URL points at an unexpected server:\n%s", info)
+	}
+}
+
+// newTestLimiter builds a limiter core on the shared test Redis with a command
 // timeout generous enough for slow CI.
-func newTestLimiter(t *testing.T, cfg Config) (*Limiter, *redis.Client) {
+func newTestLimiter(t *testing.T, cfg Config) (*Core, *redis.Client) {
 	t.Helper()
 	client := testRedisClient(t)
 	if cfg.CommandTimeout == 0 {
 		cfg.CommandTimeout = 3 * time.Second
 	}
-	limiter, err := New(client, cfg)
+	core, err := New(client, cfg)
 	if err != nil {
-		t.Fatalf("new limiter: %v", err)
+		t.Fatalf("new core: %v", err)
 	}
-	return limiter, client
+	return core, client
 }
 
 func uniqueIDs(t *testing.T) (projectID, keyID string) {

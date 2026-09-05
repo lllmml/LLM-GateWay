@@ -17,3 +17,8 @@ import "context"
 type Limiter interface {
 	Admit(ctx context.Context, keyID, projectID string) (Decision, error)
 }
+
+// Registry implements Limiter with Week 8 in-memory token-bucket semantics.
+// The compile-time assertion keeps the local implementation honest against the
+// seam.
+var _ Limiter = (*Registry)(nil)

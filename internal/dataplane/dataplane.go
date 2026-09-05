@@ -136,9 +136,11 @@ type Options struct {
 	Logger                    *slog.Logger
 
 	// Week 8 Reliability Baseline. All admission controls default to disabled
-	// (nil / 0). RateLimit is the shared in-memory registry (owned by the
-	// caller, closed by the caller); when nil no rate limiting runs.
-	RateLimiter *ratelimit.Registry
+	// (nil / 0). RateLimiter is the admission limiter (local in-memory registry
+	// or, from Week 9 Slice B2 onward, the distributed wrapper); when nil no
+	// rate limiting runs. Dependency failures never escape a Limiter
+	// implementation (ADR-018 D1).
+	RateLimiter ratelimit.Limiter
 	// MaxConcurrentRequests bounds total in-flight chat operations (stream and
 	// non-stream); 0 disables it. MaxConcurrentStreams additionally bounds
 	// in-flight streams; stream requests must satisfy both caps.
@@ -162,7 +164,7 @@ type Service struct {
 	providers                 *provider.Registry
 	logger                    *slog.Logger
 
-	rateLimiter           *ratelimit.Registry
+	rateLimiter           ratelimit.Limiter
 	maxConcurrentRequests int
 	maxConcurrentStreams  int
 	requestSlots          chan struct{}

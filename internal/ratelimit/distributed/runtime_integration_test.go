@@ -4,40 +4,64 @@
 // 7.4.11-alpine stack (ADR-018 D8 mandatory acceptance requirement). These
 // tests pin observable behavior instead of assuming it from configuration:
 //
-//   - Script.Run EVALSHA -> NOSCRIPT -> EVAL fallback executes exactly once;
+//   - the integration helper refuses to run against any Redis whose version is
+//     not the pinned 7.4.11;
+//   - Script.Run EVALSHA -> NOSCRIPT -> EVAL fallback executes exactly once
+//     (unique script body per run so the SHA cannot already be cached);
 //   - MaxRetries normalization: 0 means the DEFAULT 3 retries in go-redis
 //     v9.22.0, -1 disables retries - so the production posture must set -1;
-//   - with retries disabled, a mutating command whose outcome is ambiguous
-//     (server closed after receiving the bytes, no reply) is never
-//     retransmitted: exactly one connection attempt is observed;
-//   - context cancellation surfaces as a context error and is never treated
-//     as a dependency failure by the limiter core (ADR-018 D8);
-//   - a genuinely unreachable Redis with a live parent context surfaces as a
-//     DependencyError for the future degraded wrapper to handle.
+//   - with retries disabled, an ambiguous mutating EVAL (the real Redis
+//     executed it but the reply was dropped by a test-only proxy) is never
+//     retransmitted: exactly one execution and one connection;
+//   - read interruption semantics: with ContextTimeoutEnabled=false (default)
+//     the read is bounded by ReadTimeout (net timeout); with it enabled the
+//     per-command context deadline bounds the read (surfaced as a net timeout
+//     whose source is the context).
 package distributed
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"net"
 	"os"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
+// TestScriptRunEvalshaFallsBackToEvalAndExecutesOnce uses a per-run unique
+// script body (a random nonce inside a Lua comment) so the SHA can never be
+// pre-loaded on the persistent shared Redis: the first Run must take the
+// EVALSHA -> NOSCRIPT -> EVAL path and mutate exactly once (P2-1).
 func TestScriptRunEvalshaFallsBackToEvalAndExecutesOnce(t *testing.T) {
 	client := testRedisClient(t)
 	ctx := context.Background()
 	counterKey := "runtime:" + t.Name() + ":counter"
 	t.Cleanup(func() { _ = client.Del(ctx, counterKey).Err() })
 
-	script := redis.NewScript(`return redis.call('INCR', KEYS[1])`)
-	// Script has never been loaded: EVALSHA must answer NOSCRIPT and go-redis
-	// falls back to EVAL. NOSCRIPT proves the script never executed, so the
-	// fallback is a provably pre-execution path and must execute exactly once.
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("nonce: %v", err)
+	}
+	body := "-- nonce " + hex.EncodeToString(nonce) + "\nreturn redis.call('INCR', KEYS[1])"
+	script := redis.NewScript(body)
+
+	sha := sha1.Sum([]byte(body))
+	shaHex := hex.EncodeToString(sha[:])
+	exists, err := client.ScriptExists(ctx, shaHex).Result()
+	if err != nil {
+		t.Fatalf("script exists: %v", err)
+	}
+	if len(exists) != 1 || exists[0] {
+		t.Fatalf("unique script unexpectedly already cached: %v", exists)
+	}
+
+	// First Run: EVALSHA answers NOSCRIPT (script never executed) so go-redis
+	// falls back to EVAL - a provably pre-execution path - executing once.
 	first, err := script.Run(ctx, client, []string{counterKey}).Int()
 	if err != nil {
 		t.Fatalf("first Run: %v", err)
@@ -45,7 +69,11 @@ func TestScriptRunEvalshaFallsBackToEvalAndExecutesOnce(t *testing.T) {
 	if first != 1 {
 		t.Fatalf("first Run result = %d, want 1 (EVAL executed exactly once)", first)
 	}
-	// Second Run hits the now-cached script via EVALSHA: still one execution.
+	existsAfter, err := client.ScriptExists(ctx, shaHex).Result()
+	if err != nil || len(existsAfter) != 1 || !existsAfter[0] {
+		t.Fatalf("script not cached after Run: %v / %v", existsAfter, err)
+	}
+	// Second Run hits the cached script via EVALSHA: one more mutation.
 	second, err := script.Run(ctx, client, []string{counterKey}).Int()
 	if err != nil {
 		t.Fatalf("second Run: %v", err)
@@ -56,12 +84,7 @@ func TestScriptRunEvalshaFallsBackToEvalAndExecutesOnce(t *testing.T) {
 }
 
 func TestGoRedisMaxRetriesNormalization(t *testing.T) {
-	client := testRedisClient(t)
-	_ = client
-	// go-redis v9.22.0 normalizes MaxRetries in NewClient: 0 (unset) becomes
-	// the default 3; -1 disables retries (documented in options.go and pinned
-	// by these assertions so a config change cannot silently reintroduce
-	// retransmission of ambiguous mutating scripts).
+	testRedisClient(t) // also asserts the pinned server version (P2-2)
 	for _, tc := range []struct {
 		set  int
 		want int
@@ -82,94 +105,13 @@ func TestGoRedisMaxRetriesNormalization(t *testing.T) {
 	}
 }
 
-// swallowServer accepts connections, reads whatever bytes arrive, then closes
-// without ever replying - simulating a Redis that consumed a command whose
-// outcome is ambiguous. It counts accepted connections so retransmission is
-// observable as additional dials.
-type swallowServer struct {
-	listener net.Listener
-	accepted atomic.Int64
-}
-
-func newSwallowServer(t *testing.T) *swallowServer {
-	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	server := &swallowServer{listener: listener}
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			server.accepted.Add(1)
-			go func(conn net.Conn) {
-				buffer := make([]byte, 4096)
-				_, _ = conn.Read(buffer) // wait for at least the command bytes
-				_ = conn.Close()
-			}(conn)
-		}
-	}()
-	t.Cleanup(func() { _ = listener.Close() })
-	return server
-}
-
-func TestZeroRetryNeverRetransmitsAmbiguousCommand(t *testing.T) {
-	server := newSwallowServer(t)
-	client := redis.NewClient(&redis.Options{
-		Addr:         server.listener.Addr().String(),
-		MaxRetries:   -1, // the production posture (0 would mean 3 retries!)
-		DialTimeout:  2 * time.Second,
-		ReadTimeout:  time.Second,
-		WriteTimeout: time.Second,
-	})
-	defer client.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	err := client.Ping(ctx).Err()
-	if err == nil {
-		t.Fatal("ping against a swallowing server unexpectedly succeeded")
-	}
-	// Give any (forbidden) reconnect a moment to appear before asserting.
-	time.Sleep(200 * time.Millisecond)
-	if got := server.accepted.Load(); got != 1 {
-		t.Fatalf("zero-retry client opened %d connections, want exactly 1 (no retransmission)", got)
-	}
-}
-
-func TestDefaultRetryWouldRetransmit(t *testing.T) {
-	server := newSwallowServer(t)
-	client := redis.NewClient(&redis.Options{
-		Addr:         server.listener.Addr().String(),
-		DialTimeout:  2 * time.Second,
-		ReadTimeout:  time.Second,
-		WriteTimeout: time.Second,
-		// MaxRetries unset -> normalized to the go-redis default of 3.
-	})
-	defer client.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = client.Ping(ctx).Err() // error expected; we only observe the retransmission
-	deadline := time.Now().Add(3 * time.Second)
-	for server.accepted.Load() < 2 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if got := server.accepted.Load(); got <= 1 {
-		t.Fatalf("default-retry client opened %d connections, want > 1 (demonstrating why -1 is mandatory)", got)
-	}
-}
-
 func TestAdmitPropagatesParentCancellationNotDependency(t *testing.T) {
-	limiter, _ := newTestLimiter(t, cfgWith(20, 0))
+	core, _ := newTestLimiter(t, cfgWith(20, 0))
 	projectID, keyID := uniqueIDs(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := limiter.Admit(ctx, keyID, projectID)
+	_, err := core.AdmitCore(ctx, keyID, projectID)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled admit error = %v, want context.Canceled", err)
 	}
@@ -180,15 +122,14 @@ func TestAdmitPropagatesParentCancellationNotDependency(t *testing.T) {
 }
 
 func TestAdmitSurfacesDependencyErrorWhenRedisUnreachable(t *testing.T) {
-	// Point at a closed port: command fails while the parent context is live.
 	deadClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", MaxRetries: -1, DialTimeout: 300 * time.Millisecond})
 	defer deadClient.Close()
-	limiter, err := New(deadClient, Config{KeyRPM: 20, IdleTTL: time.Minute, CommandTimeout: 500 * time.Millisecond})
+	core, err := New(deadClient, Config{KeyRPM: 20, IdleTTL: time.Minute, CommandTimeout: 500 * time.Millisecond})
 	if err != nil {
-		t.Fatalf("new limiter: %v", err)
+		t.Fatalf("new core: %v", err)
 	}
 	projectID, keyID := uniqueIDs(t)
-	_, err = limiter.Admit(context.Background(), keyID, projectID)
+	_, err = core.AdmitCore(context.Background(), keyID, projectID)
 	if err == nil {
 		t.Fatal("admit against unreachable redis succeeded")
 	}
@@ -197,42 +138,94 @@ func TestAdmitSurfacesDependencyErrorWhenRedisUnreachable(t *testing.T) {
 	}
 }
 
-func TestCommandReadBoundedByReadTimeoutNotContext(t *testing.T) {
-	// Empirical finding pinned against go-redis v9.22.0: a context deadline does
-	// NOT interrupt an in-flight blocking server reply (DEBUG SLEEP / BLPop).
-	// The effective in-flight bound is the connection ReadTimeout: with a 250ms
-	// ReadTimeout the command fails as a net i/o timeout after ~250ms, never as
-	// context.DeadlineExceeded and never retransmitted with the -1 posture.
-	// Consequence for the production client: ReadTimeout must be set tight
-	// (comparable to the per-command budget), because per-command contexts alone
-	// do not bound hung reads. Recorded in ADR-018's implementation note.
-	options, err := redis.ParseURL(os.Getenv("REDIS_URL"))
-	if err != nil {
-		t.Fatalf("parse REDIS_URL: %v", err)
-	}
-	options.MaxRetries = -1
-	options.ReadTimeout = 250 * time.Millisecond
-	options.WriteTimeout = time.Second
-	options.DialTimeout = time.Second
-	client := redis.NewClient(options)
+// TestContextDoesNotInterruptReadByDefault pins the go-redis default posture:
+// with ContextTimeoutEnabled=false the per-command context does NOT bound an
+// in-flight read - ReadTimeout does (net i/o timeout at ~ReadTimeout, never a
+// context error). This is why the production client must enable
+// ContextTimeoutEnabled (see the next test) OR keep ReadTimeout tight.
+func TestContextDoesNotInterruptReadByDefault(t *testing.T) {
+	client := pinnedRedisClient(t, func(options *redis.Options) {
+		options.ContextTimeoutEnabled = false // default
+		options.ReadTimeout = 300 * time.Millisecond
+	})
 	defer client.Close()
 
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	err = client.Do(ctx, "DEBUG", "SLEEP", "2").Err()
+	err := client.Do(ctx, "DEBUG", "SLEEP", "2").Err()
 	elapsed := time.Since(started)
-	if err == nil {
-		t.Fatal("blocked command unexpectedly succeeded")
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("error = %v: go-redis v9.22.0 read is not interrupted by ctx (documented)", err)
+	if err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v: ctx must NOT interrupt the read in the default mode", err)
 	}
 	if elapsed >= 1500*time.Millisecond {
-		t.Fatalf("read was not bounded by ReadTimeout: %v after %v", err, elapsed)
+		t.Fatalf("read not bounded by ReadTimeout: %v after %v", err, elapsed)
 	}
 	var netErr net.Error
 	if !errors.As(err, &netErr) || !netErr.Timeout() {
 		t.Fatalf("error = %v, want a net timeout from ReadTimeout", err)
 	}
+}
+
+// TestContextInterruptsReadWhenEnabled pins the chosen production posture:
+// with ContextTimeoutEnabled=true the per-command context deadline DOES bound
+// the in-flight read even when ReadTimeout is much longer (~ctx deadline here,
+// 250ms, against a 5s ReadTimeout and a 2s server sleep). Empirically go-redis
+// v9.22.0 surfaces that read abort as a net i/o timeout rather than
+// context.DeadlineExceeded - the crucial observable is WHERE the deadline
+// came from (ctx, not ReadTimeout), which is what the core's per-command
+// CommandTimeout context relies on.
+func TestContextInterruptsReadWhenEnabled(t *testing.T) {
+	client := pinnedRedisClient(t, func(options *redis.Options) {
+		options.ContextTimeoutEnabled = true
+		options.ReadTimeout = 5 * time.Second
+	})
+	defer client.Close()
+
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	err := client.Do(ctx, "DEBUG", "SLEEP", "2").Err()
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("blocked command unexpectedly succeeded")
+	}
+	if elapsed >= 1500*time.Millisecond {
+		t.Fatalf("ctx deadline did not bound the read: %v after %v", err, elapsed)
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Fatalf("read aborted suspiciously early: %v after %v", err, elapsed)
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("error = %v, want a timeout (deadline sourced from ctx, surfaced as net i/o timeout)", err)
+	}
+}
+
+// pinnedRedisClient dials the pinned Redis with explicit options mutations,
+// used by the read-semantics probes.
+func pinnedRedisClient(t *testing.T, mutate func(*redis.Options)) *redis.Client {
+	t.Helper()
+	url := os.Getenv("REDIS_URL")
+	if url == "" {
+		t.Fatal("REDIS_URL is required for distributed integration tests")
+	}
+	options, err := redis.ParseURL(url)
+	if err != nil {
+		t.Fatalf("parse REDIS_URL: %v", err)
+	}
+	options.MaxRetries = -1
+	options.DialTimeout = time.Second
+	options.WriteTimeout = time.Second
+	if mutate != nil {
+		mutate(options)
+	}
+	client := redis.NewClient(options)
+	pingCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := client.Ping(pingCtx).Err(); err != nil {
+		client.Close()
+		t.Fatalf("ping pinned Redis: %v", err)
+	}
+	return client
 }

@@ -54,8 +54,11 @@ local function stage_scope(key, rpm, ttl, now)
     if refill > room then refill = room end
     tokens = tokens + refill
     if tokens > cap then tokens = cap end
-    -- tostring keeps integer values decimal (no scientific-notation drift).
-    redis.call('HSET', key, 't', tostring(tokens), 's', tostring(now))
+    -- Integer Lua numbers are passed to Redis commands directly (NO tostring):
+    -- Redis 7.4.11's Lua bridge serializes integral numbers exactly (verified),
+    -- while Lua tostring uses %.14g and turns e.g. 9007199254740000 into
+    -- 9.00719925474e+15, which HINCRBY then rejects as a non-integer.
+    redis.call('HSET', key, 't', tokens, 's', now)
     if ttl > 0 then redis.call('PEXPIRE', key, ttl) end
     if tokens >= COST then
         return 1, 0
