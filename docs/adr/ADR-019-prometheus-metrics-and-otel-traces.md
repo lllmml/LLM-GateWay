@@ -430,6 +430,45 @@ credential material in any attribute (redaction test).
 | TracerProvider shutdown exceeds budget | `Shutdown` context expires; error logged, process exit status unchanged |
 | Tracing disabled (no endpoint) | noop tracer; zero data-path cost; existing behavior preserved |
 
+## Implementation notes (binding, recorded before Slice A1)
+
+### N1. Gateway-owned telemetry runtime owns the single real Shutdown (A2, binding)
+
+The gateway lifecycle contract must NOT depend on "OTel `TracerProvider.Shutdown`
+is repeatable". A2 introduces a gateway-owned `telemetry.Runtime` (or an
+equivalent gateway-owned object) that owns the real TracerProvider shutdown
+through `sync.Once`, so the underlying provider Shutdown executes **at most
+once**. Roles:
+
+- Tracer created, `App` not yet running, later wiring failure: the `main`
+  fallback cleanup calls `Runtime.Shutdown`; the `sync.Once` executes the one
+  real shutdown.
+- Once `App.Run` starts: the App Run-scope hook (D9) becomes the normal
+  lifecycle cleanup owner and calls the same `Runtime.Shutdown`.
+- Normal path: HTTP drain -> one real telemetry Shutdown -> database close.
+- Partial `listen()`/startup failure also goes through the App Run-scope
+  cleanup (D9), calling the same Once-protected Shutdown.
+- If the bounded Shutdown timeout expires, the telemetry failure is logged and
+  nothing assumes a second (`main` fallback) call can complete an unfinished
+  OTel processor shutdown: the Once already ran, and the processor flush is
+  best-effort by design. The two callers share the one `Runtime` created in
+  `main`; whichever reaches it first performs the single real shutdown.
+
+### N2. pprof never touches `http.DefaultServeMux` (A3, binding)
+
+The `net/http/pprof` package registers its handlers on
+`http.DefaultServeMux` during `init()`. A3 therefore defines the security
+invariant as:
+
+- production servers never use `http.DefaultServeMux` - all planes use their
+  own muxes built in `internal/app`/wiring;
+- Data and Control Plane muxes never mount pprof handlers;
+- the Ops Plane explicitly registers every pprof handler it serves and routes
+  them through the single token-protected handler/mux (D8);
+- tests assert Data/Control mux isolation and the Ops guard, and must NOT
+  write tests claiming `http.DefaultServeMux` itself has no pprof
+  registration (that is false by construction of the standard library).
+
 ## Migration / rollback
 
 - No database migration. `gateway_requests.trace_id` keeps its type/bound;
