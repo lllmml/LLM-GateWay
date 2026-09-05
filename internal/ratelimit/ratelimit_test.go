@@ -415,6 +415,61 @@ func TestConcurrentAdmitSweepEviction(t *testing.T) {
 	}
 }
 
+// tickingClock returns a strictly increasing time on every read (one second
+// per call under a mutex). It models a real monotonic clock: when admissions
+// are serialized and each one snapshots the clock inside the serialization
+// boundary, the timestamps handed to x/time/rate strictly increase.
+type tickingClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *tickingClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(time.Second)
+	return c.t
+}
+
+// TestConcurrentAdmissionsKeepTimestampsSerialized guards the ordering
+// invariant that a limiter's timestamps follow the registry serialization
+// order. Burst 1 with a refill rate of one token per second means every
+// admission must be allowed while snapshots increase strictly: each admission
+// refills the single token from the next tick. If a waiter ever carried a
+// stale pre-lock timestamp into ReserveN after another admission had advanced
+// the limiter, that admission would see no refill and be denied, dropping the
+// allowed count below the goroutine count.
+func TestConcurrentAdmissionsKeepTimestampsSerialized(t *testing.T) {
+	clock := &tickingClock{t: time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)}
+	cfg := testConfig()
+	cfg.KeyRPM = 60 // 1 token/second, burst 1
+	cfg.ProjectRPM = 0
+	cfg.Now = clock.now
+	registry, err := NewRegistry(cfg)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	t.Cleanup(registry.Close)
+
+	const goroutines = 200
+	var wg sync.WaitGroup
+	var allowed atomicCounter
+	for index := 0; index < goroutines; index++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if registry.Admit(testKeyID, testProjID).Allowed {
+				allowed.add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if allowed.get() != goroutines {
+		t.Fatalf("allowed admissions = %d, want %d (a stale timestamp would deny an admission)", allowed.get(), goroutines)
+	}
+}
+
 func TestCloseIsIdempotentAndStopsJanitor(t *testing.T) {
 	registry, err := NewRegistry(func() Config {
 		cfg := testConfig()

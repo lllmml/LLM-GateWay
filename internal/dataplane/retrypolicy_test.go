@@ -53,6 +53,9 @@ func TestIsRetryableGatewayErrorWhitelist(t *testing.T) {
 		{name: "provider 501 not whitelisted", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 501}, want: false},
 		{name: "provider 505 not whitelisted", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 505}, want: false},
 		{name: "provider 508 unknown not whitelisted", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 508}, want: false},
+		{name: "provider redirect 300 not whitelisted", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 300}, want: false},
+		{name: "provider redirect 307 not whitelisted", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 307}, want: false},
+		{name: "provider redirect 308 not whitelisted", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 308}, want: false},
 		{name: "provider 401 must never retry", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 401}, want: false},
 		{name: "provider 402 must never retry", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 402}, want: false},
 		{name: "provider 403 must never retry", err: &GatewayError{Category: provider.ProviderUnavailable, StatusCode: 403}, want: false},
@@ -82,7 +85,7 @@ func TestRetryableProviderStatus(t *testing.T) {
 			t.Fatalf("retryableProviderStatus(%d) = false, want true", status)
 		}
 	}
-	for _, status := range []int{501, 504, 505, 507, 508, 599, 429, 400, 401, 403} {
+	for _, status := range []int{501, 504, 505, 507, 508, 599, 429, 400, 401, 403, 300, 301, 307, 308} {
 		if retryableProviderStatus(status) {
 			t.Fatalf("retryableProviderStatus(%d) = true, want false", status)
 		}
@@ -180,5 +183,60 @@ func TestFormatRetryAfter(t *testing.T) {
 		if strings.HasPrefix(got, "-") {
 			t.Fatalf("formatRetryAfter(%v) emitted a negative header %q", test.duration, got)
 		}
+	}
+}
+
+func TestWaitWithContextCancellationWins(t *testing.T) {
+	t.Run("already cancelled context never waits", func(t *testing.T) {
+		store := &fakeStore{}
+		service := newServiceWithReliability(t, store, map[provider.Name]provider.Client{
+			provider.OpenAI: &retryProbeClient{result: okResult()},
+		}, nil)
+
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		if service.waitWithContext(cancelled, 0) {
+			t.Fatal("waitWithContext returned true for an already-cancelled context")
+		}
+		if service.waitWithContext(cancelled, time.Hour) {
+			t.Fatal("waitWithContext returned true for an already-cancelled context with a long wait")
+		}
+	})
+
+	t.Run("zero wait on a live context fires immediately", func(t *testing.T) {
+		store := &fakeStore{}
+		service := newServiceWithReliability(t, store, map[provider.Name]provider.Client{
+			provider.OpenAI: &retryProbeClient{result: okResult()},
+		}, nil)
+		if !service.waitWithContext(context.Background(), 0) {
+			t.Fatal("waitWithContext returned false for a live context with a zero wait")
+		}
+	})
+}
+
+func TestRetryLoopChecksCancellationAfterWait(t *testing.T) {
+	// The retry loop must not start another paid attempt when the request is
+	// cancelled, even if a wait had already been computed and fired.
+	store, rawKey := newAuthorizedStore(t)
+	client := &retryProbeClient{errors: []error{errProviderUnavailable500()}, result: okResult()}
+	service := newServiceWithReliability(t, store, map[provider.Name]provider.Client{provider.OpenAI: client}, func(options *Options) {
+		options.RetryMaxRetries = 5
+	})
+	// A zero wait makes the wait itself trivially "fire"; the post-wait
+	// cancellation check is what must stop the loop.
+	service.jitter = zeroJitter
+
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err = service.CompleteChat(cancelled, auth, "", chatRequest())
+	if err == nil {
+		t.Fatal("complete chat returned nil error for a cancelled request")
+	}
+	if client.calls != 1 {
+		t.Fatalf("provider calls = %d, want 1 (pre-cancelled request must not retry)", client.calls)
 	}
 }

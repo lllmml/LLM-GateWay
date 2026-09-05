@@ -169,11 +169,19 @@ func (r *Registry) now() time.Time {
 // write lock is held across resolution, reservation and commit-or-cancel, so
 // the two participating entries stay current for the whole operation and a
 // rejected admission cancels every reservation (no token is lost in either
-// scope).
+// scope). The clock snapshot is taken AFTER the lock is acquired: admissions
+// are serialized, so the timestamps supplied to a limiter follow the registry
+// serialization order. Reading the clock before the lock would let a waiter
+// carry a stale (earlier) timestamp into ReserveN/CancelAt after another
+// admission has already advanced the limiter, which would move its accounting
+// time backward and double-count refill.
 func (r *Registry) Admit(keyID, projectID string) Decision {
-	now := r.now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// now is the single snapshot for this admission's creation, lastSeen
+	// refresh, reservation, DelayFrom, and cancellation decisions.
+	now := r.now()
 
 	type limb struct {
 		entry *entry

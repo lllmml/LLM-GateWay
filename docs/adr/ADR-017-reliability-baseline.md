@@ -42,14 +42,20 @@ cancelled.
 Retry only when the attempt failed with an explicit whitelisted condition:
 
 - provider 429 (`ProviderRateLimited` **and** HTTP status 429);
-- provider 429 (`ProviderRateLimited` **and** HTTP status 429);
 - provider transient 5xx / overload statuses (`ProviderUnavailable`) only from
   the explicit list **500, 502, 503, 529** - not any 5xx: unlisted statuses
   such as 501/505 are never replayed, and 401/402/403 (classified
   `ProviderUnavailable` but not transient server failures) never retry;
 - transport failures with no HTTP response at all
   (`ProviderUnavailable`, status 0) whose error chain proves the request never
-  reached the provider: a dial-phase `net.OpError` or a `net.DNSError`.
+  reached the provider: a dial-phase `net.OpError` or a `net.DNSError`. This
+  "proves pre-provider" argument holds only because automatic provider
+  redirects are disabled (every adapter default and the shared
+  `main.go` client return `http.ErrUseLastResponse`): a provider POST is never
+  transparently re-sent to a redirect target, so a redirect-chain dial/DNS
+  failure cannot masquerade as a safe pre-provider transport error. A real 3xx
+  is returned to the adapter, classified with its 3xx status, and is not in
+  the whitelist, so it never retries.
 
 Never retried: provider 401/402/403, provider-invalid-request 4xx,
 `ProviderTimeout` (including 408/504 and context timeouts classified as such),
@@ -116,10 +122,15 @@ the commit-both or `CancelAt(now)`-both step. This is the simplest
 lock-ordered (registry -> entry) way to keep both participating entries
 current for the entire operation: no sweep or eviction can detach a limb
 mid-admission, so an admission can never consume quota on a limiter the
-registry has already replaced with a full bucket. A rejected admission
-consumes nothing in either scope. Retry-After for a rejection is the maximum
-reservation delay and the binding scope (`virtual_key` or `project`) is
-reported for operational visibility.
+registry has already replaced with a full bucket. The clock snapshot is taken
+after the lock is acquired, so the timestamps supplied to a limiter follow the
+registry serialization order and can never move `x/time/rate` accounting time
+backward. This is a correctness-first trade-off: in-process limiter admissions
+are serialized under one short registry critical section. It can be revisited
+only if later benchmarks show that this section becomes a contention point.
+A rejected admission consumes nothing in either scope. Retry-After for a
+rejection is the maximum reservation delay and the binding scope
+(`virtual_key` or `project`) is reported for operational visibility.
 
 ### D7. Bounded limiter registry lifecycle
 

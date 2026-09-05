@@ -12,10 +12,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
+	"github.com/lllmml/production-go-llm-gateway/internal/provider/openai"
 	"github.com/lllmml/production-go-llm-gateway/internal/ratelimit"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
 )
@@ -365,21 +367,20 @@ func TestClientCancellationStopsRetriesDuringBackoff(t *testing.T) {
 		options.RetryMaxRetries = 5
 	})
 	// A fixed non-trivial wait that still fits the ~1s phase budget, so the
-	// retry loop provably blocks in its backoff wait before any cancellation.
+	// retry loop provably reaches its backoff-wait decision before any
+	// cancellation.
 	service.jitter = func(int64) int64 { return int64(900 * time.Millisecond) }
 
-	// Synchronize on the loop entering the wait instead of sleeping and
-	// guessing: the hook fires immediately before waitWithContext blocks.
-	enteredBackoff := make(chan struct{})
-	var once sync.Once
-	service.onRetryWait = func() {
-		once.Do(func() { close(enteredBackoff) })
-	}
+	// Cancel synchronously inside the onRetryWait hook, which fires exactly at
+	// the wait boundary: the loop is provably past its retry decision and
+	// about to block, and waitWithContext must refuse to wait for a cancelled
+	// request instead of sleeping.
+	hookRan := false
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		<-enteredBackoff
+	service.onRetryWait = func() {
+		hookRan = true
 		cancel()
-	}()
+	}
 
 	auth, err := service.Authenticate(context.Background(), rawKey)
 	if err != nil {
@@ -388,6 +389,9 @@ func TestClientCancellationStopsRetriesDuringBackoff(t *testing.T) {
 	_, _, err = service.CompleteChat(ctx, auth, "", chatRequest())
 	if err == nil {
 		t.Fatal("complete chat returned nil error after cancellation")
+	}
+	if !hookRan {
+		t.Fatal("retry loop never reached its backoff-wait boundary")
 	}
 	if client.calls != 1 {
 		t.Fatalf("provider calls = %d, want 1 (cancellation during backoff must not retry)", client.calls)
@@ -1026,4 +1030,64 @@ func chatHTTPRequest(rawKey string) *http.Request {
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+rawKey)
 	return request
+}
+
+// redirectBaseURLStore wraps an authorized fake store and forces every
+// resolved credential to point at the httptest redirecting provider.
+type redirectBaseURLStore struct {
+	*fakeStore
+	override string
+}
+
+func (s *redirectBaseURLStore) ResolveProviderCredential(ctx context.Context, projectID string, name provider.Name) (ProviderCredential, error) {
+	credential, err := s.fakeStore.ResolveProviderCredential(ctx, projectID, name)
+	if err != nil {
+		return ProviderCredential{}, err
+	}
+	credential.BaseURLOverride = s.override
+	return credential, nil
+}
+
+// TestRedirectChainDialFailureIsNotRetriedAsPreProviderFailure exercises the
+// real OpenAI adapter through the service: the redirecting provider returns a
+// 307 to a target that would fail to dial. With redirects disabled the 3xx is
+// classified as a real HTTP status (307, provider_unavailable), which is not
+// in the retry whitelist, so the executor runs exactly one attempt even with
+// retries enabled - it never treats a redirect-chain dial error as a safe
+// pre-provider failure.
+func TestRedirectChainDialFailureIsNotRetriedAsPreProviderFailure(t *testing.T) {
+	var posts atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		posts.Add(1)
+		response.Header().Set("Location", "http://127.0.0.1:1/nowhere") // would fail to dial if followed
+		response.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+
+	baseStore, rawKey := newAuthorizedStore(t)
+	store := &redirectBaseURLStore{fakeStore: baseStore, override: server.URL}
+	openAIClient := openai.New(openai.NewHTTPClient())
+	service := newServiceWithReliability(t, store, map[provider.Name]provider.Client{provider.OpenAI: openAIClient}, func(options *Options) {
+		options.RetryMaxRetries = 5
+	})
+	service.jitter = zeroJitter
+
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	_, record, err := service.CompleteChat(context.Background(), auth, "", chatRequest())
+	gatewayErr, ok := err.(*GatewayError)
+	if !ok || gatewayErr.Category != provider.ProviderUnavailable {
+		t.Fatalf("error = %#v, want provider_unavailable", err)
+	}
+	if gatewayErr.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("gateway status = %d, want 307 (real 3xx classification, not a dial error)", gatewayErr.StatusCode)
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("provider POSTs = %d, want exactly 1 (redirect not followed, no replay)", posts.Load())
+	}
+	if int(record.RetryCount) != 0 || int(store.lastFinalize.RetryCount) != 0 {
+		t.Fatalf("retry count record=%d persisted=%d, want 0 (3xx is not retryable)", record.RetryCount, store.lastFinalize.RetryCount)
+	}
 }

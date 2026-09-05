@@ -84,8 +84,17 @@ func run() error {
 	openAITransport := openai.NewTransport()
 	defer openAITransport.CloseIdleConnections()
 	// One long-lived transport is shared by every provider adapter; no
-	// transport or client is ever created per request.
-	providerHTTPClient := &http.Client{Transport: openAITransport}
+	// transport or client is ever created per request. Automatic redirect
+	// following is disabled (same policy as every adapter default) so a
+	// provider POST is never transparently replayed to a redirect target and a
+	// redirect-chain dial/DNS failure can never masquerade as a safe
+	// pre-provider transport error eligible for retry.
+	providerHTTPClient := &http.Client{
+		Transport: openAITransport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	providerRegistry, err := provider.NewRegistry(map[provider.Name]provider.Client{
 		provider.OpenAI:    openai.New(providerHTTPClient),
 		provider.DeepSeek:  deepseek.New(providerHTTPClient),

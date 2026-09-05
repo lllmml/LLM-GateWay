@@ -356,7 +356,10 @@ func (s *Service) completeChat(ctx context.Context, auth AuthContext, traceID st
 		if s.onRetryWait != nil {
 			s.onRetryWait()
 		}
-		if !s.waitWithContext(ctx, *wait) {
+		// Cancellation is checked again after the wait returns: even if the
+		// timer won the select, a cancelled request must not start another
+		// paid attempt.
+		if !s.waitWithContext(ctx, *wait) || ctx.Err() != nil {
 			break
 		}
 		retryCount++
@@ -478,7 +481,10 @@ func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID stri
 		if s.onRetryWait != nil {
 			s.onRetryWait()
 		}
-		if !s.waitWithContext(ctx, *wait) {
+		// Cancellation is checked again after the wait returns: even if the
+		// timer won the select, a cancelled request must not start another
+		// paid stream-open attempt.
+		if !s.waitWithContext(ctx, *wait) || ctx.Err() != nil {
 			break
 		}
 		retryCount++
@@ -688,13 +694,19 @@ func retryBackoffWindow(base, max time.Duration, retryCount int) time.Duration {
 }
 
 func (s *Service) waitWithContext(ctx context.Context, duration time.Duration) bool {
+	// Cancellation wins semantically even if the timer case were selected: an
+	// already-cancelled request never waits, and a timer that fires at the
+	// same moment as ctx.Done() is treated as cancelled.
+	if ctx.Err() != nil {
+		return false
+	}
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return false
 	case <-timer.C:
-		return true
+		return ctx.Err() == nil
 	}
 }
 
