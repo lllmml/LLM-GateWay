@@ -6,10 +6,15 @@ import (
 	"net/http"
 )
 
-func (a *App) opsHandler() http.Handler {
+func (a *App) opsHandler(metricsHandler http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", a.handleLiveness)
 	mux.HandleFunc("GET /health/ready", a.handleReadiness)
+	// Metrics live on the private Operations Plane only (ADR-019 D2); the
+	// data and control plane muxes never mount them.
+	if metricsHandler != nil {
+		mux.Handle("GET /metrics", metricsHandler)
+	}
 	return mux
 }
 

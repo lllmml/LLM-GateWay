@@ -35,6 +35,11 @@ type Options struct {
 	DataPlaneHandler    http.Handler
 	ControlPlaneHandler http.Handler
 
+	// MetricsHandler, when non-nil, is mounted at GET /metrics on the private
+	// Operations Plane only (ADR-019 D2). The data and control planes never
+	// serve it; wiring owns that isolation.
+	MetricsHandler http.Handler
+
 	// listeners, when non-empty, is a test seam: the three pre-bound
 	// listeners are used instead of binding DataPlaneAddr / ControlPlaneAddr /
 	// OpsAddr (in that order). Production callers never set it, so real
@@ -78,7 +83,7 @@ func New(options Options, database Database, logger *slog.Logger) *App {
 	}
 	application.dataPlaneServer = newDataPlaneServer(options.DataPlaneAddr, options.DataPlaneHandler)
 	application.controlPlaneServer = newControlPlaneServer(options.ControlPlaneAddr, options.ControlPlaneHandler)
-	application.opsServer = newOpsServer(options.OpsAddr, application.opsHandler())
+	application.opsServer = newOpsServer(options.OpsAddr, application.opsHandler(options.MetricsHandler))
 	return application
 }
 
