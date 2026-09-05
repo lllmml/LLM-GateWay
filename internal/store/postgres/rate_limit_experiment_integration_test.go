@@ -392,6 +392,12 @@ func TestReplicaRateLimitInconsistencyHTTPLevel(t *testing.T) {
 	if providerCallsTotal <= experimentLimitRPM {
 		t.Fatalf("mock provider calls = %d, want > %d to demonstrate cluster over-admission", providerCallsTotal, experimentLimitRPM)
 	}
+	// Durable-row assertion (ADR-017 D8): every admitted request creates exactly
+	// one gateway_requests row. If any of the 24 admitted requests failed to
+	// persist or any rejected request had leaked a row, this fails.
+	if rows != experimentTotal {
+		t.Fatalf("durable gateway_requests rows = %d, want exactly %d", rows, experimentTotal)
+	}
 }
 
 // TestReplicaRateLimitSingleReplicaControl is the Week 9 Slice A control: the
@@ -449,5 +455,11 @@ func TestReplicaRateLimitSingleReplicaControl(t *testing.T) {
 	}
 	if providerCallsTotal != experimentControlOK {
 		t.Fatalf("mock provider calls = %d, want exactly %d", providerCallsTotal, experimentControlOK)
+	}
+	// Durable-row assertion (ADR-017 D8): the 4 rejected requests must have
+	// produced NO durable row, so the total must be exactly the 20 admitted
+	// requests. If a rate-limit rejection ever leaked a row, this fails.
+	if rows != experimentControlOK {
+		t.Fatalf("durable gateway_requests rows = %d, want exactly %d", rows, experimentControlOK)
 	}
 }

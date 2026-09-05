@@ -47,12 +47,24 @@ independent ratelimit.Registry   independent ratelimit.Registry   (per-process s
               +---- shared deterministic mock provider (single httptest OpenAI-compatible endpoint)
 ```
 
-Two complete gateway replicas (Service + Handler + HTTP server each) share one
-real PostgreSQL schema and one mock provider endpoint; only the rate-limit
-quota state is duplicated, exactly the production situation Redis would fix.
-The real OpenAI adapter is used end to end; the provider config row's
-`base_url_override` column points at the shared mock endpoint (test-only, via
-the store query layer - no public API and no production base-URL change).
+Two independent Gateway HTTP/Service stacks model two replicas at the
+HTTP + limiter-state boundary. Each stack owns its own in-memory
+`ratelimit.Registry` (independent per-key quota state), while PostgreSQL and
+the deterministic mock provider are shared. The real OpenAI adapter is used
+end to end; the provider config row's `base_url_override` column points at the
+shared mock endpoint (test-only, via the store query layer - no public API and
+no production base-URL change).
+
+Fidelity note: the two stacks run in one Go OS process and share the
+non-limiter test dependencies (PostgreSQL Store, provider registry/client
+wiring, mock provider). This experiment therefore demonstrates the correctness
+problem caused by **duplicated local limiter state** (independent registries
+-> duplicated quota -> cluster over-admission); it does NOT claim to reproduce
+OS-process isolation, network boundaries, or production reverse-proxy
+behavior. That is exactly the property Phase B needs to show: a single shared
+coordinator (Redis) must replace the duplicated in-process state for the
+cluster to enforce one quota. It is not an exercise in process/network
+isolation.
 
 ### Determinism
 
@@ -110,19 +122,37 @@ PostgreSQL dependency.
 
 ## Decision (PENDING - gated on owner review of the evidence above)
 
-This section is intentionally not filled in. Once the project owner accepts the
-Slice A evidence and opens the gate, this ADR will be extended (before any
-Slice B code) with:
+This section is intentionally not filled in. The transition order agreed with
+the project owner is:
+
+1. Slice A evidence/code review passes;
+2. the Evidence/Decision Gate opens;
+3. the Redis go/no-go decision is recorded here;
+4. the already-approved Slice B architecture and failure policy are recorded
+   here (limiter interface, Lua composite admission, Redis TIME as the
+   authoritative limiter clock, integer fixed-point accounting with Lua
+   exact-integer bounds, key namespace, degraded state machine, emergency
+   limiter as a bounded fallback rather than an exact global quota during
+   partition, recovery, cancellation vs dependency-failure semantics, and the
+   standalone-Redis scope note), together with the three mandatory
+   implementation invariants listed below;
+5. **ADR-018 becomes Accepted** - Accepted happens BEFORE Slice B
+   implementation begins, not after Slice B lands;
+6. only then may Slice B implementation start (and if implementation finds a
+   design deviation, this ADR is amended with the reason recorded).
+
+Items to record when the gate opens:
 
 1. The go/no-go outcome and the scope of Slice B (Redis distributed limiter +
    degraded local emergency limiter + Redis failure tests).
-2. The Redis design and failure-policy decisions recorded in Slice B (limiter
-   interface, Lua composite admission, Redis TIME as the authoritative limiter
-   clock, integer fixed-point accounting, key namespace, degraded state
-   machine, emergency limiter derivation, recovery, and the standalone-Redis
-   scope note).
-3. The three mandatory Slice B implementation invariants agreed at direction
-   approval time (also recorded in MEMORY.md):
+2. The Redis design and failure-policy decisions (limiter interface, Lua
+   composite admission, Redis TIME as the authoritative limiter clock, integer
+   fixed-point accounting with Lua exact-integer bounds, key namespace,
+   degraded state machine, emergency limiter as a bounded fallback rather than
+   an exact global quota during partition, recovery, cancellation vs
+   dependency-failure semantics, and the standalone-Redis scope note).
+3. The three mandatory Slice B implementation invariants (also recorded in
+   MEMORY.md):
    - limiter logical time must never move backwards
      (`effective_now_ms = max(redis_now_ms, stored_last_ms)`); Redis image/
      version pinned at gate time with an integration test proving `TIME` +
@@ -138,5 +168,3 @@ Slice B code) with:
      the Lua exact-integer range, with boundary tests (max accepted RPM,
      one-above rejected at config load, no precision drift on large elapsed,
      integer retry-after ceil, no negative/over-cap tokens).
-4. When Slice B lands, this ADR becomes Accepted with
-   Context -> Evidence -> Decision -> Redis design -> failure policy.
