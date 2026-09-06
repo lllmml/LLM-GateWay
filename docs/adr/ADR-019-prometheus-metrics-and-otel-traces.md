@@ -29,6 +29,11 @@
   and A2c (exporter-failure isolation + lifecycle) are implemented and merged
   after owner review of each slice; implementation status is recorded in the
   Evidence section below.
+- 2026-09-06: Week 10 A3 (local self-hosted observability stack) slices A3a
+  (collector + tempo + trace round trip), A3b (Prometheus + Grafana
+  provisioning), and A3c (full metrics evidence + dashboard provisioning +
+  runbook) are implemented and merged after owner review; protected pprof
+  (A3d) remains.
 
 ## Context
 
@@ -538,12 +543,26 @@ Completed:
   or block the request path, shutdown stays bounded under failure, cancelled
   requests end every started span, and the batch processor leaves no goroutine
   behind after shutdown (`-race`).
+- **Local observability stack (Slices A3a-A3c)**: docker compose services for
+  `otel-collector` (contrib image, pinned), `tempo`, `prometheus`, and
+  `grafana` with all host ports on `127.0.0.1`; the collector runs a traces
+  pipeline (OTLP gRPC/HTTP -> batch -> otlp/tempo) while metrics stay in the
+  Prometheus pull model (never pushed, never through the Collector); Grafana
+  auto-provisions Prometheus + Tempo datasources and a minimal Gateway
+  Overview dashboard. Live evidence: OTLP export -> Collector -> Tempo query
+  API round trip passes; a real gateway request increments
+  `gateway_requests_total` visible through the Prometheus API and the Grafana
+  Prometheus datasource, and the provisioned dashboard is importable
+  (`make observability-evidence`, `make observability-metrics-evidence`).
+  Runbook: `docs/observability-runbook.md`.
 
-Deferred (not part of A2):
+Deferred after A3c:
 
-- Collector deployment (Slice A3 local Docker Compose observability stack).
-- Tempo / Grafana dashboards and request-UI trace deep links (later Week 10
-  slices).
+- Protected pprof on the Ops plane (`PPROF_ENABLED` / `PPROF_TOKEN`, A3d).
+- Collector in-container health check inside `observability-up` (distroless
+  images have no shell; readiness is currently host-side), and an
+  `observability-down` stop/down naming review.
+- Richer Grafana dashboards and request-UI trace deep links.
 
 ## Reopen triggers
 

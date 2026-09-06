@@ -28,7 +28,8 @@ endif
 	typecheck typecheck-backend typecheck-web format lint lint-backend lint-web \
 	build build-backend build-web integration race bench generate \
 	postgres-up postgres-down redis-up redis-stop migrate-version migrate-up migrate-down-one \
-	observability-up observability-down observability-ps observability-evidence
+	observability-up observability-down observability-ps observability-evidence \
+	observability-metrics-evidence
 
 bootstrap: $(MIGRATE) $(SQLC) web-install
 	@command -v $(GO) >/dev/null
@@ -154,6 +155,12 @@ observability-ps:
 # Gateway-style OTLP gRPC export -> Collector -> Tempo -> Tempo query API.
 observability-evidence: observability-up
 	$(GO) test -tags=integration ./internal/telemetry/ -run '^TestLiveOTLPTraceRoundTrip$$' -count=1 -v
+
+# Proves the metrics path end to end: a real request through the running
+# gateway -> gateway_requests_total -> Prometheus query -> Grafana datasource
+# and the auto-provisioned dashboard. Orchestrated by the evidence script.
+observability-metrics-evidence:
+	/bin/sh scripts/observability-metrics-evidence.sh "$(GO)"
 
 migrate-version:
 	$(MIGRATE) -database '$(DATABASE_URL)' -path db/migrations version

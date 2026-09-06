@@ -20,5 +20,8 @@ datasources:
     editable: false
     jsonData:
       httpMethod: GET
+      # Future-ready only: no span metrics / service graph panels exist yet, so
+      # tracesToMetrics currently has no consumer. Kept to avoid a migration
+      # when such panels are added later.
       tracesToMetrics:
         datasourceUid: prometheus

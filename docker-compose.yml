@@ -77,13 +77,14 @@ services:
       - "host.docker.internal:host-gateway"
 
   # Grafana with datasource provisioning only (dashboards deferred to a later
-  # slice). Admin credentials are local-dev only and never appear in
-  # .env.example. host port 3001 avoids common :3000 clashes.
+  # slice; the gateway overview below is the minimal evidence dashboard).
+  # Admin credentials are local-dev only (env interpolation, no committed
+  # secret value) and never appear in .env.example.
   grafana:
     image: grafana/grafana:13.2.1
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
       GF_AUTH_ANONYMOUS_ENABLED: "false"
     ports:
       - "127.0.0.1:3001:3000"
