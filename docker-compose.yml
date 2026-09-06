@@ -34,5 +34,35 @@ services:
       timeout: 2s
       retries: 20
 
+  # Week 10 A3a local observability stack (ADR-019 D10). The Gateway runs on
+  # the host during local development; collector/tempo/prometheus/grafana live
+  # here. All host-published ports bind 127.0.0.1 only. The images are
+  # distroless (no shell/wget), so these services carry NO in-container
+  # HEALTHCHECK; readiness is verified host-side (Tempo /ready plus the real
+  # trace round-trip in `make observability-evidence`).
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.160.0
+    command: ["--config", "/etc/otelcol/config.yaml"]
+    ports:
+      # Host Gateway OTLP gRPC export (dev-only; bind 127.0.0.1).
+      - "127.0.0.1:4317:4317"
+    volumes:
+      - ./deploy/observability/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      tempo:
+        condition: service_started
+
+  tempo:
+    image: grafana/tempo:2.10.8
+    command: ["-config.file=/etc/tempo.yaml"]
+    ports:
+      # Query API: Grafana reaches it over the internal network; the host
+      # binding is for A3a evidence and the integration test (127.0.0.1).
+      - "127.0.0.1:3200:3200"
+    volumes:
+      - ./deploy/observability/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+
 volumes:
   postgres-data:
+  tempo-data:

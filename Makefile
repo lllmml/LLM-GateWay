@@ -27,7 +27,8 @@ endif
 .PHONY: bootstrap web-install dev dev-backend dev-web test test-backend test-web test-dev-supervisor \
 	typecheck typecheck-backend typecheck-web format lint lint-backend lint-web \
 	build build-backend build-web integration race bench generate \
-	postgres-up postgres-down redis-up redis-stop migrate-version migrate-up migrate-down-one
+	postgres-up postgres-down redis-up redis-stop migrate-version migrate-up migrate-down-one \
+	observability-up observability-down observability-ps observability-evidence
 
 bootstrap: $(MIGRATE) $(SQLC) web-install
 	@command -v $(GO) >/dev/null
@@ -125,6 +126,29 @@ redis-up:
 
 redis-stop:
 	$(COMPOSE) stop redis
+
+# Week 10 A3a local observability stack (ADR-019 D10). Services are distroless
+# (no in-container healthcheck), so observability-up brings them up and then
+# polls Tempo's /ready host-side before returning; the real collector->Tempo
+# trace round-trip is proven by observability-evidence.
+observability-up:
+	$(COMPOSE) up -d --wait otel-collector tempo
+	@for i in $$(seq 1 60); do \
+		if curl -fsS http://127.0.0.1:3200/ready >/dev/null 2>&1; then exit 0; fi; \
+		sleep 1; \
+	done; \
+	echo 'Tempo /ready did not respond within 60s' >&2; exit 1
+
+observability-down:
+	$(COMPOSE) stop otel-collector tempo
+
+observability-ps:
+	$(COMPOSE) ps
+
+# Proves the traces path end to end against the running local stack:
+# Gateway-style OTLP gRPC export -> Collector -> Tempo -> Tempo query API.
+observability-evidence: observability-up
+	$(GO) test -tags=integration ./internal/telemetry/ -run '^TestLiveOTLPTraceRoundTrip$$' -count=1 -v
 
 migrate-version:
 	$(MIGRATE) -database '$(DATABASE_URL)' -path db/migrations version
