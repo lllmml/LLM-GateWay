@@ -46,12 +46,9 @@ type Runtime struct {
 	// shutdownMu serializes the shutdown ownership handoff: the first caller
 	// claims ownership under the lock; later callers observe ownership and
 	// return nil immediately - they never re-run the cleanup and never wait
-	// for the owning attempt to finish. shutdownDone is closed by the owning
-	// caller once its real cleanup has finished.
+	// for the owning attempt to finish.
 	shutdownMu    sync.Mutex
 	shutdownOwned bool
-	shutdownDone  chan struct{}
-	shutdownErr   error
 }
 
 // NewRuntime creates the gateway tracing runtime. A blank endpoint returns a
@@ -100,9 +97,6 @@ func NewRuntime(endpoint, serviceName string) (*Runtime, error) {
 }
 
 func (r *Runtime) withTracer() *Runtime {
-	if r.shutdownDone == nil {
-		r.shutdownDone = make(chan struct{})
-	}
 	r.tracer = r.provider.Tracer(serviceTracerName)
 	return r
 }
@@ -129,7 +123,7 @@ func (r *Runtime) Tracer() trace.Tracer {
 // explicit, non-blocking concurrency semantics. The FIRST caller owns the
 // cleanup attempt and runs the underlying provider shutdown under the
 // supplied bounded context; that call's error (if any) is returned to that
-// caller only, and completion is signaled by closing shutdownDone.
+// caller only.
 //
 // Every other caller - before, during, or after that attempt - returns nil
 // immediately: it never re-runs the cleanup and never waits for the owner to
@@ -147,14 +141,9 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 	r.shutdownOwned = true
 	r.shutdownMu.Unlock()
 
-	// This caller owns the single real shutdown attempt.
-	shutdownErr := r.shutdown(ctx)
-
-	r.shutdownMu.Lock()
-	r.shutdownErr = shutdownErr
-	r.shutdownMu.Unlock()
-	close(r.shutdownDone)
-	return shutdownErr
+	// This caller owns the single real shutdown attempt; its error is returned
+	// to that caller only and is never stored on the Runtime.
+	return r.shutdown(ctx)
 }
 
 func parseOTLPEndpoint(raw string) (hostPort string, insecure bool, err error) {
