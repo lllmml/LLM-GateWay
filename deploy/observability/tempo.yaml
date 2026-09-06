@@ -12,6 +12,9 @@ distributor:
     otlp:
       protocols:
         grpc:
+          # Collector -> Tempo on the private compose network only. This port
+          # is deliberately NOT published to the host: the host Gateway sends
+          # OTLP to the Collector (127.0.0.1:4317), never directly to Tempo.
           endpoint: 0.0.0.0:4317
 
 storage:

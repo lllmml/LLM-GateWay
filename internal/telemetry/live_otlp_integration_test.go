@@ -5,6 +5,11 @@
 // collector and Tempo running on 127.0.0.1:4317 / :3200. This is the
 // "compose healthy but traces lost" guard: the test only passes when a real
 // span exported over OTLP gRPC is queryable through the Tempo API.
+//
+// The test relies on the Tempo 2.10.x HTTP API contract
+// (grafana/tempo:2.10.8): GET /api/traces/{traceID} returns the trace once
+// ingested and 404 until then. If the pinned Tempo image is bumped,
+// re-verify this contract on that version.
 package telemetry
 
 import (
