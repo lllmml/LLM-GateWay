@@ -259,10 +259,9 @@ func TestInvalidProviderAndStatusInputsAreIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new metrics: %v", err)
 	}
+	// Invalid provider/status inputs must never create provider-labeled series.
 	metrics.ObserveRequest("gemini", "anything", false, "succeeded", time.Millisecond)
 	metrics.ObserveRequest("openai", "gpt-x", false, "not-a-real-status", time.Millisecond)
-	metrics.TrackInFlight("gemini", false)
-	metrics.TrackInFlight("openai", false)()
 
 	families := gatherFamilies(t, metrics)
 	if _, ok := families[metricRequestsTotal]; ok {
@@ -271,8 +270,40 @@ func TestInvalidProviderAndStatusInputsAreIgnored(t *testing.T) {
 	if _, ok := families[metricRequestDuration]; ok {
 		t.Fatal("invalid provider/status inputs created a duration series")
 	}
+	if _, ok := families[metricActiveStreams]; ok {
+		t.Fatal("invalid provider/status inputs created an active_streams series")
+	}
 	if activeGaugeValue(t, families) != 0 {
-		t.Fatal("invalid provider leaked into the active gauge")
+		t.Fatal("active gauge changed before TrackInFlight")
+	}
+
+	// ADR-019 D4 (review fix): a post-admission operation whose provider is
+	// not a supported namespace still counts against the unlabeled
+	// gateway_active_requests gauge; it must never create a provider-labeled
+	// series.
+	release := metrics.TrackInFlight("gemini", false)
+	families = gatherFamilies(t, metrics)
+	if activeGaugeValue(t, families) != 1 {
+		t.Fatalf("active requests after TrackInFlight(unknown, non-stream) = %v, want 1", activeGaugeValue(t, families))
+	}
+	release()
+	families = gatherFamilies(t, metrics)
+	if activeGaugeValue(t, families) != 0 {
+		t.Fatalf("active requests after release = %v, want 0", activeGaugeValue(t, families))
+	}
+
+	streamRelease := metrics.TrackInFlight("gemini", true)
+	families = gatherFamilies(t, metrics)
+	if activeGaugeValue(t, families) != 1 {
+		t.Fatalf("active requests after TrackInFlight(unknown, stream) = %v, want 1", activeGaugeValue(t, families))
+	}
+	if _, ok := families[metricActiveStreams]; ok {
+		t.Fatal("unknown provider created a provider-labeled active_streams series")
+	}
+	streamRelease()
+	families = gatherFamilies(t, metrics)
+	if activeGaugeValue(t, families) != 0 {
+		t.Fatalf("active requests after stream release = %v, want 0", activeGaugeValue(t, families))
 	}
 }
 

@@ -144,24 +144,30 @@ func (m *Metrics) ObserveRequest(providerName, model string, stream bool, status
 	m.requestDuration.WithLabelValues(providerName, streamValue).Observe(duration.Seconds())
 }
 
-// TrackInFlight increments the active request gauge (and, for streaming
-// requests, the active streams gauge labeled by provider) and returns a
-// release function that decrements both exactly once. Callers defer the
-// release in the same request lifecycle as the admission slot release, after
-// the durable terminal state has been determined (ADR-019 D4).
+// TrackInFlight increments the unlabeled gateway_active_requests gauge for
+// every chat operation that passed admission (ADR-019 D4). The unlabeled gauge
+// must count every admitted operation - including one whose provider turns out
+// to be unconfigured after admission - so it never depends on provider
+// validity. For streaming requests it additionally increments
+// gateway_active_streams{provider}, which IS provider-bounded and only counts
+// valid supported providers: a raw or unknown provider name is never a label.
+// The returned release function decrements exactly once (sync.Once); callers
+// defer it in the same request lifecycle as the admission slot release, after
+// the durable terminal state has been determined.
 func (m *Metrics) TrackInFlight(providerName string, stream bool) func() {
-	if m == nil || !validProvider(providerName) {
+	if m == nil {
 		return func() {}
 	}
+	trackStream := stream && validProvider(providerName)
 	m.activeRequests.Inc()
-	if stream {
+	if trackStream {
 		m.activeStreams.WithLabelValues(providerName).Inc()
 	}
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			m.activeRequests.Dec()
-			if stream {
+			if trackStream {
 				m.activeStreams.WithLabelValues(providerName).Dec()
 			}
 		})
@@ -178,10 +184,12 @@ func validProvider(name string) bool {
 }
 
 // modelFamily maps a model string to a bounded product family per provider
-// (ADR-019 D5). The explicit table below is derived from the seed-catalog
-// families; anything unmapped resolves to the bounded "other" fallback, so an
-// arbitrary or adversarial model string can never become a high-cardinality
-// label value.
+// (ADR-019 D5). The families form a curated, finite observability taxonomy for
+// the supported provider namespaces, decoupled from the pricing seed catalog:
+// anything unmapped resolves to the bounded "other" fallback, so an arbitrary
+// or adversarial model string can never become a high-cardinality label value.
+// Adding a new family (or provider) is an explicit, reviewed extension - never
+// automatic.
 func modelFamily(providerName, model string) string {
 	model = strings.TrimSpace(model)
 	switch providerName {

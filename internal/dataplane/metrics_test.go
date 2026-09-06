@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -272,6 +274,118 @@ func TestMetricsStreamCompletesAndReleasesActiveStreamGauge(t *testing.T) {
 	}
 }
 
+func TestMetricsCancellationAfterAdmissionReleasesActiveGauge(t *testing.T) {
+	metrics, err := telemetry.NewMetrics()
+	if err != nil {
+		t.Fatalf("new metrics: %v", err)
+	}
+	store, rawKey := newAuthorizedStore(t)
+	client := &blockingCompleteClient{started: make(chan struct{}), release: make(chan struct{})}
+	service := newMetricsService(t, store, client, metrics)
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := service.CompleteChat(ctx, auth, "", provider.ChatRequest{
+			Model:    "openai/gpt-test",
+			Messages: []provider.Message{{Role: "user", Content: "hello"}},
+		})
+		done <- err
+	}()
+	<-client.started // admitted and blocked inside the provider call
+	families := gatherDataPlaneMetrics(t, metrics)
+	if activeRequestGauge(t, families) != 1 {
+		t.Fatalf("active requests while blocked = %v, want 1", activeRequestGauge(t, families))
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("cancelled in-flight request unexpectedly succeeded")
+	}
+	families = gatherDataPlaneMetrics(t, metrics)
+	if activeRequestGauge(t, families) != 0 {
+		t.Fatalf("active requests after cancellation = %v, want 0 (ADR-019 D4 exactly-once)", activeRequestGauge(t, families))
+	}
+}
+
+func TestMetricsPostAdmissionCredentialErrorReleasesGaugeWithoutRow(t *testing.T) {
+	metrics, err := telemetry.NewMetrics()
+	if err != nil {
+		t.Fatalf("new metrics: %v", err)
+	}
+	// The store authenticates a valid key but holds a credential for a
+	// different provider, so ResolveProviderCredential fails AFTER admission
+	// and BEFORE any durable row is created - the D4 early-return path.
+	store, rawKey := newAuthorizedStoreForProvider(t, provider.Anthropic, testCredentialID)
+	service := newMetricsService(t, store, &fakeProviderClient{}, metrics)
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if _, _, err := service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+		Model:    "openai/gpt-test",
+		Messages: []provider.Message{{Role: "user", Content: "hello"}},
+	}); err == nil {
+		t.Fatal("credential resolve failure was not surfaced")
+	}
+	families := gatherDataPlaneMetrics(t, metrics)
+	if activeRequestGauge(t, families) != 0 {
+		t.Fatalf("active requests after pre-row early return = %v, want 0 (ADR-019 D4)", activeRequestGauge(t, families))
+	}
+	if findRequestCounter(t, families, map[string]string{}) != nil {
+		t.Fatal("pre-row credential error created a durable request metric series")
+	}
+}
+
+func TestMetricsStreamFailureAfterProcessingReleasesGauges(t *testing.T) {
+	metrics, err := telemetry.NewMetrics()
+	if err != nil {
+		t.Fatalf("new metrics: %v", err)
+	}
+	store, rawKey := newAuthorizedStore(t)
+	stream := &blockingChatStream{started: make(chan struct{}), release: make(chan struct{})}
+	client := &fakeProviderClient{streamFactory: func(context.Context) (provider.StreamResult, error) {
+		return provider.StreamResult{Stream: stream}, nil
+	}}
+	service := newMetricsService(t, store, client, metrics)
+	auth, err := service.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.StreamChat(context.Background(), auth, "", provider.ChatRequest{
+			Model:    "openai/gpt-test",
+			Messages: []provider.Message{{Role: "user", Content: "hello"}},
+			Stream:   true,
+		}, &recordingSink{})
+		done <- err
+	}()
+	<-stream.started // stream is established and blocked while processing
+	families := gatherDataPlaneMetrics(t, metrics)
+	if activeRequestGauge(t, families) != 1 {
+		t.Fatalf("active requests while stream blocked = %v, want 1", activeRequestGauge(t, families))
+	}
+	streamFamily, ok := families["gateway_active_streams"]
+	if !ok || len(streamFamily.Metric) != 1 || streamFamily.Metric[0].GetGauge().GetValue() != 1 {
+		t.Fatalf("active streams while blocked = %v, want openai series = 1", len(streamFamily.Metric))
+	}
+	close(stream.release) // upstream read fails; stream_interrupted terminal state
+	if err := <-done; err == nil {
+		t.Fatal("failed stream unexpectedly succeeded")
+	}
+	families = gatherDataPlaneMetrics(t, metrics)
+	if activeRequestGauge(t, families) != 0 {
+		t.Fatalf("active requests after stream failure = %v, want 0", activeRequestGauge(t, families))
+	}
+	streamFamily, ok = families["gateway_active_streams"]
+	if !ok || len(streamFamily.Metric) != 1 || streamFamily.Metric[0].GetGauge().GetValue() != 0 {
+		t.Fatalf("active streams after stream failure = %v, want 0", streamFamily.Metric[0].GetGauge().GetValue())
+	}
+}
+
 func TestDataPlaneMuxDoesNotExposeMetrics(t *testing.T) {
 	service := newTestService(t, &fakeStore{})
 	mux := http.NewServeMux()
@@ -318,3 +432,23 @@ func (s *recordingSink) WriteEvent(provider.StreamEvent) error {
 	return nil
 }
 func (s *recordingSink) Committed() bool { return false }
+
+// blockingChatStream blocks its first Next call until release is closed, then
+// fails like an upstream read error so the stream ends in the documented
+// stream_interrupted terminal state. It makes the in-flight stream gauges
+// observable at a deterministic point without sleeps.
+type blockingChatStream struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingChatStream) Next() (provider.StreamEvent, error) {
+	s.once.Do(func() { close(s.started) })
+	<-s.release
+	return provider.StreamEvent{}, io.EOF
+}
+
+func (s *blockingChatStream) Close() error { return nil }
+
+func (s *blockingChatStream) Usage() *provider.Usage { return nil }

@@ -176,10 +176,15 @@ stays telemetry-free. Provider labels must not be smuggled into it. Instead:
 ### D5. Bounded label domains (contract fixed before code)
 
 - `provider`: registry enum values `openai` / `anthropic` / `deepseek` only.
-- `model_family`: explicit bounded mapping table (`familyFor(model)`) derived
-  from the seed-catalog families per provider; anything unmapped labels
-  `other`. Raw model strings never become labels. Revisit only with the later
-  metrics slice or benchmark evidence.
+- `model_family`: a **curated, finite observability taxonomy for the
+  supported provider namespaces**, decoupled from the pricing seed catalog.
+  The current finite domain is fixed to `gpt` / `claude` / `deepseek` /
+  `other`; the prefix rule (`gpt*` -> `gpt`, `claude*` -> `claude`,
+  `deepseek*` -> `deepseek`) decides only which finite family a model
+  resolves to, and anything unmapped labels `other`. Raw model strings never
+  become labels. Adding a new provider or a new family is an explicit,
+  reviewed extension - label families are never generated automatically.
+  Revisit only with the later metrics slice or benchmark evidence.
 - `status`: `succeeded` / `failed`, mirroring the durable row's final status.
 - `stream`: `true` / `false`.
 - Never label with: request ID, trace ID, project ID, user ID, virtual-key ID,
