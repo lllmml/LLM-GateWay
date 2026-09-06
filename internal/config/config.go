@@ -103,6 +103,11 @@ type Config struct {
 	// exporter); OTELServiceName defaults to "gateway".
 	OTELExporterOTLPEndpoint string
 	OTELServiceName          string
+
+	// Week 10 A3d protected pprof (ADR-019 D8). Disabled by default; enabling
+	// requires a non-empty PPROF_TOKEN.
+	PprofEnabled bool
+	PprofToken   string
 }
 
 func Load() (Config, error) {
@@ -267,6 +272,19 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	otelServiceName := valueOrDefault(lookup, "OTEL_SERVICE_NAME", defaultOTELServiceName)
 
+	// Week 10 A3d protected pprof (ADR-019 D8). pprof is opt-in: disabled by
+	// default, and enabling it requires a non-empty PPROF_TOKEN (the token is
+	// defense-in-depth on the private Ops plane, never a substitute for
+	// network isolation).
+	pprofEnabled, err := boolValue(lookup, "PPROF_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
+	pprofToken := valueOrDefault(lookup, "PPROF_TOKEN", "")
+	if pprofEnabled && pprofToken == "" {
+		return Config{}, errors.New("PPROF_TOKEN is required when PPROF_ENABLED=true")
+	}
+
 	return Config{
 		DataPlaneAddr:             dataPlaneAddr,
 		ControlPlaneAddr:          controlPlaneAddr,
@@ -305,6 +323,8 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 
 		OTELExporterOTLPEndpoint: otelEndpoint,
 		OTELServiceName:          otelServiceName,
+		PprofEnabled:             pprofEnabled,
+		PprofToken:               pprofToken,
 	}, nil
 }
 
@@ -440,6 +460,21 @@ func positiveDuration(lookup func(string) (string, bool), key string, fallback t
 		return 0, fmt.Errorf("%s must be positive", key)
 	}
 	return duration, nil
+}
+
+func boolValue(lookup func(string) (string, bool), key string, fallback bool) (bool, error) {
+	value, ok := lookup(key)
+	if !ok || strings.TrimSpace(value) == "" {
+		return fallback, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be true or false", key)
+	}
 }
 
 func parseLogLevel(value string) (slog.Level, error) {

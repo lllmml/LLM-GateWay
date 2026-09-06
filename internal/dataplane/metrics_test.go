@@ -398,6 +398,13 @@ func TestDataPlaneMuxDoesNotExposeMetrics(t *testing.T) {
 		t.Fatalf("GET /metrics on data plane mux = %d, want 404", metricsResponse.Code)
 	}
 
+	pprofRequest := httptest.NewRequest(http.MethodGet, "/debug/pprof/heap", nil)
+	pprofResponse := httptest.NewRecorder()
+	mux.ServeHTTP(pprofResponse, pprofRequest)
+	if pprofResponse.Code != http.StatusNotFound {
+		t.Fatalf("GET /debug/pprof/heap on data plane mux = %d, want 404 (ADR-019 D8)", pprofResponse.Code)
+	}
+
 	// The documented chat route must still be the only live route: an invalid
 	// bearer is rejected before the body is read (route exists), never 404.
 	chatRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{`))

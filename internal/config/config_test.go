@@ -531,3 +531,54 @@ func TestLoadValidatesOTLPEndpoint(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadPprofDefaultsDisabled(t *testing.T) {
+	cfg, err := load(mapLookup(requiredTestValues()))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.PprofEnabled {
+		t.Fatal("PPROF_ENABLED must default to false")
+	}
+	if cfg.PprofToken != "" {
+		t.Fatalf("PPROF_TOKEN = %q, want empty", cfg.PprofToken)
+	}
+}
+
+func TestLoadParsesPprofSettings(t *testing.T) {
+	values := requiredTestValues()
+	values["PPROF_ENABLED"] = "true"
+	values["PPROF_TOKEN"] = "a-pprof-token"
+	cfg, err := load(mapLookup(values))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !cfg.PprofEnabled || cfg.PprofToken != "a-pprof-token" {
+		t.Fatalf("pprof = (%v, %q), want (true, a-pprof-token)", cfg.PprofEnabled, cfg.PprofToken)
+	}
+}
+
+func TestLoadRejectsPprofWithoutTokenAndBadBool(t *testing.T) {
+	enabledNoToken := requiredTestValues()
+	enabledNoToken["PPROF_ENABLED"] = "true"
+	if _, err := load(mapLookup(enabledNoToken)); err == nil {
+		t.Fatal("PPROF_ENABLED=true without PPROF_TOKEN accepted, want an error")
+	}
+
+	badBool := requiredTestValues()
+	badBool["PPROF_ENABLED"] = "yes"
+	if _, err := load(mapLookup(badBool)); err == nil {
+		t.Fatal("PPROF_ENABLED=yes accepted, want an error")
+	}
+
+	// A token without PPROF_ENABLED is ignored (pprof stays disabled).
+	tokenOnly := requiredTestValues()
+	tokenOnly["PPROF_TOKEN"] = "some-token"
+	cfg, err := load(mapLookup(tokenOnly))
+	if err != nil {
+		t.Fatalf("token-only config: %v", err)
+	}
+	if cfg.PprofEnabled {
+		t.Fatal("PPROF_TOKEN without PPROF_ENABLED must stay disabled")
+	}
+}

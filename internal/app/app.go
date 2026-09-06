@@ -46,6 +46,11 @@ type Options struct {
 	// serve it; wiring owns that isolation.
 	MetricsHandler http.Handler
 
+	// PprofHandler, when non-nil, is mounted at /debug/pprof/ on the private
+	// Operations Plane only (ADR-019 D8). The handler itself owns token
+	// protection; data and control planes never mount it.
+	PprofHandler http.Handler
+
 	// TelemetryShutdown, when non-nil, is invoked once by App.Run after HTTP
 	// drain completes and before database.Close(), under a bounded context
 	// (ADR-019 D9). It is a plain function type so internal/app never depends
@@ -98,7 +103,7 @@ func New(options Options, database Database, logger *slog.Logger) *App {
 	}
 	application.dataPlaneServer = newDataPlaneServer(options.DataPlaneAddr, options.DataPlaneHandler)
 	application.controlPlaneServer = newControlPlaneServer(options.ControlPlaneAddr, options.ControlPlaneHandler)
-	application.opsServer = newOpsServer(options.OpsAddr, application.opsHandler(options.MetricsHandler))
+	application.opsServer = newOpsServer(options.OpsAddr, application.opsHandler(options.MetricsHandler, options.PprofHandler))
 	return application
 }
 

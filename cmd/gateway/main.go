@@ -17,6 +17,7 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/config"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane"
 	"github.com/lllmml/production-go-llm-gateway/internal/dataplane"
+	"github.com/lllmml/production-go-llm-gateway/internal/pprof"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/anthropic"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/deepseek"
@@ -252,6 +253,21 @@ func run() error {
 	dataPlaneMux := http.NewServeMux()
 	dataplane.NewHandler(dataPlaneService).Register(dataPlaneMux)
 
+	// Week 10 A3d protected pprof (ADR-019 D8). Disabled unless explicitly
+	// enabled; enabling requires a PPROF_TOKEN (config-validated). The token is
+	// hashed into the handler and the config copy is cleared immediately; the
+	// Ops plane remains the only mount point and is never publicly routed.
+	var pprofHandler http.Handler
+	if cfg.PprofEnabled {
+		protectedPprof, err := pprof.NewHandler(cfg.PprofToken)
+		if err != nil {
+			database.Close()
+			return fmt.Errorf("configure protected pprof: %w", err)
+		}
+		cfg.PprofToken = ""
+		pprofHandler = protectedPprof
+	}
+
 	application := app.New(app.Options{
 		DataPlaneAddr:       cfg.DataPlaneAddr,
 		ControlPlaneAddr:    cfg.ControlPlaneAddr,
@@ -261,6 +277,7 @@ func run() error {
 		DataPlaneHandler:    dataPlaneMux,
 		ControlPlaneHandler: controlPlaneHandler,
 		MetricsHandler:      metrics.Handler(),
+		PprofHandler:        pprofHandler,
 		TelemetryShutdown: func(ctx context.Context) error {
 			return tracingRuntime.Shutdown(ctx)
 		},

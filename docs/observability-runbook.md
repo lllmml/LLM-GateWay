@@ -45,9 +45,36 @@ Prometheus ── pull host.docker.internal:9090/metrics ──► Gateway ops
 ## Notes / deferred
 
 - Metrics are pulled by Prometheus only; they never enter the Collector.
-- pprof (`PPROF_ENABLED`/`PPROF_TOKEN`) and richer dashboards land in later
+- Richer Grafana dashboards and request-UI trace deep links land in later
   slices.
 - The images are distroless; container readiness is verified host-side rather
   than via in-container `HEALTHCHECK` (the compose readiness polling above).
 - Grafana admin credentials are local-dev only via env interpolation
   (`GRAFANA_ADMIN_USER`/`GRAFANA_ADMIN_PASSWORD`, default `admin`).
+- `observability-down` currently uses stop semantics; a stop/down split can be
+  revisited later.
+
+## Protected pprof (A3d)
+
+Disabled by default (`PPROF_ENABLED=false`). When enabled, `PPROF_TOKEN` is
+required (defense-in-depth only: the Ops plane is never publicly routed). The
+handler is built from `runtime/pprof` on its own mux - `net/http/pprof` is
+never imported, so `http.DefaultServeMux` is never used.
+
+- Ops plane only: `/debug/pprof/` index, `/debug/pprof/{goroutine|heap|allocs|
+  block|mutex|threadcreate}` (`?debug=0|1|2`), `/debug/pprof/profile
+  ?seconds=1..120` (default 30).
+- Token: `Authorization: Bearer $PPROF_TOKEN`, compared as SHA-256 digests via
+  `subtle.ConstantTimeCompare`.
+- CPU profile requests are mutually exclusive (second concurrent request gets
+  HTTP 409) and `seconds` is bounded.
+
+Evidence (unit tests plus live gateway run):
+
+```sh
+curl -i http://127.0.0.1:9090/debug/pprof/heap                  # 401
+curl -i -H 'Authorization: Bearer $PPROF_TOKEN' \
+     'http://127.0.0.1:9090/debug/pprof/heap?debug=1'           # 200
+curl -i http://127.0.0.1:18080/debug/pprof/heap                 # 404 (data plane)
+curl -i http://127.0.0.1:18081/debug/pprof/heap                 # 404 (control plane)
+```

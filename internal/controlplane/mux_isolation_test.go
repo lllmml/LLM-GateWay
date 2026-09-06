@@ -41,4 +41,11 @@ func TestControlPlaneMuxDoesNotExposeMetrics(t *testing.T) {
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("GET /metrics on control plane mux = %d, want 404", response.Code)
 	}
+
+	pprofRequest := httptest.NewRequest(http.MethodGet, "/debug/pprof/heap", nil)
+	pprofResponse := httptest.NewRecorder()
+	handler.ServeHTTP(pprofResponse, pprofRequest)
+	if pprofResponse.Code != http.StatusNotFound {
+		t.Fatalf("GET /debug/pprof/heap on control plane mux = %d, want 404 (ADR-019 D8)", pprofResponse.Code)
+	}
 }

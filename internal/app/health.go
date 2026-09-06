@@ -6,7 +6,7 @@ import (
 	"net/http"
 )
 
-func (a *App) opsHandler(metricsHandler http.Handler) http.Handler {
+func (a *App) opsHandler(metricsHandler http.Handler, pprofHandler http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", a.handleLiveness)
 	mux.HandleFunc("GET /health/ready", a.handleReadiness)
@@ -14,6 +14,13 @@ func (a *App) opsHandler(metricsHandler http.Handler) http.Handler {
 	// data and control plane muxes never mount them.
 	if metricsHandler != nil {
 		mux.Handle("GET /metrics", metricsHandler)
+	}
+	// Protected pprof (ADR-019 D8): only the private Operations Plane serves
+	// it, only when wiring supplied an explicit (token-protected) handler, and
+	// never through http.DefaultServeMux.
+	if pprofHandler != nil {
+		mux.Handle("GET /debug/pprof/", pprofHandler)
+		mux.Handle("GET /debug/pprof", pprofHandler)
 	}
 	return mux
 }

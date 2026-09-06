@@ -31,9 +31,9 @@
   Evidence section below.
 - 2026-09-06: Week 10 A3 (local self-hosted observability stack) slices A3a
   (collector + tempo + trace round trip), A3b (Prometheus + Grafana
-  provisioning), and A3c (full metrics evidence + dashboard provisioning +
-  runbook) are implemented and merged after owner review; protected pprof
-  (A3d) remains.
+  provisioning), A3c (full metrics evidence + dashboard provisioning +
+  runbook), and A3d (protected pprof) are implemented and merged after owner
+  review.
 
 ## Context
 
@@ -556,9 +556,18 @@ Completed:
   (`make observability-evidence`, `make observability-metrics-evidence`).
   Runbook: `docs/observability-runbook.md`.
 
-Deferred after A3c:
+- **Protected pprof (Slice A3d)**: `PPROF_ENABLED` (default false) +
+  `PPROF_TOKEN` (required when enabled, no example value in `.env.example`);
+  new `internal/pprof` package builds handlers from `runtime/pprof` on its own
+  mux (never imports `net/http/pprof`, never touches `http.DefaultServeMux`);
+  token compared as SHA-256 digests via `subtle.ConstantTimeCompare`; CPU
+  profile requests are mutually exclusive (HTTP 409) with bounded `seconds`;
+  mounted only on the private Ops plane via `app.Options.PprofHandler`, with
+  data/control mux isolation tests. Live evidence: 401 unauth / 200 authed /
+  404 on data & control planes / 405 on non-GET.
 
-- Protected pprof on the Ops plane (`PPROF_ENABLED` / `PPROF_TOKEN`, A3d).
+Deferred after A3d:
+
 - Collector in-container health check inside `observability-up` (distroless
   images have no shell; readiness is currently host-side), and an
   `observability-down` stop/down naming review.
