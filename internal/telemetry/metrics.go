@@ -128,7 +128,7 @@ func (m *Metrics) Handler() http.Handler {
 // status must be "succeeded" or "failed"; any other value is a programmer
 // error and is ignored rather than inventing a label value.
 func (m *Metrics) ObserveRequest(providerName, model string, stream bool, status string, duration time.Duration) {
-	if m == nil || !validProvider(providerName) {
+	if m == nil || !ProviderSupported(providerName) {
 		return
 	}
 	if status != statusSucceeded && status != statusFailed {
@@ -137,7 +137,7 @@ func (m *Metrics) ObserveRequest(providerName, model string, stream bool, status
 	streamValue := streamLabel(stream)
 	// WithLabelValues is positional and must match the declared order
 	// provider, model_family, status, stream.
-	m.requestsTotal.WithLabelValues(providerName, modelFamily(providerName, model), status, streamValue).Inc()
+	m.requestsTotal.WithLabelValues(providerName, ModelFamily(providerName, model), status, streamValue).Inc()
 	if duration < 0 {
 		duration = 0
 	}
@@ -158,7 +158,7 @@ func (m *Metrics) TrackInFlight(providerName string, stream bool) func() {
 	if m == nil {
 		return func() {}
 	}
-	trackStream := stream && validProvider(providerName)
+	trackStream := stream && ProviderSupported(providerName)
 	m.activeRequests.Inc()
 	if trackStream {
 		m.activeStreams.WithLabelValues(providerName).Inc()
@@ -174,7 +174,10 @@ func (m *Metrics) TrackInFlight(providerName string, stream bool) func() {
 	}
 }
 
-func validProvider(name string) bool {
+// ProviderSupported reports whether name is one of the supported provider
+// namespaces (openai/anthropic/deepseek). It backs the bounded provider label
+// and keeps raw provider strings out of telemetry.
+func ProviderSupported(name string) bool {
 	switch name {
 	case string(provider.OpenAI), string(provider.Anthropic), string(provider.DeepSeek):
 		return true
@@ -183,14 +186,14 @@ func validProvider(name string) bool {
 	}
 }
 
-// modelFamily maps a model string to a bounded product family per provider
+// ModelFamily maps a model string to a bounded product family per provider
 // (ADR-019 D5). The families form a curated, finite observability taxonomy for
 // the supported provider namespaces, decoupled from the pricing seed catalog:
 // anything unmapped resolves to the bounded "other" fallback, so an arbitrary
 // or adversarial model string can never become a high-cardinality label value.
 // Adding a new family (or provider) is an explicit, reviewed extension - never
 // automatic.
-func modelFamily(providerName, model string) string {
+func ModelFamily(providerName, model string) string {
 	model = strings.TrimSpace(model)
 	switch providerName {
 	case string(provider.OpenAI):

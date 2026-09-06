@@ -57,7 +57,18 @@ func (h *Handler) chatCompletions(response http.ResponseWriter, request *http.Re
 		writeError(response, http.StatusUnauthorized, provider.AuthenticationFailed, "authentication_failed", "authentication failed")
 		return
 	}
-	auth, err := h.service.Authenticate(ctx, rawKey)
+	// auth.virtual_key covers the virtual-key authentication lookup as a child
+	// of the request span; failure carries the stable category attribute.
+	authCtx, authSpan := h.service.tracer.Start(ctx, "auth.virtual_key")
+	auth, err := h.service.Authenticate(authCtx, rawKey)
+	if err != nil {
+		if category := gatewayCategoryOf(err); category != "" {
+			setSpanGatewayError(authSpan, category)
+		} else {
+			setSpanError(authSpan)
+		}
+	}
+	authSpan.End()
 	if err != nil {
 		writeGatewayError(response, GatewayRequest{}, err)
 		return
@@ -76,12 +87,18 @@ func (h *Handler) chatCompletions(response http.ResponseWriter, request *http.Re
 		sink := newHTTPStreamSink(response)
 		record, err := h.service.StreamChatStartedAt(ctx, auth, requestStartedAt, chat, sink)
 		if err != nil && !sink.Committed() {
+			if category := gatewayCategoryOf(err); category != "" {
+				setSpanGatewayError(span, category)
+			}
 			writeGatewayError(response, record, err)
 		}
 		return
 	}
 	result, record, err := h.service.CompleteChatStartedAt(ctx, auth, requestStartedAt, chat)
 	if err != nil {
+		if category := gatewayCategoryOf(err); category != "" {
+			setSpanGatewayError(span, category)
+		}
 		writeGatewayError(response, record, err)
 		return
 	}

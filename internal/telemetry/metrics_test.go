@@ -180,8 +180,8 @@ func TestModelFamilyMappingIsBounded(t *testing.T) {
 		{"openai", "  gpt-6-astra  ", "gpt"},
 	}
 	for _, current := range cases {
-		if got := modelFamily(current.providerName, current.model); got != current.want {
-			t.Errorf("modelFamily(%q, %q) = %q, want %q", current.providerName, current.model, got, current.want)
+		if got := ModelFamily(current.providerName, current.model); got != current.want {
+			t.Errorf("ModelFamily(%q, %q) = %q, want %q", current.providerName, current.model, got, current.want)
 		}
 	}
 }
