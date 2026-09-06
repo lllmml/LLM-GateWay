@@ -472,3 +472,62 @@ func TestDistributedConfigValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadOTELSettingsDefaults(t *testing.T) {
+	cfg, err := load(mapLookup(requiredTestValues()))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.OTELExporterOTLPEndpoint != "" {
+		t.Fatalf("OTELExporterOTLPEndpoint = %q, want empty (tracing disabled by default)", cfg.OTELExporterOTLPEndpoint)
+	}
+	if cfg.OTELServiceName != defaultOTELServiceName {
+		t.Fatalf("OTELServiceName = %q, want %q", cfg.OTELServiceName, defaultOTELServiceName)
+	}
+}
+
+func TestLoadParsesOTELSettings(t *testing.T) {
+	values := requiredTestValues()
+	values["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://127.0.0.1:4317"
+	values["OTEL_SERVICE_NAME"] = "edge-gateway"
+	cfg, err := load(mapLookup(values))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.OTELExporterOTLPEndpoint != "http://127.0.0.1:4317" {
+		t.Fatalf("OTELExporterOTLPEndpoint = %q, want parsed value", cfg.OTELExporterOTLPEndpoint)
+	}
+	if cfg.OTELServiceName != "edge-gateway" {
+		t.Fatalf("OTELServiceName = %q, want override", cfg.OTELServiceName)
+	}
+}
+
+func TestLoadValidatesOTLPEndpoint(t *testing.T) {
+	valid := []string{
+		"http://127.0.0.1:4317",
+		"https://collector.example.com:443",
+		"http://otel-collector:4317",
+	}
+	for _, endpoint := range valid {
+		values := requiredTestValues()
+		values["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
+		if _, err := load(mapLookup(values)); err != nil {
+			t.Errorf("valid endpoint %q rejected: %v", endpoint, err)
+		}
+	}
+	invalid := []string{
+		"not a url",
+		"ftp://127.0.0.1:4317",
+		"http://user:pass@127.0.0.1:4317",
+		"http://127.0.0.1:4317/with/path",
+		"http://127.0.0.1:4317?query=1",
+		"127.0.0.1:4317",
+	}
+	for _, endpoint := range invalid {
+		values := requiredTestValues()
+		values["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
+		if _, err := load(mapLookup(values)); err == nil {
+			t.Errorf("invalid endpoint %q accepted, want an error", endpoint)
+		}
+	}
+}

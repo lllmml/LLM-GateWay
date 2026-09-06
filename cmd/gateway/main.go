@@ -86,6 +86,26 @@ func run() error {
 		return fmt.Errorf("configure metrics: %w", err)
 	}
 
+	// Week 10 tracing (ADR-019 D8/D9/N1): one gateway-owned Runtime per
+	// process. An empty OTEL_EXPORTER_OTLP_ENDPOINT keeps tracing disabled
+	// (noop tracer, no exporter). The fallback defer is registered immediately
+	// so a wiring failure after this point still performs the single real
+	// telemetry shutdown (construction corner where App.Run never runs); when
+	// App.Run does run, its Run-scope hook is the lifecycle owner and this
+	// fallback's later call is an idempotent no-op (Runtime.Shutdown is
+	// sync.Once).
+	tracingRuntime, err := telemetry.NewRuntime(cfg.OTELExporterOTLPEndpoint, cfg.OTELServiceName)
+	if err != nil {
+		return fmt.Errorf("configure tracing: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
+		defer cancelShutdown()
+		if err := tracingRuntime.Shutdown(shutdownCtx); err != nil {
+			logger.Error("tracing shutdown failed", "error", err)
+		}
+	}()
+
 	connectCtx, cancelConnect := context.WithTimeout(context.Background(), cfg.DatabaseConnectTime)
 	database, err := postgres.Open(connectCtx, cfg.DatabaseURL)
 	cancelConnect()
@@ -240,6 +260,9 @@ func run() error {
 		DataPlaneHandler:    dataPlaneMux,
 		ControlPlaneHandler: controlPlaneHandler,
 		MetricsHandler:      metrics.Handler(),
+		TelemetryShutdown: func(ctx context.Context) error {
+			return tracingRuntime.Shutdown(ctx)
+		},
 	}, database, logger)
 
 	runCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
