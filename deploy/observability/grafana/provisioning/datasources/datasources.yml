@@ -1,0 +1,24 @@
+# Week 10 A3b: Grafana datasource provisioning. After `docker compose up`,
+# Grafana already knows both backends; no manual datasource setup is needed.
+# Dashboards (dashboard JSON artifacts) are intentionally deferred to a later
+# slice; this folder is the future dashboards provider location.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      httpMethod: GET
+      tracesToMetrics:
+        datasourceUid: prometheus

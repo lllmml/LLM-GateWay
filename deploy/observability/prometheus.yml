@@ -1,0 +1,17 @@
+# Week 10 A3b: Prometheus configuration for the local self-hosted stack.
+#
+# Prometheus PULLS metrics; it never receives them over OTLP (ADR-019 D2/D10).
+# The single scrape target is the host Gateway's private Ops plane /metrics
+# (A1). In local development the Gateway runs on the host, so the container
+# reaches it through host.docker.internal (extra_hosts: host-gateway). In the
+# Week 12 same-stack deployment this target becomes the internal service name
+# of the Gateway container.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9090"]

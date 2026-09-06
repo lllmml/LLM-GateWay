@@ -127,20 +127,25 @@ redis-up:
 redis-stop:
 	$(COMPOSE) stop redis
 
-# Week 10 A3a local observability stack (ADR-019 D10). Services are distroless
-# (no in-container healthcheck), so observability-up brings them up and then
-# polls Tempo's /ready host-side before returning; the real collector->Tempo
-# trace round-trip is proven by observability-evidence.
+# Week 10 A3 local observability stack (ADR-019 D10). Services are distroless
+# or do not expose a usable in-container health tool, so observability-up
+# brings them up and then polls each HTTP readiness endpoint host-side:
+# Tempo /ready, Prometheus /-/ready, Grafana /api/health. The real
+# collector->Tempo trace round-trip is proven by observability-evidence.
 observability-up:
-	$(COMPOSE) up -d --wait otel-collector tempo
-	@for i in $$(seq 1 60); do \
-		if curl -fsS http://127.0.0.1:3200/ready >/dev/null 2>&1; then exit 0; fi; \
+	$(COMPOSE) up -d --wait otel-collector tempo prometheus grafana
+	@for i in $$(seq 1 90); do \
+		ok=1; \
+		curl -fsS http://127.0.0.1:3200/ready >/dev/null 2>&1 || ok=0; \
+		curl -fsS http://127.0.0.1:9091/-/ready >/dev/null 2>&1 || ok=0; \
+		curl -fsS http://127.0.0.1:3001/api/health >/dev/null 2>&1 || ok=0; \
+		if [ $$ok -eq 1 ]; then exit 0; fi; \
 		sleep 1; \
 	done; \
-	echo 'Tempo /ready did not respond within 60s' >&2; exit 1
+	echo 'observability readiness endpoints did not respond within 90s' >&2; exit 1
 
 observability-down:
-	$(COMPOSE) stop otel-collector tempo
+	$(COMPOSE) stop otel-collector tempo prometheus grafana
 
 observability-ps:
 	$(COMPOSE) ps
