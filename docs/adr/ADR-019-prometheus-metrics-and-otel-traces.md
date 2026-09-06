@@ -24,6 +24,11 @@
   never rejects the request; (P4) pprof protection hashes the token and uses a
   single guarded handler/mux with no `DefaultServeMux`/global bypass. Slice A1
   starts only after the owner confirms this commit.
+- 2026-09-05: Week 10 foundation slices A1 (metrics), A2a (tracing runtime),
+  A2b1 (root span + TraceID migration), A2b2 (child spans + log correlation),
+  and A2c (exporter-failure isolation + lifecycle) are implemented and merged
+  after owner review of each slice; implementation status is recorded in the
+  Evidence section below.
 
 ## Context
 
@@ -489,7 +494,52 @@ invariant as:
 
 ## Evidence / implementation notes
 
-(Filled in by slices A1/A2/A3 as they land; this ADR commit is docs-only.)
+### Implementation status (Week 10, after Slice A2c)
+
+Completed:
+
+- **Metrics foundation (Slice A1)**: the four ADR-019 D3 metrics
+  (`gateway_requests_total`, `gateway_request_duration_seconds`,
+  `gateway_active_requests`, `gateway_active_streams`) on an app-owned
+  Prometheus registry served at `GET /metrics` on the private Operations
+  Plane; bounded label domains with the curated model-family taxonomy;
+  mux-isolation tests lock data/control plane exclusion.
+- **Tracing runtime (Slice A2a)**: gateway-owned `telemetry.Runtime` - OTLP
+  gRPC exporter, `AlwaysSample`, app-owned noop tracer when the endpoint is
+  empty, `sync.Once` single real shutdown with a bounded App Run-scope hook
+  before `database.Close()` and a `main` construction-fallback; deterministic
+  lifecycle tests (clean shutdown, hook error non-fatal, partial-listen
+  failure, idempotent second shutdown).
+- **TraceID semantic migration (Slice A2b1)**: `gateway_requests.trace_id`
+  now stores the real OTel TraceID derived from the active `gateway.request`
+  span (empty -> NULL under the noop tracer); the legacy `X-Request-ID` /
+  UUID-fallback trace source and the `traceID string` service parameters are
+  gone; `X-Request-ID` is bounded, sanitized client correlation metadata
+  (`client_request_id` log field only); incoming `Traceparent` headers are
+  ignored and never leak.
+- **Child span hierarchy (Slice A2b2)**: `gateway.request` ->
+  `auth.virtual_key`, `rate_limit.check`, `usage.create_request_record`,
+  `provider.attempt` (one span per retry attempt), `usage.finalize`; bounded
+  `llm.*` attributes (provider namespace only, A1 model family, stream flag)
+  and the `gateway.request_row_id` / `gateway.retry_attempt` /
+  `gateway.error_category` whitelist, enforced by tests on every recorded
+  span.
+- **Log-trace correlation (Slice A2b2)**: single `slog` entry point with a
+  context-aware enrichment handler - `InfoContext`/`ErrorContext` under an
+  active span carry `trace_id`/`span_id` (plus sanitized `client_request_id`),
+  plain logs keep today's exact output; the five request-path log sites were
+  converted.
+- **Exporter-failure isolation and lifecycle (Slice A2c)**: deterministic
+  tests prove exporter errors and stalled exporters never affect HTTP results
+  or block the request path, shutdown stays bounded under failure, cancelled
+  requests end every started span, and the batch processor leaves no goroutine
+  behind after shutdown (`-race`).
+
+Deferred (not part of A2):
+
+- Collector deployment (Slice A3 local Docker Compose observability stack).
+- Tempo / Grafana dashboards and request-UI trace deep links (later Week 10
+  slices).
 
 ## Reopen triggers
 
