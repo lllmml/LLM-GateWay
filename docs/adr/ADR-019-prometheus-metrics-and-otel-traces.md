@@ -447,22 +447,24 @@ credential material in any attribute (redaction test).
 The gateway lifecycle contract must NOT depend on "OTel `TracerProvider.Shutdown`
 is repeatable". A2 introduces a gateway-owned `telemetry.Runtime` (or an
 equivalent gateway-owned object) that owns the real TracerProvider shutdown
-through `sync.Once`, so the underlying provider Shutdown executes **at most
-once**. Roles:
+so it executes **at most once**, with explicit first-caller ownership:
+concurrent and later callers return nil **immediately** - they never re-run
+the cleanup and never wait for the owning attempt to finish. Roles:
 
 - Tracer created, `App` not yet running, later wiring failure: the `main`
-  fallback cleanup calls `Runtime.Shutdown`; the `sync.Once` executes the one
+  fallback cleanup calls `Runtime.Shutdown`; the first caller owns the one
   real shutdown.
 - Once `App.Run` starts: the App Run-scope hook (D9) becomes the normal
   lifecycle cleanup owner and calls the same `Runtime.Shutdown`.
 - Normal path: HTTP drain -> one real telemetry Shutdown -> database close.
 - Partial `listen()`/startup failure also goes through the App Run-scope
-  cleanup (D9), calling the same Once-protected Shutdown.
+  cleanup (D9), calling the same owned Shutdown.
 - If the bounded Shutdown timeout expires, the telemetry failure is logged and
   nothing assumes a second (`main` fallback) call can complete an unfinished
-  OTel processor shutdown: the Once already ran, and the processor flush is
-  best-effort by design. The two callers share the one `Runtime` created in
-  `main`; whichever reaches it first performs the single real shutdown.
+  OTel processor shutdown: the owning caller already ran, and the processor
+  flush is best-effort by design. The two callers share the one `Runtime`
+  created in `main`; whichever reaches it first owns the single real
+  shutdown, and the other returns immediately.
 
 ### N2. pprof never touches `http.DefaultServeMux` (A3, binding)
 
@@ -506,10 +508,12 @@ Completed:
   mux-isolation tests lock data/control plane exclusion.
 - **Tracing runtime (Slice A2a)**: gateway-owned `telemetry.Runtime` - OTLP
   gRPC exporter, `AlwaysSample`, app-owned noop tracer when the endpoint is
-  empty, `sync.Once` single real shutdown with a bounded App Run-scope hook
-  before `database.Close()` and a `main` construction-fallback; deterministic
-  lifecycle tests (clean shutdown, hook error non-fatal, partial-listen
-  failure, idempotent second shutdown).
+  empty, single real shutdown owned by the first Shutdown caller (later/
+  concurrent callers return nil immediately without waiting) with a bounded
+  App Run-scope hook before `database.Close()` and a `main`
+  construction-fallback; deterministic lifecycle tests (clean shutdown, hook
+  error non-fatal, partial-listen failure, idempotent second shutdown,
+  non-blocking concurrent shutdown).
 - **TraceID semantic migration (Slice A2b1)**: `gateway_requests.trace_id`
   now stores the real OTel TraceID derived from the active `gateway.request`
   span (empty -> NULL under the noop tracer); the legacy `X-Request-ID` /

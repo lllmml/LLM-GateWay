@@ -115,6 +115,56 @@ func TestRuntimeShutdownReportsFirstErrorThenNoOps(t *testing.T) {
 	}
 }
 
+func TestRuntimeConcurrentShutdownDoesNotBlockSecondCaller(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	wantErr := errors.New("flush failed")
+	var calls atomic.Int64
+	shutdown := func(context.Context) error {
+		calls.Add(1)
+		close(started)
+		<-release
+		return wantErr
+	}
+	runtime := runtimeWithProvider(trace.NewNoopTracerProvider(), shutdown)
+
+	// First caller becomes the owner and blocks inside the real cleanup.
+	firstErr := make(chan error, 1)
+	go func() {
+		firstErr <- runtime.Shutdown(context.Background())
+	}()
+	<-started
+
+	// A second caller while the first is still running must return nil
+	// immediately: no waiting, no second cleanup.
+	secondStarted := time.Now()
+	if err := runtime.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second caller Shutdown = %v, want immediate nil", err)
+	}
+	if elapsed := time.Since(secondStarted); elapsed > 250*time.Millisecond {
+		t.Fatalf("second caller blocked for %v behind the first shutdown", elapsed)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("cleanup calls while first is blocked = %d, want exactly 1", calls.Load())
+	}
+
+	// Only the owning caller receives the real error.
+	close(release)
+	if err := <-firstErr; err != wantErr {
+		t.Fatalf("first caller error = %v, want %v", err, wantErr)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("cleanup calls after completion = %d, want exactly 1", calls.Load())
+	}
+	// Post-completion callers also return nil immediately without re-running.
+	if err := runtime.Shutdown(context.Background()); err != nil {
+		t.Fatalf("post-completion Shutdown = %v, want nil", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("cleanup calls after post-completion Shutdown = %d, want 1", calls.Load())
+	}
+}
+
 func TestNewRuntimeWithEndpointDoesNotRequireLiveCollector(t *testing.T) {
 	// A closed port proves construction is lazy (no dial at startup) and that
 	// shutdown is bounded: nothing listens at :1.
