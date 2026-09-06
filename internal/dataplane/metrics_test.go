@@ -113,7 +113,7 @@ func TestMetricsCountSuccessAndFailureTerminalStates(t *testing.T) {
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	}
-	if _, _, err := service.CompleteChat(context.Background(), auth, "", chat); err != nil {
+	if _, _, err := service.CompleteChat(context.Background(), auth, chat); err != nil {
 		t.Fatalf("success request failed: %v", err)
 	}
 	families := gatherDataPlaneMetrics(t, metrics)
@@ -139,7 +139,7 @@ func TestMetricsCountSuccessAndFailureTerminalStates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate failing service: %v", err)
 	}
-	if _, _, err := failingService.CompleteChat(context.Background(), failingAuth, "", chat); err == nil {
+	if _, _, err := failingService.CompleteChat(context.Background(), failingAuth, chat); err == nil {
 		t.Fatal("failing request unexpectedly succeeded")
 	}
 	families = gatherDataPlaneMetrics(t, metrics)
@@ -163,7 +163,7 @@ func TestMetricsFinalizePersistenceFailureStillCountsTerminalState(t *testing.T)
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	if _, _, err := service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	if _, _, err := service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	}); err == nil {
@@ -216,7 +216,7 @@ func TestMetricsActiveGaugeTracksInFlightAndReleasesOnCompletion(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+		_, _, err := service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 			Model:    "openai/gpt-test",
 			Messages: []provider.Message{{Role: "user", Content: "hello"}},
 		})
@@ -251,7 +251,7 @@ func TestMetricsStreamCompletesAndReleasesActiveStreamGauge(t *testing.T) {
 		t.Fatalf("authenticate: %v", err)
 	}
 	sink := &recordingSink{}
-	if _, err := service.StreamChat(context.Background(), auth, "", provider.ChatRequest{
+	if _, err := service.StreamChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 		Stream:   true,
@@ -289,7 +289,7 @@ func TestMetricsCancellationAfterAdmissionReleasesActiveGauge(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := service.CompleteChat(ctx, auth, "", provider.ChatRequest{
+		_, _, err := service.CompleteChat(ctx, auth, provider.ChatRequest{
 			Model:    "openai/gpt-test",
 			Messages: []provider.Message{{Role: "user", Content: "hello"}},
 		})
@@ -324,7 +324,7 @@ func TestMetricsPostAdmissionCredentialErrorReleasesGaugeWithoutRow(t *testing.T
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	if _, _, err := service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	if _, _, err := service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	}); err == nil {
@@ -356,7 +356,7 @@ func TestMetricsStreamFailureAfterProcessingReleasesGauges(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := service.StreamChat(context.Background(), auth, "", provider.ChatRequest{
+		_, err := service.StreamChat(context.Background(), auth, provider.ChatRequest{
 			Model:    "openai/gpt-test",
 			Messages: []provider.Message{{Role: "user", Content: "hello"}},
 			Stream:   true,

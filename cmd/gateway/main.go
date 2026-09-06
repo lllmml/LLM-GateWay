@@ -243,6 +243,7 @@ func run() error {
 		RetryMaxRetries:           cfg.RetryMaxRetries,
 		RetryBackoffMax:           cfg.RetryBackoffMax,
 		Metrics:                   metrics,
+		Tracer:                    tracingRuntime.Tracer(),
 	})
 	if err != nil {
 		database.Close()

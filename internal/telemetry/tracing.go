@@ -114,11 +114,13 @@ func (r *Runtime) Tracer() trace.Tracer {
 	return r.tracer
 }
 
-// Shutdown performs the single real telemetry shutdown (ADR-019 D9/N1). Only
-// the first caller executes the underlying provider shutdown under the given
-// bounded context; every later call returns nil immediately and never attempts
-// to "finish" an already-started or timed-out shutdown. The first call's error
-// is returned to that caller only.
+// Shutdown performs the single real telemetry shutdown (ADR-019 D9/N1).
+// sync.Once guarantees: the FIRST caller owns the cleanup attempt and runs
+// the underlying provider shutdown under the supplied bounded context, and
+// that call's error (if any) is returned to that caller only. Every later
+// call returns a no-op result immediately and never re-runs the cleanup - in
+// particular a timed-out first shutdown is NOT re-executed by a later call,
+// because the Once has already consumed the single attempt.
 func (r *Runtime) Shutdown(ctx context.Context) error {
 	if r == nil {
 		return nil

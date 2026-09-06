@@ -17,6 +17,9 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/ratelimit"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
 	"github.com/lllmml/production-go-llm-gateway/internal/telemetry"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -43,6 +46,16 @@ const finalizeTimeout = 5 * time.Second
 // budget: pricing failure degrades to NULL cost, while the final durable write
 // still receives a live context (ADR-016).
 const pricingLookupBudget = 1 * time.Second
+
+// dataplaneTracerName names the tracer this package starts spans with. It
+// matches telemetry.Runtime's tracer name so spans keep one service identity.
+const dataplaneTracerName = "gateway"
+
+// attrGatewayRequestRowID is the only span attribute A2b1 sets on the root
+// request span: the durable gateway_requests row id (never a client-supplied
+// X-Request-ID). The llm.* attributes and error status land with the
+// child-span slice (A2b2).
+const attrGatewayRequestRowID = "gateway.request_row_id"
 
 type AuthContext struct {
 	ProjectID    string
@@ -159,6 +172,11 @@ type Options struct {
 	// optional: when nil every metric call is a no-op, so existing tests and
 	// embedded uses run unchanged.
 	Metrics *telemetry.Metrics
+
+	// Tracer starts gateway spans (ADR-019 D25). It is optional: when nil the
+	// service uses its own noop tracer, so Start() always works and business
+	// code never branches on tracing being enabled.
+	Tracer trace.Tracer
 }
 
 type Service struct {
@@ -178,6 +196,7 @@ type Service struct {
 	retryMaxRetries       int
 	retryBackoffMax       time.Duration
 	metrics               *telemetry.Metrics
+	tracer                trace.Tracer
 	jitter                func(int64) int64
 	now                   func() time.Time
 	// onRetryWait is an unexported test hook invoked immediately before the
@@ -237,8 +256,16 @@ func NewService(options Options) (*Service, error) {
 		retryMaxRetries:           options.RetryMaxRetries,
 		retryBackoffMax:           retryBackoffMax,
 		metrics:                   options.Metrics,
+		tracer:                    options.Tracer,
 		jitter:                    rand.Int64N,
 		now:                       time.Now,
+	}
+	if service.tracer == nil {
+		// Disabled tracing uses an app-owned noop tracer: Start() succeeds and
+		// yields a non-recording span with an invalid SpanContext, so no
+		// trace_id is ever derived or persisted (ADR-019 D1) and no guard is
+		// needed anywhere in business code.
+		service.tracer = trace.NewNoopTracerProvider().Tracer(dataplaneTracerName)
 	}
 	if options.MaxConcurrentRequests > 0 {
 		service.requestSlots = make(chan struct{}, options.MaxConcurrentRequests)
@@ -268,15 +295,15 @@ func (s *Service) Authenticate(ctx context.Context, rawKey string) (AuthContext,
 	return auth, nil
 }
 
-func (s *Service) CompleteChat(ctx context.Context, auth AuthContext, traceID string, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
-	return s.CompleteChatStartedAt(ctx, auth, traceID, time.Now().UTC(), chat)
+func (s *Service) CompleteChat(ctx context.Context, auth AuthContext, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
+	return s.CompleteChatStartedAt(ctx, auth, time.Now().UTC(), chat)
 }
 
-func (s *Service) CompleteChatStartedAt(ctx context.Context, auth AuthContext, traceID string, requestStartedAt time.Time, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
-	return s.completeChat(ctx, auth, traceID, normalizedStartedAt(requestStartedAt), chat)
+func (s *Service) CompleteChatStartedAt(ctx context.Context, auth AuthContext, requestStartedAt time.Time, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
+	return s.completeChat(ctx, auth, normalizedStartedAt(requestStartedAt), chat)
 }
 
-func (s *Service) completeChat(ctx context.Context, auth AuthContext, traceID string, requestStartedAt time.Time, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
+func (s *Service) completeChat(ctx context.Context, auth AuthContext, requestStartedAt time.Time, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
 	modelRef, err := provider.ParseModel(chat.Model)
 	if err != nil {
 		return provider.Result{}, GatewayRequest{}, NewError(provider.ModelNotSupported, "model must use provider/model-id format")
@@ -314,12 +341,16 @@ func (s *Service) completeChat(ctx context.Context, auth AuthContext, traceID st
 		Model:                modelRef.Model,
 		IsStream:             chat.Stream,
 		StartedAt:            requestStartedAt,
-		TraceID:              traceID,
+		TraceID:              otelRequestTraceID(ctx),
 	})
 	if err != nil {
 		return provider.Result{}, GatewayRequest{}, err
 	}
 	record.Provider = modelRef.Provider
+	// Once the durable row id exists it is the only identifier attached to the
+	// request span (ADR-019 A2 whitelist); a client X-Request-ID is never a
+	// span attribute.
+	setRootRowID(ctx, record.ID)
 
 	apiKey, err := s.decryptCredential(credential)
 	if err != nil {
@@ -387,15 +418,15 @@ func (s *Service) completeChat(ctx context.Context, auth AuthContext, traceID st
 	return lastResult, record, lastGatewayErr
 }
 
-func (s *Service) StreamChat(ctx context.Context, auth AuthContext, traceID string, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
-	return s.StreamChatStartedAt(ctx, auth, traceID, time.Now().UTC(), chat, sink)
+func (s *Service) StreamChat(ctx context.Context, auth AuthContext, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
+	return s.StreamChatStartedAt(ctx, auth, time.Now().UTC(), chat, sink)
 }
 
-func (s *Service) StreamChatStartedAt(ctx context.Context, auth AuthContext, traceID string, requestStartedAt time.Time, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
-	return s.streamChat(ctx, auth, traceID, normalizedStartedAt(requestStartedAt), chat, sink)
+func (s *Service) StreamChatStartedAt(ctx context.Context, auth AuthContext, requestStartedAt time.Time, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
+	return s.streamChat(ctx, auth, normalizedStartedAt(requestStartedAt), chat, sink)
 }
 
-func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID string, requestStartedAt time.Time, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
+func (s *Service) streamChat(ctx context.Context, auth AuthContext, requestStartedAt time.Time, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
 	if sink == nil {
 		return GatewayRequest{}, NewError(provider.InternalError, "request could not be completed")
 	}
@@ -436,12 +467,13 @@ func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID stri
 		Model:                modelRef.Model,
 		IsStream:             true,
 		StartedAt:            requestStartedAt,
-		TraceID:              traceID,
+		TraceID:              otelRequestTraceID(ctx),
 	})
 	if err != nil {
 		return GatewayRequest{}, err
 	}
 	record.Provider = modelRef.Provider
+	setRootRowID(ctx, record.ID)
 
 	apiKey, err := s.decryptCredential(credential)
 	if err != nil {
@@ -580,6 +612,28 @@ func classifyStreamOpenError(ctx context.Context, gatewayErr *GatewayError) *Gat
 // cancelled request, ADR-018 D1). The returned release function must be
 // called exactly once when the admitted operation finishes; it is safe under
 // early returns and panics when deferred.
+// otelRequestTraceID returns the 32-character hex OTel TraceID of the active
+// span in ctx, or "" when ctx carries no valid span context (noop tracer or
+// a context without a root span). An empty value is persisted as NULL; a
+// gateway-generated UUID fallback no longer exists (ADR-019 D1/D4).
+func otelRequestTraceID(ctx context.Context) string {
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		return ""
+	}
+	return sc.TraceID().String()
+}
+
+// setRootRowID attaches the durable gateway_requests row id to the request
+// span in ctx once the row exists. Setting an attribute on a noop/
+// non-recording span is a no-op.
+func setRootRowID(ctx context.Context, rowID string) {
+	if rowID == "" {
+		return
+	}
+	trace.SpanFromContext(ctx).SetAttributes(attribute.String(attrGatewayRequestRowID, rowID))
+}
+
 // trackInFlight returns a no-op when no metrics are wired; otherwise it
 // delegates to telemetry.Metrics.TrackInFlight so the in-flight gauges stay
 // decoupled from the admit() seam (ADR-019 D4).
