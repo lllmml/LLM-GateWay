@@ -1,4 +1,4 @@
-//go:build integration
+//go:build integration && observability
 
 // Package telemetry: live OTLP round-trip evidence against the A3a local
 // observability stack (ADR-019 D10). Requires `make observability-up` first:

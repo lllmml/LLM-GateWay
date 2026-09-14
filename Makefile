@@ -154,7 +154,7 @@ observability-ps:
 # Proves the traces path end to end against the running local stack:
 # Gateway-style OTLP gRPC export -> Collector -> Tempo -> Tempo query API.
 observability-evidence: observability-up
-	$(GO) test -tags=integration ./internal/telemetry/ -run '^TestLiveOTLPTraceRoundTrip$$' -count=1 -v
+	$(GO) test -tags='integration observability' ./internal/telemetry/ -run '^TestLiveOTLPTraceRoundTrip$$' -count=1 -v
 
 # Proves the metrics path end to end: a real request through the running
 # gateway -> gateway_requests_total -> Prometheus query -> Grafana datasource
