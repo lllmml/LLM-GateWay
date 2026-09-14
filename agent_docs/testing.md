@@ -20,10 +20,11 @@
 - Build: `make build`
 - Integration: `make integration`
 - Race: `make race` (must include `go test -race ./...`)
-- Benchmark/profile: `make bench`
+- Go microbenchmarks: `make bench` (existing target; not E2E or profile collection)
+- E2E benchmarks: `make bench-e2e` (Week 11 A1a planned target; currently unavailable)
 - Browser/device check: Run `make dev`; manually complete project → provider credential → virtual key → gateway request → usage/request inspection in a current desktop browser, then check a mobile viewport.
 
-If a Make target is not implemented yet, the current foundation task must create it before downstream agents rely on it.
+Profiling and E2E benchmark commands may only be relied on after their owning implementation slice is approved and implements them. An unimplemented command belongs to its approved implementation slice; an arbitrary current foundation task must not create it automatically. See [ADR-015](../docs/adr/ADR-015-benchmark-methodology.md) for the Draft Week 11 contract. A0 is documentation only.
 
 ## What To Test
 
