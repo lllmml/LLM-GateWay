@@ -12,7 +12,8 @@ Draft pending review. The sequence is **Draft -> owner review -> Accepted ->
 authorized A1a implementation -> A1a review -> A1b**. Plan approval does not
 authorize starting A1 while this ADR is Draft.
 
-A0 changes only this ADR and AGENTS.md. It does not change Makefile, Go,
+A0's documentation scope includes this ADR, AGENTS.md, and
+`agent_docs/testing.md`. It does not change Makefile, Go,
 runtime, configuration, database code, dependencies, or infrastructure. No
 load generator or formal performance measurements exist as an outcome of A0.
 
@@ -41,8 +42,13 @@ generation can be reconsidered if a later experiment requires it.
 
 ### D1. Workloads, timing, and result semantics
 
-- D and G use equivalent synthetic request content, response size, and mock
-  timing, allowing only required authentication and model namespace differences.
+- D and G send the same serialized request body, stream flag, synthetic
+  content, and workload dimensions whenever possible, with identical response
+  size and mock timing. The current mock accepts the same model namespace in
+  the direct request; do not introduce a model-body difference. Only differences
+  necessary for the gateway to work, such as target URL and Gateway
+  Authorization, are allowed. Any future protocol constraint preventing equal
+  bodies must be separately documented before using that workload.
   Initial coverage uses the existing OpenAI-compatible mock, without claiming
   performance equivalence for other adapters.
 - Initial scenarios include zero artificial delay non-streaming, fixed-delay
@@ -62,9 +68,32 @@ generation can be reconsidered if a later experiment requires it.
   from the result's error denominator.
 - Differences between quantiles are named **distribution delta** or
   **gateway-vs-direct delta**, never per-request overhead percentiles.
-- Declare measurement-window membership and throughput denominator before
-  execution. Warm-up is excluded; in-flight work at the measurement boundary
-  has a bounded drain and explicit accounting. No silent dropping of samples.
+- The formal measurement cohort consists exactly of requests whose start
+  timestamp is in `[measurement_start, measurement_end)`. Warm-up requests
+  are excluded. At `measurement_end`, stop starting new requests; in-flight
+  cohort requests enter bounded drain. Requests still without a terminal
+  outcome at drain expiry are classified as timeout/incomplete/failure,
+  never silently removed.
+- The error denominator is all requests in the cohort. Record cohort total,
+  success, and failure counts, with `total = success + failure`, so the
+  denominator is auditable after drain.
+- Latency P50/P95/P99 use only successfully completed cohort requests and
+  always report the successful sample count. Streaming TTFT uses only
+  successful cohort requests that actually produced a first valid content
+  delta, with a separate TTFT sample count. A failed stream's earlier content
+  does not make it a successful TTFT sample; content-free streams get no
+  fabricated TTFT.
+- Successful throughput is successful requests in the measurement cohort
+  divided by configured measurement duration (`measurement_end -
+  measurement_start`). Drain completions count for their cohort; drain time
+  does not extend this denominator.
+- A1a P50/P95/P99 use **exact nearest-rank**: sort the corresponding successful
+  duration samples ascending; for `p = 0.50, 0.95, 0.99` and sample count `N`,
+  take `rank = ceil(p * N)` (1-based) and return that sample. Do not interpolate
+  linearly. Always report `N` alongside percentiles, independently for latency
+  and TTFT. For `N = 0`, percentiles are unavailable, not zero. Deterministic
+  unit tests must lock this rule, including empty/singleton samples, ties,
+  and ranks that differ from interpolated quantiles.
 - Client-observed completion and durable DB finalization are distinct events.
   Finalization verification occurs after timing, under a bounded wait, and
   does not extend individual client latency measurements.
@@ -217,9 +246,10 @@ justified or retained.
 
 ### A0: Draft methodology (current authorization)
 
-Create this Draft ADR and synchronize AGENTS.md phase and command semantics.
+Create this Draft ADR and synchronize AGENTS.md phase and command semantics,
+including the command ownership/availability contract in `agent_docs/testing.md`.
 Check consistency against the owner corrections, Tech Design, Makefile, and
-mock timeout. Commit only the two documents and stop for review. No formal
+mock timeout. Commit only documents within this A0 scope and stop for review. No formal
 numbers or performance claims are produced.
 
 ### A1a: Loadgen core (not started)
