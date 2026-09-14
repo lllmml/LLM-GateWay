@@ -24,7 +24,7 @@ Use the repository `Makefile` as the command contract. Do not invent replacement
 - `make observability-evidence` — traces round trip (OTLP → Collector → Tempo query API)
 - `make observability-metrics-evidence` — real-request metrics loop (gateway → Prometheus → Grafana datasource/dashboard)
 
-Telemetry defaults are disabled (see `.env.example`); the local stack configs and commands live in `deploy/observability/` and `docs/observability-runbook.md`.
+Observability defaults: Prometheus metrics are always enabled and served on the private Ops plane (`/metrics`); OTLP tracing is disabled unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set (noop tracer); protected pprof is disabled unless `PPROF_ENABLED=true`. See `.env.example`; the local stack configs and commands live in `deploy/observability/` and `docs/observability-runbook.md`.
 
 If a command does not exist yet, creating the Makefile target is part of the current foundation task; do not silently substitute an undocumented command.
 

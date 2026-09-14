@@ -92,9 +92,10 @@ func run() error {
 	// (noop tracer, no exporter). The fallback defer is registered immediately
 	// so a wiring failure after this point still performs the single real
 	// telemetry shutdown (construction corner where App.Run never runs); when
-	// App.Run does run, its Run-scope hook is the lifecycle owner and this
-	// fallback's later call is an idempotent no-op (Runtime.Shutdown is
-	// sync.Once).
+	// App.Run does run, its Run-scope hook is the lifecycle owner. Runtime
+	// shutdown uses explicit first-caller ownership (shutdownMu/shutdownOwned):
+	// whichever call wins runs the one real shutdown, and this fallback's later
+	// call returns nil immediately without waiting or re-running it.
 	tracingRuntime, err := telemetry.NewRuntime(cfg.OTELExporterOTLPEndpoint, cfg.OTELServiceName)
 	if err != nil {
 		return fmt.Errorf("configure tracing: %w", err)
