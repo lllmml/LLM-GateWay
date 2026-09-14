@@ -27,7 +27,9 @@ endif
 .PHONY: bootstrap web-install dev dev-backend dev-web test test-backend test-web test-dev-supervisor \
 	typecheck typecheck-backend typecheck-web format lint lint-backend lint-web \
 	build build-backend build-web integration race bench generate \
-	postgres-up postgres-down redis-up redis-stop migrate-version migrate-up migrate-down-one
+	postgres-up postgres-down redis-up redis-stop migrate-version migrate-up migrate-down-one \
+	observability-up observability-down observability-ps observability-evidence \
+	observability-metrics-evidence
 
 bootstrap: $(MIGRATE) $(SQLC) web-install
 	@command -v $(GO) >/dev/null
@@ -125,6 +127,40 @@ redis-up:
 
 redis-stop:
 	$(COMPOSE) stop redis
+
+# Week 10 A3 local observability stack (ADR-019 D10). Services are distroless
+# or do not expose a usable in-container health tool, so observability-up
+# brings them up and then polls each HTTP readiness endpoint host-side:
+# Tempo /ready, Prometheus /-/ready, Grafana /api/health. The real
+# collector->Tempo trace round-trip is proven by observability-evidence.
+observability-up:
+	$(COMPOSE) up -d --wait otel-collector tempo prometheus grafana
+	@for i in $$(seq 1 90); do \
+		ok=1; \
+		curl -fsS http://127.0.0.1:3200/ready >/dev/null 2>&1 || ok=0; \
+		curl -fsS http://127.0.0.1:9091/-/ready >/dev/null 2>&1 || ok=0; \
+		curl -fsS http://127.0.0.1:3001/api/health >/dev/null 2>&1 || ok=0; \
+		if [ $$ok -eq 1 ]; then exit 0; fi; \
+		sleep 1; \
+	done; \
+	echo 'observability readiness endpoints did not respond within 90s' >&2; exit 1
+
+observability-down:
+	$(COMPOSE) stop otel-collector tempo prometheus grafana
+
+observability-ps:
+	$(COMPOSE) ps
+
+# Proves the traces path end to end against the running local stack:
+# Gateway-style OTLP gRPC export -> Collector -> Tempo -> Tempo query API.
+observability-evidence: observability-up
+	$(GO) test -tags='integration observability' ./internal/telemetry/ -run '^TestLiveOTLPTraceRoundTrip$$' -count=1 -v
+
+# Proves the metrics path end to end: a real request through the running
+# gateway -> gateway_requests_total -> Prometheus query -> Grafana datasource
+# and the auto-provisioned dashboard. Orchestrated by the evidence script.
+observability-metrics-evidence:
+	/bin/sh scripts/observability-metrics-evidence.sh "$(GO)"
 
 migrate-version:
 	$(MIGRATE) -database '$(DATABASE_URL)' -path db/migrations version

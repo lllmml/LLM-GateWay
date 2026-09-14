@@ -232,7 +232,7 @@ func TestRetryLoopChecksCancellationAfterWait(t *testing.T) {
 	}
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, err = service.CompleteChat(cancelled, auth, "", chatRequest())
+	_, _, err = service.CompleteChat(cancelled, auth, chatRequest())
 	if err == nil {
 		t.Fatal("complete chat returned nil error for a cancelled request")
 	}

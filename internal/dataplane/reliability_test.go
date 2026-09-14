@@ -117,7 +117,7 @@ func TestRetryCountOffByOneTable(t *testing.T) {
 			if err != nil {
 				t.Fatalf("authenticate: %v", err)
 			}
-			_, record, err := service.CompleteChat(context.Background(), auth, "", chatRequest())
+			_, record, err := service.CompleteChat(context.Background(), auth, chatRequest())
 			if test.wantOK && err != nil {
 				t.Fatalf("complete chat: %v", err)
 			}
@@ -172,7 +172,7 @@ func TestNonRetryableFailuresRunExactlyOneAttempt(t *testing.T) {
 			if err != nil {
 				t.Fatalf("authenticate: %v", err)
 			}
-			_, _, err = service.CompleteChat(context.Background(), auth, "", chatRequest())
+			_, _, err = service.CompleteChat(context.Background(), auth, chatRequest())
 			gatewayErr, ok := err.(*GatewayError)
 			if !ok {
 				t.Fatalf("error type = %T", err)
@@ -223,7 +223,7 @@ func TestTransportDialAndDNSFailuresRetryButAmbiguousDoNot(t *testing.T) {
 			if err != nil {
 				t.Fatalf("authenticate: %v", err)
 			}
-			_, _, err = service.CompleteChat(context.Background(), auth, "", chatRequest())
+			_, _, err = service.CompleteChat(context.Background(), auth, chatRequest())
 			if test.wantOK && err != nil {
 				t.Fatalf("complete chat: %v", err)
 			}
@@ -247,7 +247,7 @@ func TestRetryAfterHintRespectedAndBudgetClamped(t *testing.T) {
 		if err != nil {
 			t.Fatalf("authenticate: %v", err)
 		}
-		_, _, err = service.CompleteChat(context.Background(), auth, "", chatRequest())
+		_, _, err = service.CompleteChat(context.Background(), auth, chatRequest())
 		gatewayErr, ok := err.(*GatewayError)
 		if !ok {
 			t.Fatalf("error type = %T", err)
@@ -275,7 +275,7 @@ func TestRetryAfterHintRespectedAndBudgetClamped(t *testing.T) {
 		if err != nil {
 			t.Fatalf("authenticate: %v", err)
 		}
-		if _, _, err := service.CompleteChat(context.Background(), auth, "", chatRequest()); err != nil {
+		if _, _, err := service.CompleteChat(context.Background(), auth, chatRequest()); err != nil {
 			t.Fatalf("complete chat: %v", err)
 		}
 		if client.calls != 2 {
@@ -342,7 +342,7 @@ func TestRetriesShareOverallBudgetNeverMultiplyTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, _, err = service.CompleteChat(context.Background(), auth, "", chatRequest())
+	_, _, err = service.CompleteChat(context.Background(), auth, chatRequest())
 
 	gatewayErr, ok := err.(*GatewayError)
 	if !ok || gatewayErr.Category != provider.ProviderUnavailable {
@@ -386,7 +386,7 @@ func TestClientCancellationStopsRetriesDuringBackoff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, _, err = service.CompleteChat(ctx, auth, "", chatRequest())
+	_, _, err = service.CompleteChat(ctx, auth, chatRequest())
 	if err == nil {
 		t.Fatal("complete chat returned nil error after cancellation")
 	}
@@ -425,7 +425,7 @@ func TestStreamOpenRetriesOnlyUntilEstablished(t *testing.T) {
 		if err != nil {
 			t.Fatalf("authenticate: %v", err)
 		}
-		record, err := service.StreamChat(context.Background(), auth, "", streamChatRequest(), &recordingStreamSink{})
+		record, err := service.StreamChat(context.Background(), auth, streamChatRequest(), &recordingStreamSink{})
 		if err != nil {
 			t.Fatalf("stream chat: %v", err)
 		}
@@ -459,7 +459,7 @@ func TestStreamOpenRetriesOnlyUntilEstablished(t *testing.T) {
 		if err != nil {
 			t.Fatalf("authenticate: %v", err)
 		}
-		_, err = service.StreamChat(context.Background(), auth, "", streamChatRequest(), &recordingStreamSink{})
+		_, err = service.StreamChat(context.Background(), auth, streamChatRequest(), &recordingStreamSink{})
 		gatewayErr, ok := err.(*GatewayError)
 		if !ok || gatewayErr.Category != provider.StreamInterrupted {
 			t.Fatalf("error = %#v, want stream_interrupted", err)
@@ -489,7 +489,7 @@ func TestStreamOpenRetriesOnlyUntilEstablished(t *testing.T) {
 		if err != nil {
 			t.Fatalf("authenticate: %v", err)
 		}
-		_, err = service.StreamChat(context.Background(), auth, "", streamChatRequest(), &recordingStreamSink{})
+		_, err = service.StreamChat(context.Background(), auth, streamChatRequest(), &recordingStreamSink{})
 		gatewayErr, ok := err.(*GatewayError)
 		if !ok || gatewayErr.Category != provider.ProviderRateLimited {
 			t.Fatalf("error = %#v, want provider_rate_limited", err)
@@ -588,10 +588,10 @@ func TestRateLimitRejectionHappensBeforeRowAndProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	if _, _, err := service.CompleteChat(context.Background(), auth, "", chatRequest()); err != nil {
+	if _, _, err := service.CompleteChat(context.Background(), auth, chatRequest()); err != nil {
 		t.Fatalf("first request: %v", err)
 	}
-	_, _, err = service.CompleteChat(context.Background(), auth, "", chatRequest())
+	_, _, err = service.CompleteChat(context.Background(), auth, chatRequest())
 	gatewayErr, ok := err.(*GatewayError)
 	if !ok || gatewayErr.Category != provider.RateLimited {
 		t.Fatalf("error = %#v, want rate_limited", err)
@@ -644,13 +644,13 @@ func TestConcurrencyGeneralSlotBound(t *testing.T) {
 	}
 	firstDone := make(chan outcome, 1)
 	go func() {
-		_, _, err := service.CompleteChat(context.Background(), auth, "", chatRequest())
+		_, _, err := service.CompleteChat(context.Background(), auth, chatRequest())
 		firstDone <- outcome{err: err}
 	}()
 	<-client.started
 
 	// Second request must be rejected immediately: no provider call, no row.
-	_, _, err = service.CompleteChat(context.Background(), auth, "", chatRequest())
+	_, _, err = service.CompleteChat(context.Background(), auth, chatRequest())
 	gatewayErr, ok := err.(*GatewayError)
 	if !ok || gatewayErr.Category != provider.RateLimited {
 		t.Fatalf("second request error = %#v, want rate_limited capacity rejection", err)
@@ -668,7 +668,7 @@ func TestConcurrencyGeneralSlotBound(t *testing.T) {
 	}
 
 	// After release the slot is available again.
-	if _, _, err := service.CompleteChat(context.Background(), auth, "", chatRequest()); err != nil {
+	if _, _, err := service.CompleteChat(context.Background(), auth, chatRequest()); err != nil {
 		t.Fatalf("request after release: %v", err)
 	}
 	client.mu.Lock()
@@ -708,14 +708,14 @@ func TestConcurrencyStreamCapIsAdditionalToGeneralCap(t *testing.T) {
 
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := service.StreamChat(context.Background(), auth, "", streamChatRequest(), &recordingStreamSink{})
+		_, err := service.StreamChat(context.Background(), auth, streamChatRequest(), &recordingStreamSink{})
 		firstDone <- err
 	}()
 	<-streamStarted
 
 	// A second stream holds no free stream slot -> rejected, and the rejected
 	// request must not reach the provider.
-	_, err = service.StreamChat(context.Background(), auth, "", streamChatRequest(), &recordingStreamSink{})
+	_, err = service.StreamChat(context.Background(), auth, streamChatRequest(), &recordingStreamSink{})
 	gatewayErr, ok := err.(*GatewayError)
 	if !ok || gatewayErr.Category != provider.RateLimited {
 		t.Fatalf("second stream error = %#v, want rate_limited capacity rejection", err)
@@ -726,7 +726,7 @@ func TestConcurrencyStreamCapIsAdditionalToGeneralCap(t *testing.T) {
 
 	// A non-stream request still fits the general cap (2 general slots, only
 	// one in use by the stream) while the stream cap is exhausted.
-	if _, _, err := service.CompleteChat(context.Background(), auth, "", chatRequest()); err != nil {
+	if _, _, err := service.CompleteChat(context.Background(), auth, chatRequest()); err != nil {
 		t.Fatalf("non-stream request while stream cap full: %v", err)
 	}
 
@@ -943,10 +943,10 @@ func TestAdmissionRejectionVisibility(t *testing.T) {
 		if err != nil {
 			t.Fatalf("authenticate: %v", err)
 		}
-		if _, _, err := service.CompleteChat(context.Background(), auth, "", chatRequest()); err != nil {
+		if _, _, err := service.CompleteChat(context.Background(), auth, chatRequest()); err != nil {
 			t.Fatalf("first request: %v", err)
 		}
-		if _, _, err := service.CompleteChat(context.Background(), auth, "", chatRequest()); err == nil {
+		if _, _, err := service.CompleteChat(context.Background(), auth, chatRequest()); err == nil {
 			t.Fatal("second request unexpectedly allowed")
 		}
 		attrs := capture.attrs()
@@ -986,7 +986,7 @@ func TestAdmissionRejectionVisibility(t *testing.T) {
 		}
 		done := make(chan error, 1)
 		go func() {
-			_, _, err := service.CompleteChat(context.Background(), auth, "", chatRequest())
+			_, _, err := service.CompleteChat(context.Background(), auth, chatRequest())
 			done <- err
 		}()
 		<-client.started
@@ -995,7 +995,7 @@ func TestAdmissionRejectionVisibility(t *testing.T) {
 			<-done
 		}()
 
-		if _, _, err := service.CompleteChat(context.Background(), auth, "", chatRequest()); err == nil {
+		if _, _, err := service.CompleteChat(context.Background(), auth, chatRequest()); err == nil {
 			t.Fatal("second request unexpectedly allowed")
 		}
 		attrs := capture.attrs()
@@ -1076,7 +1076,7 @@ func TestRedirectChainDialFailureIsNotRetriedAsPreProviderFailure(t *testing.T) 
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, record, err := service.CompleteChat(context.Background(), auth, "", chatRequest())
+	_, record, err := service.CompleteChat(context.Background(), auth, chatRequest())
 	gatewayErr, ok := err.(*GatewayError)
 	if !ok || gatewayErr.Category != provider.ProviderUnavailable {
 		t.Fatalf("error = %#v, want provider_unavailable", err)

@@ -17,6 +17,7 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/config"
 	"github.com/lllmml/production-go-llm-gateway/internal/controlplane"
 	"github.com/lllmml/production-go-llm-gateway/internal/dataplane"
+	"github.com/lllmml/production-go-llm-gateway/internal/pprof"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/anthropic"
 	"github.com/lllmml/production-go-llm-gateway/internal/provider/deepseek"
@@ -76,6 +77,36 @@ func run() error {
 	}
 
 	logger := telemetry.NewLogger(os.Stdout, cfg.LogLevel)
+
+	// Week 10 (ADR-019 D2): one app-owned Metrics value with its own
+	// Prometheus registry. The private Operations Plane serves it at /metrics;
+	// the data and control planes never do. Creating it before any
+	// database/provider wiring keeps this failure independent of them.
+	metrics, err := telemetry.NewMetrics()
+	if err != nil {
+		return fmt.Errorf("configure metrics: %w", err)
+	}
+
+	// Week 10 tracing (ADR-019 D8/D9/N1): one gateway-owned Runtime per
+	// process. An empty OTEL_EXPORTER_OTLP_ENDPOINT keeps tracing disabled
+	// (noop tracer, no exporter). The fallback defer is registered immediately
+	// so a wiring failure after this point still performs the single real
+	// telemetry shutdown (construction corner where App.Run never runs); when
+	// App.Run does run, its Run-scope hook is the lifecycle owner. Runtime
+	// shutdown uses explicit first-caller ownership (shutdownMu/shutdownOwned):
+	// whichever call wins runs the one real shutdown, and this fallback's later
+	// call returns nil immediately without waiting or re-running it.
+	tracingRuntime, err := telemetry.NewRuntime(cfg.OTELExporterOTLPEndpoint, cfg.OTELServiceName)
+	if err != nil {
+		return fmt.Errorf("configure tracing: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
+		defer cancelShutdown()
+		if err := tracingRuntime.Shutdown(shutdownCtx); err != nil {
+			logger.Error("tracing shutdown failed", "error", err)
+		}
+	}()
 
 	connectCtx, cancelConnect := context.WithTimeout(context.Background(), cfg.DatabaseConnectTime)
 	database, err := postgres.Open(connectCtx, cfg.DatabaseURL)
@@ -213,6 +244,8 @@ func run() error {
 		MaxConcurrentStreams:      cfg.MaxConcurrentStreams,
 		RetryMaxRetries:           cfg.RetryMaxRetries,
 		RetryBackoffMax:           cfg.RetryBackoffMax,
+		Metrics:                   metrics,
+		Tracer:                    tracingRuntime.Tracer(),
 	})
 	if err != nil {
 		database.Close()
@@ -220,6 +253,21 @@ func run() error {
 	}
 	dataPlaneMux := http.NewServeMux()
 	dataplane.NewHandler(dataPlaneService).Register(dataPlaneMux)
+
+	// Week 10 A3d protected pprof (ADR-019 D8). Disabled unless explicitly
+	// enabled; enabling requires a PPROF_TOKEN (config-validated). The token is
+	// hashed into the handler and the config copy is cleared immediately; the
+	// Ops plane remains the only mount point and is never publicly routed.
+	var pprofHandler http.Handler
+	if cfg.PprofEnabled {
+		protectedPprof, err := pprof.NewHandler(cfg.PprofToken)
+		if err != nil {
+			database.Close()
+			return fmt.Errorf("configure protected pprof: %w", err)
+		}
+		cfg.PprofToken = ""
+		pprofHandler = protectedPprof
+	}
 
 	application := app.New(app.Options{
 		DataPlaneAddr:       cfg.DataPlaneAddr,
@@ -229,6 +277,11 @@ func run() error {
 		ShutdownTimeout:     cfg.ShutdownTimeout,
 		DataPlaneHandler:    dataPlaneMux,
 		ControlPlaneHandler: controlPlaneHandler,
+		MetricsHandler:      metrics.Handler(),
+		PprofHandler:        pprofHandler,
+		TelemetryShutdown: func(ctx context.Context) error {
+			return tracingRuntime.Shutdown(ctx)
+		},
 	}, database, logger)
 
 	runCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

@@ -1,0 +1,26 @@
+# Week 10 A3a: Grafana Tempo configuration for the local self-hosted
+# observability stack (ADR-019 D10). Single-node mode with local storage.
+#
+# Receiver: OTLP gRPC on 4317 (fed by the Collector). Query API on 3200 is
+# used by Grafana (internal network) and by A3a evidence / the integration
+# test (host-published 127.0.0.1:3200).
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          # Collector -> Tempo on the private compose network only. This port
+          # is deliberately NOT published to the host: the host Gateway sends
+          # OTLP to the Collector (127.0.0.1:4317), never directly to Tempo.
+          endpoint: 0.0.0.0:4317
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/traces
+    wal:
+      path: /var/tempo/wal

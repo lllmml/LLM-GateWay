@@ -1,0 +1,38 @@
+# Week 10 A3a: OpenTelemetry Collector (contrib) configuration for the local
+# self-hosted observability stack (ADR-019 D10).
+#
+# The contrib image is used (not the core image) so later processor/exporter
+# needs (tail sampling, filter, attributes, debug) require no image change.
+#
+# Pipeline: OTLP gRPC/HTTP (from the host Gateway) -> batch -> OTLP gRPC to
+# Tempo. Metrics stay out of the Collector: Prometheus scrapes the Gateway's
+# private Ops plane /metrics directly (pull), it is never pushed here.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  # Internal compose-network only; insecure TLS is fine inside the private
+  # stack (never published beyond 127.0.0.1 host bindings).
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+extensions:
+  health_check: {}
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo]

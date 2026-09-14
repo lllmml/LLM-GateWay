@@ -68,7 +68,7 @@ func TestServiceConsumesLimiterRejectionBeforeAnyRowOrProvider(t *testing.T) {
 	}}
 	service := newSeamService(t, limiter, store, providerClient)
 
-	_, _, err := service.CompleteChat(context.Background(), AuthContext{VirtualKeyID: "k1", ProjectID: "p1"}, "trace-1", seamChat())
+	_, _, err := service.CompleteChat(context.Background(), AuthContext{VirtualKeyID: "k1", ProjectID: "p1"}, seamChat())
 	if err == nil {
 		t.Fatal("rejected admission returned no error")
 	}
@@ -106,7 +106,7 @@ func TestServicePropagatesLimiterCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, err := service.CompleteChat(ctx, AuthContext{VirtualKeyID: "k1", ProjectID: "p1"}, "trace-2", seamChat())
+	_, _, err := service.CompleteChat(ctx, AuthContext{VirtualKeyID: "k1", ProjectID: "p1"}, seamChat())
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled request error = %v, want context.Canceled", err)
 	}
@@ -136,7 +136,7 @@ func TestServiceAllowsThroughLimiter(t *testing.T) {
 	}}
 	service := newSeamService(t, limiter, store, providerClient)
 
-	_, _, err := service.CompleteChat(context.Background(), AuthContext{VirtualKeyID: "k-missing", ProjectID: "p-missing"}, "trace-3", seamChat())
+	_, _, err := service.CompleteChat(context.Background(), AuthContext{VirtualKeyID: "k-missing", ProjectID: "p-missing"}, seamChat())
 	if limiter.calls != 1 {
 		t.Fatalf("limiter consulted %d times, want 1", limiter.calls)
 	}

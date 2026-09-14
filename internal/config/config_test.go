@@ -472,3 +472,113 @@ func TestDistributedConfigValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadOTELSettingsDefaults(t *testing.T) {
+	cfg, err := load(mapLookup(requiredTestValues()))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.OTELExporterOTLPEndpoint != "" {
+		t.Fatalf("OTELExporterOTLPEndpoint = %q, want empty (tracing disabled by default)", cfg.OTELExporterOTLPEndpoint)
+	}
+	if cfg.OTELServiceName != defaultOTELServiceName {
+		t.Fatalf("OTELServiceName = %q, want %q", cfg.OTELServiceName, defaultOTELServiceName)
+	}
+}
+
+func TestLoadParsesOTELSettings(t *testing.T) {
+	values := requiredTestValues()
+	values["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://127.0.0.1:4317"
+	values["OTEL_SERVICE_NAME"] = "edge-gateway"
+	cfg, err := load(mapLookup(values))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.OTELExporterOTLPEndpoint != "http://127.0.0.1:4317" {
+		t.Fatalf("OTELExporterOTLPEndpoint = %q, want parsed value", cfg.OTELExporterOTLPEndpoint)
+	}
+	if cfg.OTELServiceName != "edge-gateway" {
+		t.Fatalf("OTELServiceName = %q, want override", cfg.OTELServiceName)
+	}
+}
+
+func TestLoadValidatesOTLPEndpoint(t *testing.T) {
+	valid := []string{
+		"http://127.0.0.1:4317",
+		"https://collector.example.com:443",
+		"http://otel-collector:4317",
+	}
+	for _, endpoint := range valid {
+		values := requiredTestValues()
+		values["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
+		if _, err := load(mapLookup(values)); err != nil {
+			t.Errorf("valid endpoint %q rejected: %v", endpoint, err)
+		}
+	}
+	invalid := []string{
+		"not a url",
+		"ftp://127.0.0.1:4317",
+		"http://user:pass@127.0.0.1:4317",
+		"http://127.0.0.1:4317/with/path",
+		"http://127.0.0.1:4317?query=1",
+		"127.0.0.1:4317",
+	}
+	for _, endpoint := range invalid {
+		values := requiredTestValues()
+		values["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
+		if _, err := load(mapLookup(values)); err == nil {
+			t.Errorf("invalid endpoint %q accepted, want an error", endpoint)
+		}
+	}
+}
+
+func TestLoadPprofDefaultsDisabled(t *testing.T) {
+	cfg, err := load(mapLookup(requiredTestValues()))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.PprofEnabled {
+		t.Fatal("PPROF_ENABLED must default to false")
+	}
+	if cfg.PprofToken != "" {
+		t.Fatalf("PPROF_TOKEN = %q, want empty", cfg.PprofToken)
+	}
+}
+
+func TestLoadParsesPprofSettings(t *testing.T) {
+	values := requiredTestValues()
+	values["PPROF_ENABLED"] = "true"
+	values["PPROF_TOKEN"] = "a-pprof-token"
+	cfg, err := load(mapLookup(values))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !cfg.PprofEnabled || cfg.PprofToken != "a-pprof-token" {
+		t.Fatalf("pprof = (%v, %q), want (true, a-pprof-token)", cfg.PprofEnabled, cfg.PprofToken)
+	}
+}
+
+func TestLoadRejectsPprofWithoutTokenAndBadBool(t *testing.T) {
+	enabledNoToken := requiredTestValues()
+	enabledNoToken["PPROF_ENABLED"] = "true"
+	if _, err := load(mapLookup(enabledNoToken)); err == nil {
+		t.Fatal("PPROF_ENABLED=true without PPROF_TOKEN accepted, want an error")
+	}
+
+	badBool := requiredTestValues()
+	badBool["PPROF_ENABLED"] = "yes"
+	if _, err := load(mapLookup(badBool)); err == nil {
+		t.Fatal("PPROF_ENABLED=yes accepted, want an error")
+	}
+
+	// A token without PPROF_ENABLED is ignored (pprof stays disabled).
+	tokenOnly := requiredTestValues()
+	tokenOnly["PPROF_TOKEN"] = "some-token"
+	cfg, err := load(mapLookup(tokenOnly))
+	if err != nil {
+		t.Fatalf("token-only config: %v", err)
+	}
+	if cfg.PprofEnabled {
+		t.Fatal("PPROF_TOKEN without PPROF_ENABLED must stay disabled")
+	}
+}

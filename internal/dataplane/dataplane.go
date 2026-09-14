@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/lllmml/production-go-llm-gateway/internal/apikey"
@@ -16,6 +17,11 @@ import (
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
 	"github.com/lllmml/production-go-llm-gateway/internal/ratelimit"
 	"github.com/lllmml/production-go-llm-gateway/internal/security"
+	"github.com/lllmml/production-go-llm-gateway/internal/telemetry"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -42,6 +48,27 @@ const finalizeTimeout = 5 * time.Second
 // budget: pricing failure degrades to NULL cost, while the final durable write
 // still receives a live context (ADR-016).
 const pricingLookupBudget = 1 * time.Second
+
+// dataplaneTracerName names the tracer this package starts spans with. It
+// matches telemetry.Runtime's tracer name so spans keep one service identity.
+const dataplaneTracerName = "gateway"
+
+// attrGatewayRequestRowID is the only span attribute A2b1 sets on the root
+// request span: the durable gateway_requests row id (never a client-supplied
+// X-Request-ID). The llm.* attributes and error status land with the
+// child-span slice (A2b2).
+const attrGatewayRequestRowID = "gateway.request_row_id"
+
+// Whitelisted span attributes (ADR-019 D11 / A2b2): only these values may
+// appear on spans. Raw models, error message text, prompts, completions, and
+// credential material are never recorded.
+const (
+	attrLLMProvider          = "llm.provider"
+	attrLLMModelFamily       = "llm.model_family"
+	attrLLMStream            = "llm.stream"
+	attrGatewayRetryAttempt  = "gateway.retry_attempt"
+	attrGatewayErrorCategory = "gateway.error_category"
+)
 
 type AuthContext struct {
 	ProjectID    string
@@ -153,6 +180,16 @@ type Options struct {
 	// RetryBackoffMax caps the default exponential backoff window used when
 	// the provider sends no Retry-After hint.
 	RetryBackoffMax time.Duration
+
+	// Metrics is the app-owned Week 10 telemetry value (ADR-019 D2/D3). It is
+	// optional: when nil every metric call is a no-op, so existing tests and
+	// embedded uses run unchanged.
+	Metrics *telemetry.Metrics
+
+	// Tracer starts gateway spans (ADR-019 D25). It is optional: when nil the
+	// service uses its own noop tracer, so Start() always works and business
+	// code never branches on tracing being enabled.
+	Tracer trace.Tracer
 }
 
 type Service struct {
@@ -171,6 +208,8 @@ type Service struct {
 	streamSlots           chan struct{}
 	retryMaxRetries       int
 	retryBackoffMax       time.Duration
+	metrics               *telemetry.Metrics
+	tracer                trace.Tracer
 	jitter                func(int64) int64
 	now                   func() time.Time
 	// onRetryWait is an unexported test hook invoked immediately before the
@@ -229,8 +268,17 @@ func NewService(options Options) (*Service, error) {
 		maxConcurrentStreams:      options.MaxConcurrentStreams,
 		retryMaxRetries:           options.RetryMaxRetries,
 		retryBackoffMax:           retryBackoffMax,
+		metrics:                   options.Metrics,
+		tracer:                    options.Tracer,
 		jitter:                    rand.Int64N,
 		now:                       time.Now,
+	}
+	if service.tracer == nil {
+		// Disabled tracing uses an app-owned noop tracer: Start() succeeds and
+		// yields a non-recording span with an invalid SpanContext, so no
+		// trace_id is ever derived or persisted (ADR-019 D1) and no guard is
+		// needed anywhere in business code.
+		service.tracer = trace.NewNoopTracerProvider().Tracer(dataplaneTracerName)
 	}
 	if options.MaxConcurrentRequests > 0 {
 		service.requestSlots = make(chan struct{}, options.MaxConcurrentRequests)
@@ -260,15 +308,15 @@ func (s *Service) Authenticate(ctx context.Context, rawKey string) (AuthContext,
 	return auth, nil
 }
 
-func (s *Service) CompleteChat(ctx context.Context, auth AuthContext, traceID string, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
-	return s.CompleteChatStartedAt(ctx, auth, traceID, time.Now().UTC(), chat)
+func (s *Service) CompleteChat(ctx context.Context, auth AuthContext, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
+	return s.CompleteChatStartedAt(ctx, auth, time.Now().UTC(), chat)
 }
 
-func (s *Service) CompleteChatStartedAt(ctx context.Context, auth AuthContext, traceID string, requestStartedAt time.Time, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
-	return s.completeChat(ctx, auth, traceID, normalizedStartedAt(requestStartedAt), chat)
+func (s *Service) CompleteChatStartedAt(ctx context.Context, auth AuthContext, requestStartedAt time.Time, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
+	return s.completeChat(ctx, auth, normalizedStartedAt(requestStartedAt), chat)
 }
 
-func (s *Service) completeChat(ctx context.Context, auth AuthContext, traceID string, requestStartedAt time.Time, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
+func (s *Service) completeChat(ctx context.Context, auth AuthContext, requestStartedAt time.Time, chat provider.ChatRequest) (provider.Result, GatewayRequest, error) {
 	modelRef, err := provider.ParseModel(chat.Model)
 	if err != nil {
 		return provider.Result{}, GatewayRequest{}, NewError(provider.ModelNotSupported, "model must use provider/model-id format")
@@ -276,11 +324,18 @@ func (s *Service) completeChat(ctx context.Context, auth AuthContext, traceID st
 	if chat.Stream {
 		return provider.Result{}, GatewayRequest{}, NewError(provider.UnsupportedFeature, "streaming chat completions are not supported in this milestone")
 	}
+	// Bounded llm.* request metadata on the root span (ADR-019 D11).
+	setRequestSpanMeta(ctx, modelRef.Provider, modelRef.Model, false)
 	release, admissionErr := s.admit(ctx, auth, false)
 	if admissionErr != nil {
 		return provider.Result{}, GatewayRequest{}, admissionErr
 	}
 	defer release()
+	// ADR-019 D4: the in-flight gauge is a separate release closure created
+	// only after admission succeeded; it never touches the admission seam and
+	// is released exactly once when the operation completes.
+	endInFlight := s.trackInFlight(modelRef.Provider, false)
+	defer endInFlight()
 	client, ok := s.providers.Lookup(modelRef.Provider)
 	if !ok {
 		return provider.Result{}, GatewayRequest{}, NewError(provider.ProviderNotConfigured, "provider is not configured")
@@ -293,7 +348,8 @@ func (s *Service) completeChat(ctx context.Context, auth AuthContext, traceID st
 		return provider.Result{}, GatewayRequest{}, err
 	}
 
-	record, err := s.store.CreateGatewayRequest(ctx, CreateRequestParams{
+	createCtx, createSpan := s.tracer.Start(ctx, "usage.create_request_record")
+	record, err := s.store.CreateGatewayRequest(createCtx, CreateRequestParams{
 		ProjectID:            auth.ProjectID,
 		VirtualKeyID:         auth.VirtualKeyID,
 		ProviderCredentialID: credential.ID,
@@ -301,18 +357,26 @@ func (s *Service) completeChat(ctx context.Context, auth AuthContext, traceID st
 		Model:                modelRef.Model,
 		IsStream:             chat.Stream,
 		StartedAt:            requestStartedAt,
-		TraceID:              traceID,
+		TraceID:              otelRequestTraceID(createCtx),
 	})
+	if err != nil {
+		setSpanError(createSpan)
+	}
+	createSpan.End()
 	if err != nil {
 		return provider.Result{}, GatewayRequest{}, err
 	}
 	record.Provider = modelRef.Provider
+	// Once the durable row id exists it is the only identifier attached to the
+	// request span (ADR-019 A2 whitelist); a client X-Request-ID is never a
+	// span attribute.
+	setRootRowID(ctx, record.ID)
 
 	apiKey, err := s.decryptCredential(credential)
 	if err != nil {
 		category := provider.ProviderNotConfigured
 		if finalizeErr := s.finalize(ctx, record, nil, &category, nil); finalizeErr != nil {
-			return provider.Result{}, record, s.persistenceError(record, category, finalizeErr)
+			return provider.Result{}, record, s.persistenceError(ctx, record, category, finalizeErr)
 		}
 		return provider.Result{}, record, NewError(provider.ProviderNotConfigured, "provider credential could not be decrypted")
 	}
@@ -334,20 +398,28 @@ func (s *Service) completeChat(ctx context.Context, auth AuthContext, traceID st
 	var lastGatewayErr *GatewayError
 	retryCount := 0
 	for {
-		attemptCtx, cancel := context.WithDeadline(ctx, phaseDeadline)
+		// One provider.attempt span per try (ADR-019 D11): retries are sibling
+		// child spans of the request span, each carrying its retry index. Only
+		// whitelisted attributes are recorded - never error message text.
+		attemptCtx, attemptSpan := s.tracer.Start(ctx, "provider.attempt", trace.WithAttributes(attribute.String(attrGatewayRetryAttempt, strconv.Itoa(retryCount))))
+		attemptCtx, cancel := context.WithDeadline(attemptCtx, phaseDeadline)
 		lastResult, err = client.CompleteChat(attemptCtx, upstreamChat, provider.Credential{
 			APIKey:          apiKey,
 			BaseURLOverride: credential.BaseURLOverride,
 		})
 		cancel()
+		if err != nil {
+			lastGatewayErr = s.classifyAttemptError(err)
+			setSpanGatewayError(attemptSpan, string(lastGatewayErr.Category))
+		}
+		attemptSpan.End()
 		if err == nil {
 			record.RetryCount = int16(retryCount)
 			if finalizeErr := s.finalize(ctx, record, &lastResult, nil, lastResult.Usage); finalizeErr != nil {
-				return lastResult, record, s.persistenceError(record, "", finalizeErr)
+				return lastResult, record, s.persistenceError(ctx, record, "", finalizeErr)
 			}
 			return lastResult, record, nil
 		}
-		lastGatewayErr = s.classifyAttemptError(err)
 		if !s.retryAllowed(ctx, lastGatewayErr, phaseDeadline, retryCount) {
 			break
 		}
@@ -369,20 +441,20 @@ func (s *Service) completeChat(ctx context.Context, auth AuthContext, traceID st
 
 	record.RetryCount = int16(retryCount)
 	if finalizeErr := s.finalize(ctx, record, &lastResult, &lastGatewayErr.Category, nil); finalizeErr != nil {
-		return lastResult, record, s.persistenceError(record, lastGatewayErr.Category, finalizeErr)
+		return lastResult, record, s.persistenceError(ctx, record, lastGatewayErr.Category, finalizeErr)
 	}
 	return lastResult, record, lastGatewayErr
 }
 
-func (s *Service) StreamChat(ctx context.Context, auth AuthContext, traceID string, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
-	return s.StreamChatStartedAt(ctx, auth, traceID, time.Now().UTC(), chat, sink)
+func (s *Service) StreamChat(ctx context.Context, auth AuthContext, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
+	return s.StreamChatStartedAt(ctx, auth, time.Now().UTC(), chat, sink)
 }
 
-func (s *Service) StreamChatStartedAt(ctx context.Context, auth AuthContext, traceID string, requestStartedAt time.Time, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
-	return s.streamChat(ctx, auth, traceID, normalizedStartedAt(requestStartedAt), chat, sink)
+func (s *Service) StreamChatStartedAt(ctx context.Context, auth AuthContext, requestStartedAt time.Time, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
+	return s.streamChat(ctx, auth, normalizedStartedAt(requestStartedAt), chat, sink)
 }
 
-func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID string, requestStartedAt time.Time, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
+func (s *Service) streamChat(ctx context.Context, auth AuthContext, requestStartedAt time.Time, chat provider.ChatRequest, sink StreamSink) (GatewayRequest, error) {
 	if sink == nil {
 		return GatewayRequest{}, NewError(provider.InternalError, "request could not be completed")
 	}
@@ -398,11 +470,17 @@ func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID stri
 	if !ok {
 		return GatewayRequest{}, NewError(provider.UnsupportedFeature, "streaming chat completions are not supported for this provider")
 	}
+	// Bounded llm.* request metadata on the root span (ADR-019 D11).
+	setRequestSpanMeta(ctx, modelRef.Provider, modelRef.Model, true)
 	release, admissionErr := s.admit(ctx, auth, true)
 	if admissionErr != nil {
 		return GatewayRequest{}, admissionErr
 	}
 	defer release()
+	// ADR-019 D4: same separate in-flight release as the non-stream path;
+	// streaming additionally increments gateway_active_streams{provider}.
+	endInFlight := s.trackInFlight(modelRef.Provider, true)
+	defer endInFlight()
 	credential, err := s.store.ResolveProviderCredential(ctx, auth.ProjectID, modelRef.Provider)
 	if errors.Is(err, ErrNotFound) {
 		return GatewayRequest{}, NewError(provider.ProviderNotConfigured, "provider is not configured")
@@ -411,7 +489,8 @@ func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID stri
 		return GatewayRequest{}, err
 	}
 
-	record, err := s.store.CreateGatewayRequest(ctx, CreateRequestParams{
+	createCtx, createSpan := s.tracer.Start(ctx, "usage.create_request_record")
+	record, err := s.store.CreateGatewayRequest(createCtx, CreateRequestParams{
 		ProjectID:            auth.ProjectID,
 		VirtualKeyID:         auth.VirtualKeyID,
 		ProviderCredentialID: credential.ID,
@@ -419,18 +498,23 @@ func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID stri
 		Model:                modelRef.Model,
 		IsStream:             true,
 		StartedAt:            requestStartedAt,
-		TraceID:              traceID,
+		TraceID:              otelRequestTraceID(createCtx),
 	})
+	if err != nil {
+		setSpanError(createSpan)
+	}
+	createSpan.End()
 	if err != nil {
 		return GatewayRequest{}, err
 	}
 	record.Provider = modelRef.Provider
+	setRootRowID(ctx, record.ID)
 
 	apiKey, err := s.decryptCredential(credential)
 	if err != nil {
 		category := provider.ProviderNotConfigured
 		if finalizeErr := s.finalizeStream(ctx, record, nil, &category, nil, nil, nil); finalizeErr != nil {
-			return record, s.persistenceError(record, category, finalizeErr)
+			return record, s.persistenceError(ctx, record, category, finalizeErr)
 		}
 		return record, NewError(provider.ProviderNotConfigured, "provider credential could not be decrypted")
 	}
@@ -455,7 +539,11 @@ func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID stri
 	var lastOpenErr *GatewayError
 	retryCount := 0
 	for {
-		attemptCtx, cancel := context.WithDeadline(ctx, phaseDeadline)
+		// provider.attempt wraps the stream OPEN attempts; a successful
+		// establishment ends the attempt span (there is no provider.stream
+		// span in the A2 hierarchy). Retries are sibling child spans.
+		attemptCtx, attemptSpan := s.tracer.Start(ctx, "provider.attempt", trace.WithAttributes(attribute.String(attrGatewayRetryAttempt, strconv.Itoa(retryCount))))
+		attemptCtx, cancel := context.WithDeadline(attemptCtx, phaseDeadline)
 		result, err = streamingClient.StreamChat(attemptCtx, upstreamChat, provider.Credential{
 			APIKey:          apiKey,
 			BaseURLOverride: credential.BaseURLOverride,
@@ -464,6 +552,7 @@ func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID stri
 			// STREAM ESTABLISHED: the retryable open window is closed and the
 			// attempt context must stay alive for the whole downstream read
 			// loop, so its cancellation is deferred instead of run now.
+			attemptSpan.End()
 			defer cancel()
 			break
 		}
@@ -473,6 +562,8 @@ func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID stri
 		} else {
 			lastOpenErr = classifyStreamOpenError(ctx, s.classifyAttemptError(err))
 		}
+		setSpanGatewayError(attemptSpan, string(lastOpenErr.Category))
+		attemptSpan.End()
 		if !s.retryAllowed(ctx, lastOpenErr, phaseDeadline, retryCount) {
 			break
 		}
@@ -496,7 +587,7 @@ func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID stri
 		lastOpenErr = classifyStreamOpenError(ctx, lastOpenErr)
 		record.RetryCount = int16(retryCount)
 		if finalizeErr := s.finalizeStream(ctx, record, &result, &lastOpenErr.Category, nil, nil, nil); finalizeErr != nil {
-			return record, s.persistenceError(record, lastOpenErr.Category, finalizeErr)
+			return record, s.persistenceError(ctx, record, lastOpenErr.Category, finalizeErr)
 		}
 		return record, lastOpenErr
 	}
@@ -507,7 +598,7 @@ func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID stri
 	if err := sink.Prepare(record); err != nil {
 		category := provider.StreamInterrupted
 		if finalizeErr := s.finalizeStream(ctx, record, &result, &category, nil, nil, nil); finalizeErr != nil {
-			return record, s.persistenceError(record, category, finalizeErr)
+			return record, s.persistenceError(ctx, record, category, finalizeErr)
 		}
 		return record, NewError(provider.StreamInterrupted, "stream interrupted")
 	}
@@ -519,14 +610,14 @@ func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID stri
 		if err != nil {
 			category := provider.StreamInterrupted
 			if finalizeErr := s.finalizeStream(ctx, record, &result, &category, nil, firstChunkAt, ttftMS); finalizeErr != nil {
-				return record, s.persistenceError(record, category, finalizeErr)
+				return record, s.persistenceError(ctx, record, category, finalizeErr)
 			}
 			return record, NewError(provider.StreamInterrupted, "stream interrupted")
 		}
 		if err := sink.WriteEvent(event); err != nil {
 			category := provider.StreamInterrupted
 			if finalizeErr := s.finalizeStream(ctx, record, &result, &category, nil, firstChunkAt, ttftMS); finalizeErr != nil {
-				return record, s.persistenceError(record, category, finalizeErr)
+				return record, s.persistenceError(ctx, record, category, finalizeErr)
 			}
 			return record, NewError(provider.StreamInterrupted, "stream interrupted")
 		}
@@ -538,7 +629,7 @@ func (s *Service) streamChat(ctx context.Context, auth AuthContext, traceID stri
 		}
 		if event.Done {
 			if err := s.finalizeStream(ctx, record, &result, nil, result.Stream.Usage(), firstChunkAt, ttftMS); err != nil {
-				return record, s.persistenceError(record, "", err)
+				return record, s.persistenceError(ctx, record, "", err)
 			}
 			return record, nil
 		}
@@ -563,14 +654,105 @@ func classifyStreamOpenError(ctx context.Context, gatewayErr *GatewayError) *Gat
 // cancelled request, ADR-018 D1). The returned release function must be
 // called exactly once when the admitted operation finishes; it is safe under
 // early returns and panics when deferred.
-func (s *Service) admit(ctx context.Context, auth AuthContext, stream bool) (func(), error) {
+// otelRequestTraceID returns the 32-character hex OTel TraceID of the active
+// span in ctx, or "" when ctx carries no valid span context (noop tracer or
+// a context without a root span). An empty value is persisted as NULL; a
+// gateway-generated UUID fallback no longer exists (ADR-019 D1/D4).
+func otelRequestTraceID(ctx context.Context) string {
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		return ""
+	}
+	return sc.TraceID().String()
+}
+
+// setRootRowID attaches the durable gateway_requests row id to the request
+// span in ctx once the row exists. Setting an attribute on a noop/
+// non-recording span is a no-op.
+func setRootRowID(ctx context.Context, rowID string) {
+	if rowID == "" {
+		return
+	}
+	trace.SpanFromContext(ctx).SetAttributes(attribute.String(attrGatewayRequestRowID, rowID))
+}
+
+// setRequestSpanMeta attaches the bounded llm.* attributes to the current
+// request span once provider/model are parsed. Attributes are only recorded
+// for the supported provider namespaces and never include a raw model string
+// (ADR-019 D5/D11).
+func setRequestSpanMeta(ctx context.Context, providerName provider.Name, model string, stream bool) {
+	if !telemetry.ProviderSupported(string(providerName)) {
+		return
+	}
+	streamValue := "false"
+	if stream {
+		streamValue = "true"
+	}
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.String(attrLLMProvider, string(providerName)),
+		attribute.String(attrLLMModelFamily, telemetry.ModelFamily(string(providerName), model)),
+		attribute.String(attrLLMStream, streamValue),
+	)
+}
+
+// setSpanGatewayError marks a span failed with a whitelisted gateway error
+// category attribute. No error message text is ever recorded (ADR-019 D11).
+func setSpanGatewayError(span trace.Span, category string) {
+	if category == "" {
+		return
+	}
+	span.SetAttributes(attribute.String(attrGatewayErrorCategory, category))
+	span.SetStatus(codes.Error, "")
+}
+
+// setSpanError marks a span failed without any attribute (internal errors
+// carry no gateway category and no message text).
+func setSpanError(span trace.Span) {
+	span.SetStatus(codes.Error, "")
+}
+
+// gatewayCategoryOf extracts the stable gateway error category from an error,
+// returning "" when the error is not a *GatewayError.
+func gatewayCategoryOf(err error) string {
+	var gatewayErr *GatewayError
+	if errors.As(err, &gatewayErr) {
+		return string(gatewayErr.Category)
+	}
+	return ""
+}
+
+// trackInFlight returns a no-op when no metrics are wired; otherwise it
+// delegates to telemetry.Metrics.TrackInFlight so the in-flight gauges stay
+// decoupled from the admit() seam (ADR-019 D4).
+func (s *Service) trackInFlight(providerName provider.Name, stream bool) func() {
+	if s.metrics == nil {
+		return func() {}
+	}
+	return s.metrics.TrackInFlight(string(providerName), stream)
+}
+
+func (s *Service) admit(ctx context.Context, auth AuthContext, stream bool) (release func(), err error) {
+	// rate_limit.check covers the full admission decision (rate limiter +
+	// concurrency slots). Cancellation propagates without consuming quota and
+	// is recorded as a span failure with no category attribute (ADR-018 D1).
+	ctx, span := s.tracer.Start(ctx, "rate_limit.check")
+	defer func() {
+		if err != nil {
+			if category := gatewayCategoryOf(err); category != "" {
+				setSpanGatewayError(span, category)
+			} else {
+				setSpanError(span)
+			}
+		}
+		span.End()
+	}()
 	if s.rateLimiter != nil {
 		decision, err := s.rateLimiter.Admit(ctx, auth.VirtualKeyID, auth.ProjectID)
 		if err != nil {
 			return nil, err
 		}
 		if !decision.Allowed {
-			s.logAdmissionRejection(auth, "rate_limit", string(decision.BlockingScope), decision.RetryAfter)
+			s.logAdmissionRejection(ctx, auth, "rate_limit", string(decision.BlockingScope), decision.RetryAfter)
 			retryAfter := decision.RetryAfter
 			return nil, &GatewayError{
 				Category:   provider.RateLimited,
@@ -586,7 +768,7 @@ func (s *Service) admit(ctx context.Context, auth AuthContext, stream bool) (fun
 		case s.requestSlots <- struct{}{}:
 			releaseGeneral = func() { <-s.requestSlots }
 		default:
-			s.logAdmissionRejection(auth, "concurrent_requests", "", 0)
+			s.logAdmissionRejection(ctx, auth, "concurrent_requests", "", 0)
 			return nil, NewError(provider.RateLimited, "concurrent request limit reached")
 		}
 	}
@@ -597,7 +779,7 @@ func (s *Service) admit(ctx context.Context, auth AuthContext, stream bool) (fun
 	case s.streamSlots <- struct{}{}:
 	default:
 		releaseGeneral() // never leak the general slot when the stream slot is full
-		s.logAdmissionRejection(auth, "concurrent_streams", "", 0)
+		s.logAdmissionRejection(ctx, auth, "concurrent_streams", "", 0)
 		return nil, NewError(provider.RateLimited, "concurrent stream limit reached")
 	}
 	// The composite release is deferred by the caller and therefore runs
@@ -613,7 +795,7 @@ func (s *Service) admit(ctx context.Context, auth AuthContext, stream bool) (fun
 // authorization material, credentials, prompt/response bodies, or provider
 // headers. scope is empty for concurrency rejections; retryAfter is only set
 // where the gateway computed a client wait hint.
-func (s *Service) logAdmissionRejection(auth AuthContext, reason, scope string, retryAfter time.Duration) {
+func (s *Service) logAdmissionRejection(ctx context.Context, auth AuthContext, reason, scope string, retryAfter time.Duration) {
 	fields := []any{
 		slog.String("event", "admission_rejected"),
 		slog.String("reason", reason),
@@ -626,7 +808,7 @@ func (s *Service) logAdmissionRejection(auth AuthContext, reason, scope string, 
 	if retryAfter > 0 {
 		fields = append(fields, slog.Int64("retry_after_seconds", int64(formatRetryAfterSeconds(retryAfter))))
 	}
-	s.logger.Info("admission rejected", fields...)
+	s.logger.InfoContext(ctx, "admission rejected", fields...)
 }
 
 // formatRetryAfterSeconds returns the whole-second ceiling used for the
@@ -819,7 +1001,18 @@ func (s *Service) finalize(ctx context.Context, record GatewayRequest, result *p
 	return s.finalizeStream(ctx, record, streamResult, category, usage, nil, nil)
 }
 
-func (s *Service) finalizeStream(ctx context.Context, record GatewayRequest, result *provider.StreamResult, category *provider.ErrorCategory, usage *provider.Usage, firstChunkAt *time.Time, ttftMS *int64) error {
+func (s *Service) finalizeStream(ctx context.Context, record GatewayRequest, result *provider.StreamResult, category *provider.ErrorCategory, usage *provider.Usage, firstChunkAt *time.Time, ttftMS *int64) (err error) {
+	// usage.finalize covers the whole durable terminal-state determination
+	// (pricing lookup + finalize write) under one child span.
+	ctx, span := s.tracer.Start(ctx, "usage.finalize")
+	defer func() {
+		if category != nil {
+			setSpanGatewayError(span, string(*category))
+		} else if err != nil {
+			setSpanError(span)
+		}
+		span.End()
+	}()
 	finalizeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeTimeout)
 	defer cancel()
 
@@ -828,6 +1021,12 @@ func (s *Service) finalizeStream(ctx context.Context, record GatewayRequest, res
 	status := "succeeded"
 	if category != nil {
 		status = "failed"
+	}
+	// ADR-019 D3 counting semantics: the durable lifecycle metric is observed
+	// the moment the business terminal state is determined, before the durable
+	// write - a finalize persistence failure never changes the request count.
+	if s.metrics != nil {
+		s.metrics.ObserveRequest(string(record.Provider), record.Model, record.IsStream, status, completedAt.Sub(record.StartedAt))
 	}
 	var upstreamStatus *int32
 	var upstreamRequestID *string
@@ -899,14 +1098,14 @@ func (s *Service) resolvePricing(ctx context.Context, record GatewayRequest, usa
 		// No effective price version (for example DeepSeek in Week 7, whose
 		// cache/time-tier-aware pricing is deliberately deferred). Cost stays
 		// NULL; this is expected and not an error.
-		s.logger.Debug("no pricing version effective for model", logFields...)
+		s.logger.DebugContext(ctx, "no pricing version effective for model", logFields...)
 		return nil, nil
 	}
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			s.logger.Warn("pricing lookup budget exceeded; finalizing without estimated cost", logFields...)
+			s.logger.WarnContext(ctx, "pricing lookup budget exceeded; finalizing without estimated cost", logFields...)
 		} else {
-			s.logger.Warn("pricing lookup failed; finalizing without estimated cost", append(logFields, slog.String("error", err.Error()))...)
+			s.logger.WarnContext(ctx, "pricing lookup failed; finalizing without estimated cost", append(logFields, slog.String("error", err.Error()))...)
 		}
 		return nil, nil
 	}
@@ -915,14 +1114,14 @@ func (s *Service) resolvePricing(ctx context.Context, record GatewayRequest, usa
 	}
 	costNano, ok := pricing.Estimate(usage.PromptTokens, usage.CompletionTokens, price.InputNanoUSDPerMillion, price.OutputNanoUSDPerMillion)
 	if !ok {
-		s.logger.Warn("estimated cost calculation failed; recording pricing version without cost", logFields...)
+		s.logger.WarnContext(ctx, "estimated cost calculation failed; recording pricing version without cost", logFields...)
 		return &price.ID, nil
 	}
 	return &price.ID, &costNano
 }
 
-func (s *Service) persistenceError(record GatewayRequest, category provider.ErrorCategory, err error) *GatewayError {
-	s.logger.Error("gateway request finalization failed",
+func (s *Service) persistenceError(ctx context.Context, record GatewayRequest, category provider.ErrorCategory, err error) *GatewayError {
+	s.logger.ErrorContext(ctx, "gateway request finalization failed",
 		slog.String("gateway_request_id", record.ID),
 		slog.String("provider", string(record.Provider)),
 		slog.String("project_id", record.ProjectID),

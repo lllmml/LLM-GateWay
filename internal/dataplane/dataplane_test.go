@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,8 +29,6 @@ const (
 	testCredentialID = "33333333-3333-4333-8333-333333333333"
 	testRequestID    = "44444444-4444-4444-8444-444444444444"
 )
-
-var uuidV4Pattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 func TestHandlerAuthenticatesBeforeDecodingBody(t *testing.T) {
 	service := newTestService(t, &fakeStore{})
@@ -75,7 +72,7 @@ func TestCompleteChatCreatesCallsProviderAndFinalizesSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	result, record, err := service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	result, record, err := service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	})
@@ -102,24 +99,23 @@ func TestCompleteChatCreatesCallsProviderAndFinalizesSuccess(t *testing.T) {
 	}
 }
 
-func TestCompleteChatPropagatesTraceIDToGatewayRequest(t *testing.T) {
+func TestCompleteChatWithoutActiveSpanPersistsNoTraceID(t *testing.T) {
 	store, rawKey := newAuthorizedStore(t)
-	client := &fakeProviderClient{}
-	service := newTestService(t, store, client)
+	service := newTestService(t, store, &fakeProviderClient{})
 
 	auth, err := service.Authenticate(context.Background(), rawKey)
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, _, err = service.CompleteChat(context.Background(), auth, "trace-test", provider.ChatRequest{
+	_, _, err = service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	})
 	if err != nil {
 		t.Fatalf("complete chat: %v", err)
 	}
-	if store.lastCreate.TraceID != "trace-test" {
-		t.Fatalf("trace ID = %q, want trace-test", store.lastCreate.TraceID)
+	if store.lastCreate.TraceID != "" {
+		t.Fatalf("trace ID = %q, want empty (no active span, no UUID fallback; ADR-019 D1)", store.lastCreate.TraceID)
 	}
 }
 
@@ -168,7 +164,7 @@ func TestCreateFailureDoesNotCallProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, _, err = service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	_, _, err = service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	})
@@ -190,7 +186,7 @@ func TestMissingProviderConfigDoesNotCreateRequestOrCallProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, _, err = service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	_, _, err = service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	})
@@ -212,7 +208,7 @@ func TestUnknownProviderDoesNotCreateRequestOrCallProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, _, err = service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	_, _, err = service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "ollama/llama3",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	})
@@ -234,7 +230,7 @@ func TestStreamRequestReturnsUnsupportedFeature(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, _, err = service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	_, _, err = service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 		Stream:   true,
@@ -260,7 +256,7 @@ func TestProviderFailureFinalizesStableError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, _, err = service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	_, _, err = service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	})
@@ -287,7 +283,7 @@ func TestProviderFailureWithFinalizeFailureReturnsPersistenceError(t *testing.T)
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, _, err = service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	_, _, err = service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "secret prompt"}},
 	})
@@ -324,7 +320,7 @@ func TestCanceledUpstreamStillUsesNonCanceledBoundedFinalizeContext(t *testing.T
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, err = service.CompleteChat(ctx, auth, "", provider.ChatRequest{
+	_, _, err = service.CompleteChat(ctx, auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	})
@@ -353,7 +349,7 @@ func TestSuccessfulProviderWithFinalizeFailureReturnsPersistenceError(t *testing
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, _, err = service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	_, _, err = service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	})
@@ -385,7 +381,7 @@ func TestStreamChatWritesChunksAndFinalizesUsageAndTTFT(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	record, err := service.StreamChat(context.Background(), auth, "trace-stream", provider.ChatRequest{
+	record, err := service.StreamChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 		Stream:   true,
@@ -399,8 +395,11 @@ func TestStreamChatWritesChunksAndFinalizesUsageAndTTFT(t *testing.T) {
 	if !stream.closed {
 		t.Fatal("stream was not closed")
 	}
-	if store.lastCreate.TraceID != "trace-stream" || !store.lastCreate.IsStream {
+	if !store.lastCreate.IsStream {
 		t.Fatalf("create params = %+v", store.lastCreate)
+	}
+	if store.lastCreate.TraceID != "" {
+		t.Fatalf("trace ID = %q, want empty (no active span under the noop tracer; ADR-019 D1)", store.lastCreate.TraceID)
 	}
 	if store.lastFinalize.Status != "succeeded" || store.lastFinalize.ErrorCategory != nil {
 		t.Fatalf("finalize = %+v", store.lastFinalize)
@@ -515,7 +514,7 @@ func TestStreamChatProviderErrorBeforeCommitReturnsJSONCapableError(t *testing.T
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	record, err := service.StreamChat(context.Background(), auth, "", provider.ChatRequest{
+	record, err := service.StreamChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 		Stream:   true,
@@ -550,7 +549,7 @@ func TestStreamChatInterruptionAfterCommitFinalizesFailedWithoutUsage(t *testing
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, err = service.StreamChat(context.Background(), auth, "", provider.ChatRequest{
+	_, err = service.StreamChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "secret prompt"}},
 		Stream:   true,
@@ -593,7 +592,7 @@ func TestStreamChatDoesNotReadAheadWhenSinkBlocks(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := service.StreamChat(context.Background(), auth, "", provider.ChatRequest{
+		_, err := service.StreamChat(context.Background(), auth, provider.ChatRequest{
 			Model:    "openai/gpt-test",
 			Messages: []provider.Message{{Role: "user", Content: "hello"}},
 			Stream:   true,
@@ -635,7 +634,7 @@ func TestStreamChatCancellationClosesUpstreamStreamAndFinalizes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := service.StreamChat(ctx, auth, "", provider.ChatRequest{
+		_, err := service.StreamChat(ctx, auth, provider.ChatRequest{
 			Model:    "openai/gpt-test",
 			Messages: []provider.Message{{Role: "user", Content: "hello"}},
 			Stream:   true,
@@ -677,7 +676,7 @@ func TestStreamChatClientCancelBeforeUpstreamHeadersFinalizesInterrupted(t *test
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := service.StreamChat(ctx, auth, "", provider.ChatRequest{
+		_, err := service.StreamChat(ctx, auth, provider.ChatRequest{
 			Model:    "openai/gpt-test",
 			Messages: []provider.Message{{Role: "user", Content: "hello"}},
 			Stream:   true,
@@ -729,7 +728,7 @@ func TestStreamChatUpstreamDeadlineBeforeHeadersRemainsProviderTimeout(t *testin
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, err = service.StreamChat(context.Background(), auth, "", provider.ChatRequest{
+	_, err = service.StreamChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 		Stream:   true,
@@ -1278,15 +1277,12 @@ func TestHandlerSuccessWritesStableHeadersAndEnvelope(t *testing.T) {
 	if strings.Contains(response.Body.String(), "raw-traceparent") {
 		t.Fatalf("traceparent leaked body=%s trace=%q", response.Body.String(), store.lastCreate.TraceID)
 	}
-	if !uuidV4Pattern.MatchString(store.lastCreate.TraceID) {
-		t.Fatalf("trace ID = %q, want UUID v4", store.lastCreate.TraceID)
-	}
-	if store.lastCreate.TraceID == rawTraceparent {
-		t.Fatalf("trace ID = raw traceparent %q", store.lastCreate.TraceID)
+	if store.lastCreate.TraceID != "" {
+		t.Fatalf("trace ID = %q, want empty: an incoming Traceparent header is never used and no UUID fallback exists (ADR-019 D1)", store.lastCreate.TraceID)
 	}
 }
 
-func TestHandlerUsesTrimmedXRequestIDAsTraceID(t *testing.T) {
+func TestHandlerXRequestIDIsCorrelationMetadataNotTraceSource(t *testing.T) {
 	store, rawKey := newAuthorizedStore(t)
 	client := &fakeProviderClient{
 		result: provider.Result{
@@ -1310,12 +1306,12 @@ func TestHandlerUsesTrimmedXRequestIDAsTraceID(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
 	}
-	if store.lastCreate.TraceID != "trace-http" {
-		t.Fatalf("trace ID = %q, want trace-http", store.lastCreate.TraceID)
+	if store.lastCreate.TraceID != "" {
+		t.Fatalf("trace ID = %q, want empty: X-Request-ID is client correlation metadata, never the persisted trace id (ADR-019 D1/D7)", store.lastCreate.TraceID)
 	}
 }
 
-func TestHandlerGeneratesTraceIDWhenXRequestIDMissing(t *testing.T) {
+func TestHandlerDoesNotGenerateUUIDFallbackTraceID(t *testing.T) {
 	store, rawKey := newAuthorizedStore(t)
 	client := &fakeProviderClient{
 		result: provider.Result{
@@ -1338,8 +1334,8 @@ func TestHandlerGeneratesTraceIDWhenXRequestIDMissing(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
 	}
-	if !uuidV4Pattern.MatchString(store.lastCreate.TraceID) {
-		t.Fatalf("trace ID = %q, want UUID v4", store.lastCreate.TraceID)
+	if store.lastCreate.TraceID != "" {
+		t.Fatalf("trace ID = %q, want empty: no active span means no persisted trace id, with no UUID fallback (ADR-019 D1/D4)", store.lastCreate.TraceID)
 	}
 }
 
@@ -1878,7 +1874,7 @@ func TestDeepSeekModelRequiresDeepSeekCredentialBeforeUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, _, err = service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	_, _, err = service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "deepseek/deepseek-chat",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	})
@@ -1924,7 +1920,7 @@ func TestCrossProviderServiceRoutesDeepSeekToDeepSeekAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	result, record, err := service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	result, record, err := service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "deepseek/deepseek-chat",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	})
@@ -2233,7 +2229,7 @@ func TestAnthropicModelRequiresAnthropicCredentialBeforeUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, _, err = service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	_, _, err = service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "anthropic/claude-sonnet-x",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	})
@@ -2279,7 +2275,7 @@ func TestCrossProviderServiceRoutesAnthropicToAnthropicAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	result, record, err := service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	result, record, err := service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "anthropic/claude-sonnet-x",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	})
@@ -2782,7 +2778,7 @@ func runSuccessChat(t *testing.T, store *fakeStore, rawKey string, client *fakeP
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	if _, _, err := service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	if _, _, err := service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	}); err != nil {
@@ -2864,7 +2860,7 @@ func TestFailedRequestNeverLooksUpPrice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	if _, _, err := service.CompleteChat(context.Background(), auth, "", provider.ChatRequest{
+	if _, _, err := service.CompleteChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	}); err == nil {
@@ -2907,7 +2903,7 @@ func TestStreamChatRecordsPricingIDAndEstimatedCostAtDone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, err = service.StreamChat(context.Background(), auth, "", provider.ChatRequest{
+	_, err = service.StreamChat(context.Background(), auth, provider.ChatRequest{
 		Model:    "openai/gpt-test",
 		Messages: []provider.Message{{Role: "user", Content: "hello"}},
 	}, &recordingStreamSink{})

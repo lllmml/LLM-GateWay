@@ -50,6 +50,11 @@ const (
 	// never produce a large replay of paid upstream attempts (Tech Design
 	// §14.4: very small bounded attempt count).
 	maxRetryMaxRetries = 5
+
+	// Week 10 tracing (ADR-019 D8). Tracing is opt-in and disabled by default:
+	// an empty OTEL_EXPORTER_OTLP_ENDPOINT keeps the noop tracer with zero
+	// OTel cost. OTEL_SERVICE_NAME defaults to the gateway service name.
+	defaultOTELServiceName = "gateway"
 )
 
 type Config struct {
@@ -92,6 +97,17 @@ type Config struct {
 	RedisProbeInterval       time.Duration
 	RedisProbeThreshold      int
 	RateLimiterReplicaFactor int
+
+	// Week 10 OpenTelemetry tracing (ADR-019 D8). An empty
+	// OTELExporterOTLPEndpoint keeps tracing disabled (noop tracer, no
+	// exporter); OTELServiceName defaults to "gateway".
+	OTELExporterOTLPEndpoint string
+	OTELServiceName          string
+
+	// Week 10 A3d protected pprof (ADR-019 D8). Disabled by default; enabling
+	// requires a non-empty PPROF_TOKEN.
+	PprofEnabled bool
+	PprofToken   string
 }
 
 func Load() (Config, error) {
@@ -244,6 +260,31 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		}
 	}
 
+	// Week 10 tracing (ADR-019 D8). Tracing stays disabled unless an OTLP
+	// endpoint is explicitly configured; a non-empty value must be a valid
+	// http(s) origin URL so it can never carry credentials or a path into the
+	// OTLP client.
+	otelEndpoint := valueOrDefault(lookup, "OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	if otelEndpoint != "" {
+		if err := validateOTLPEndpoint(otelEndpoint); err != nil {
+			return Config{}, err
+		}
+	}
+	otelServiceName := valueOrDefault(lookup, "OTEL_SERVICE_NAME", defaultOTELServiceName)
+
+	// Week 10 A3d protected pprof (ADR-019 D8). pprof is opt-in: disabled by
+	// default, and enabling it requires a non-empty PPROF_TOKEN (the token is
+	// defense-in-depth on the private Ops plane, never a substitute for
+	// network isolation).
+	pprofEnabled, err := boolValue(lookup, "PPROF_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
+	pprofToken := valueOrDefault(lookup, "PPROF_TOKEN", "")
+	if pprofEnabled && pprofToken == "" {
+		return Config{}, errors.New("PPROF_TOKEN is required when PPROF_ENABLED=true")
+	}
+
 	return Config{
 		DataPlaneAddr:             dataPlaneAddr,
 		ControlPlaneAddr:          controlPlaneAddr,
@@ -279,6 +320,11 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		RedisProbeInterval:       redisProbeInterval,
 		RedisProbeThreshold:      redisProbeThreshold,
 		RateLimiterReplicaFactor: replicaFactor,
+
+		OTELExporterOTLPEndpoint: otelEndpoint,
+		OTELServiceName:          otelServiceName,
+		PprofEnabled:             pprofEnabled,
+		PprofToken:               pprofToken,
 	}, nil
 }
 
@@ -312,6 +358,20 @@ func parsePublicConsoleURL(lookup func(string) (string, bool)) (string, bool, er
 		return "", false, errors.New("PUBLIC_CONSOLE_URL must use https except for loopback development")
 	}
 	return strings.TrimRight(parsed.String(), "/"), false, nil
+}
+
+func validateOTLPEndpoint(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || parsed.Scheme == "" {
+		return errors.New("OTEL_EXPORTER_OTLP_ENDPOINT must be an http(s) origin URL")
+	}
+	if parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("OTEL_EXPORTER_OTLP_ENDPOINT must be an origin URL without credentials, path, query, or fragment")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return errors.New("OTEL_EXPORTER_OTLP_ENDPOINT must use http or https")
+	}
+	return nil
 }
 
 func isLoopbackHost(host string) bool {
@@ -400,6 +460,21 @@ func positiveDuration(lookup func(string) (string, bool), key string, fallback t
 		return 0, fmt.Errorf("%s must be positive", key)
 	}
 	return duration, nil
+}
+
+func boolValue(lookup func(string) (string, bool), key string, fallback bool) (bool, error) {
+	value, ok := lookup(key)
+	if !ok || strings.TrimSpace(value) == "" {
+		return fallback, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be true or false", key)
+	}
 }
 
 func parseLogLevel(value string) (slog.Level, error) {

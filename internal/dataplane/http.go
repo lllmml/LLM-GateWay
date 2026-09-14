@@ -2,7 +2,6 @@ package dataplane
 
 import (
 	"bytes"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +13,9 @@ import (
 	"time"
 
 	"github.com/lllmml/production-go-llm-gateway/internal/provider"
+	"github.com/lllmml/production-go-llm-gateway/internal/telemetry"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 const maxChatRequestBodyBytes = 1 << 20
@@ -32,6 +34,20 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 func (h *Handler) chatCompletions(response http.ResponseWriter, request *http.Request) {
 	requestStartedAt := time.Now().UTC()
+	// The gateway.request root span starts BEFORE content-type validation,
+	// auth, and request parsing so every stage - including early failures - is
+	// observable under one trace (ADR-019 D11). Tracing disabled means the
+	// service's noop tracer: Start always succeeds and records nothing.
+	ctx, span := h.service.tracer.Start(request.Context(), "gateway.request", trace.WithSpanKind(trace.SpanKindServer))
+	defer span.End()
+	// X-Request-ID is bounded, sanitized client correlation metadata only
+	// (ADR-019 D7): it is never a trace source, metric label, or span
+	// attribute, and an invalid value is dropped without affecting the request.
+	if clientRequestID := request.Header.Get("X-Request-ID"); clientRequestID != "" {
+		if clean, ok := telemetry.SanitizeClientRequestID(clientRequestID); ok {
+			ctx = telemetry.WithClientRequestID(ctx, clean)
+		}
+	}
 	if !isJSONContentType(request.Header.Get("Content-Type")) {
 		writeError(response, http.StatusUnsupportedMediaType, provider.InvalidRequest, "invalid_request", "content type must be application/json")
 		return
@@ -41,7 +57,18 @@ func (h *Handler) chatCompletions(response http.ResponseWriter, request *http.Re
 		writeError(response, http.StatusUnauthorized, provider.AuthenticationFailed, "authentication_failed", "authentication failed")
 		return
 	}
-	auth, err := h.service.Authenticate(request.Context(), rawKey)
+	// auth.virtual_key covers the virtual-key authentication lookup as a child
+	// of the request span; failure carries the stable category attribute.
+	authCtx, authSpan := h.service.tracer.Start(ctx, "auth.virtual_key")
+	auth, err := h.service.Authenticate(authCtx, rawKey)
+	if err != nil {
+		if category := gatewayCategoryOf(err); category != "" {
+			setSpanGatewayError(authSpan, category)
+		} else {
+			setSpanError(authSpan)
+		}
+	}
+	authSpan.End()
 	if err != nil {
 		writeGatewayError(response, GatewayRequest{}, err)
 		return
@@ -56,21 +83,22 @@ func (h *Handler) chatCompletions(response http.ResponseWriter, request *http.Re
 		writeError(response, http.StatusBadRequest, provider.InvalidRequest, code, err.Error())
 		return
 	}
-	traceID, err := requestTraceID(request)
-	if err != nil {
-		writeError(response, http.StatusInternalServerError, provider.InternalError, "internal_error", "request could not be completed")
-		return
-	}
 	if chat.Stream {
 		sink := newHTTPStreamSink(response)
-		record, err := h.service.StreamChatStartedAt(request.Context(), auth, traceID, requestStartedAt, chat, sink)
+		record, err := h.service.StreamChatStartedAt(ctx, auth, requestStartedAt, chat, sink)
 		if err != nil && !sink.Committed() {
+			if category := gatewayCategoryOf(err); category != "" {
+				setSpanGatewayError(span, category)
+			}
 			writeGatewayError(response, record, err)
 		}
 		return
 	}
-	result, record, err := h.service.CompleteChatStartedAt(request.Context(), auth, traceID, requestStartedAt, chat)
+	result, record, err := h.service.CompleteChatStartedAt(ctx, auth, requestStartedAt, chat)
 	if err != nil {
+		if category := gatewayCategoryOf(err); category != "" {
+			setSpanGatewayError(span, category)
+		}
 		writeGatewayError(response, record, err)
 		return
 	}
@@ -133,29 +161,6 @@ func decodeChatRequest(response http.ResponseWriter, request *http.Request) (pro
 		Stream:    stream,
 		MaxTokens: body.MaxTokens,
 	}, nil
-}
-
-func requestTraceID(request *http.Request) (string, error) {
-	if traceID := strings.TrimSpace(request.Header.Get("X-Request-ID")); traceID != "" {
-		return traceID, nil
-	}
-	return newUUIDV4()
-}
-
-func newUUIDV4() (string, error) {
-	var raw [16]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return "", err
-	}
-	raw[6] = (raw[6] & 0x0f) | 0x40
-	raw[8] = (raw[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		raw[0:4],
-		raw[4:6],
-		raw[6:8],
-		raw[8:10],
-		raw[10:16],
-	), nil
 }
 
 func bearerToken(header string) (string, bool) {
